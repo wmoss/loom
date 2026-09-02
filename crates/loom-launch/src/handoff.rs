@@ -531,6 +531,9 @@ async fn handoff_session_inner(
         serde_json::from_str(&plan.github_repositories)
             .map_err(|error| HandoffError::bad_request(error.to_string()))?;
     let current_github_repo = repo::github_slug_for_root(&st.db, &repo_root).await?;
+    // A local checkout (not a loom-managed clone) hands off without a GitHub
+    // credential — its GitHub features are no-ops either way.
+    let managed_clone = repo::is_managed_clone(&st.db, &repo_root).await?;
     let session_github_repositories = runtime::session_github_repositories(
         &plan.class,
         &configured_github_repositories,
@@ -581,8 +584,10 @@ async fn handoff_session_inner(
             .map_err(|error| HandoffError::bad_request(error.to_string()))?;
         extra_env = crate::profile::cleared_environment(extra_env, &allowlist);
     }
-    let github_app = runtime::app_for_allowlist(&session_github_repositories, st.trigger.app());
-    if current_github_repo.is_some()
+    let github_app = managed_clone
+        .then(|| runtime::app_for_allowlist(&session_github_repositories, st.trigger.app()))
+        .flatten();
+    if managed_clone
         && !runtime::github_credential_available(
             &st.db,
             session.created_by.as_deref(),

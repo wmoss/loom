@@ -584,8 +584,14 @@ pub async fn cmd_launch(a: LaunchArgs) -> Result<()> {
     let preview = client
         .invoke::<sessions::launches::resolve::Op>(&sessions::launches::resolve::Input {
             selection: selection.clone(),
+            repo: managed_repo
+                .clone()
+                .or_else(|| (!cwd.is_empty()).then(|| cwd.clone())),
         })
         .await?;
+    for warning in &preview.warnings {
+        eprintln!("warning: {warning}");
+    }
     if !preview.valid {
         bail!(
             "launch settings are not currently valid:\n{}",

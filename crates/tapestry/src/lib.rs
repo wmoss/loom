@@ -227,15 +227,42 @@ pub async fn spawn_detached(opts: &LaunchOptions<'_>) -> Result<()> {
     if let Some(argv0) = argv0 {
         cmd.arg0(argv0);
     }
+    // Pin the detached supervisor to the socket root the launcher already
+    // resolved, so the two agree on the control-socket path regardless of how
+    // the supervisor would re-derive it (the default root comes from `$HOME`,
+    // which a derived/isolated launch may not carry).
+    let socket_dir = paths::run_dir();
     if opts.env_clear {
-        // Pin the detached supervisor to the socket root the launcher already
-        // resolved. Merely forwarding explicit overrides is insufficient: the
-        // default root derives from HOME, which env_clear deliberately removes.
-        // Without this, an isolated/derived supervisor falls back to
-        // `<cwd>/.weaver/sock` while its launcher waits under `$HOME/.weaver`.
-        let socket_dir = paths::run_dir();
+        // The supervisor's *own* process environment — its child's environment
+        // is applied separately from the launch spec, so nothing here reaches
+        // the sandboxed session. Clear the ambient environment (no inherited
+        // loom variables), then restore the minimum a supervisor process needs
+        // to start: the socket root, plus the loader/locale variables its own
+        // startup and `openpty` depend on (notably on macOS, where a
+        // CoreFoundation process started with an empty environment can stall).
         cmd.env_clear();
-        cmd.env("WEAVER_TAPESTRY_DIR", socket_dir);
+        cmd.env("WEAVER_TAPESTRY_DIR", &socket_dir);
+        for key in [
+            "PATH",
+            "HOME",
+            "TMPDIR",
+            "USER",
+            "LOGNAME",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TERM",
+            "__CF_USER_TEXT_ENCODING",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+            "LD_LIBRARY_PATH",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+    } else {
+        cmd.env("WEAVER_TAPESTRY_DIR", &socket_dir);
     }
     // `-` tells the supervisor to read its JSON spec from stdin (see below); the
     // spec never appears on argv.
@@ -243,7 +270,7 @@ pub async fn spawn_detached(opts: &LaunchOptions<'_>) -> Result<()> {
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(supervisor_log(opts.name));
     // setsid in the child so it leads a new session with no controlling
     // terminal, and so survives the parent's process group going away. setsid
     // only fails (EPERM) if the caller already leads a process group — which a
@@ -285,7 +312,26 @@ pub async fn spawn_detached(opts: &LaunchOptions<'_>) -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    anyhow::bail!("supervisor for {} did not come up within 5s", opts.name)
+    let log = paths::run_dir().join(format!("{}.supervisor.log", opts.name));
+    anyhow::bail!(
+        "supervisor for {} did not come up within 5s (its startup output, if any, is in {})",
+        opts.name,
+        log.display()
+    )
+}
+
+/// A `Stdio` capturing a detached supervisor's own stderr to
+/// `<run_dir>/<name>.supervisor.log`, so a panic or early error before the
+/// control socket binds is recoverable rather than lost to `/dev/null`. Falls
+/// back to a null sink if the file cannot be opened.
+fn supervisor_log(name: &str) -> Stdio {
+    let path = paths::run_dir().join(format!("{name}.supervisor.log"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::File::create(&path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null())
 }
 
 /// The launch parameters carried in the `supervise` argument. Owned mirror of

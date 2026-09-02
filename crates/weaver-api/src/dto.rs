@@ -248,6 +248,12 @@ pub struct SessionView {
     /// `tracking_issue` remains the field edits go through.
     #[serde(default)]
     pub github_issue: Option<GithubIssueRef>,
+    /// Whether this session can reach GitHub — a loom-managed clone, or a local
+    /// checkout whose launching user has a personal token. `false` means the
+    /// session runs locally with no GitHub credentials, and the UI hides the
+    /// pull-request / issue association controls.
+    #[serde(default = "default_true")]
+    pub github: bool,
     pub last_activity_at: String,
     pub created_at: String,
     pub updated_at: String,
@@ -1030,6 +1036,10 @@ pub struct ResolvedLaunchView {
     pub policy: ResolvedLaunchPolicyView,
     pub valid: bool,
     pub errors: Vec<String>,
+    /// Non-blocking advisories about the launch — e.g. a local checkout whose
+    /// session will run without GitHub credentials. Empty for most launches.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Atomic environment composition for a cloned profile. Inherited values are

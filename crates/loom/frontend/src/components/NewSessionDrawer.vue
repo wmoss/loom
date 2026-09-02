@@ -392,7 +392,9 @@ function scheduleResolution() {
   }, 120);
 }
 
-watch(selection, scheduleResolution, { deep: true, flush: 'sync' });
+// The repo feeds a preview advisory (local checkout → no GitHub credentials),
+// so a repo change re-resolves alongside a profile/override change.
+watch([selection, repo], scheduleResolution, { deep: true, flush: 'sync' });
 
 async function resolveSelection(request: number) {
   if (!profiles.value.length) {
@@ -400,7 +402,7 @@ async function resolveSelection(request: number) {
     return;
   }
   try {
-    const preview = await resolveSessionLaunch(selection.value);
+    const preview = await resolveSessionLaunch(selection.value, repo.value.trim() || undefined);
     if (request === resolveRequest) {
       resolved.value = preview;
       lastResolved.value = preview;
@@ -1076,6 +1078,12 @@ onActivated(() => void refreshLaunchData());
           <p v-if="resolving" class="text-xs text-faint" aria-live="polite">Checking settings…</p>
           <ul v-else-if="resolved?.errors.length" class="space-y-1 text-xs text-block">
             <li v-for="message in resolved.errors" :key="message">• {{ message }}</li>
+          </ul>
+          <ul
+            v-if="!resolving && resolved?.warnings.length"
+            class="space-y-1 rounded bg-attn-soft p-2 text-xs text-attn"
+          >
+            <li v-for="message in resolved.warnings" :key="message">• {{ message }}</li>
           </ul>
         </section>
 

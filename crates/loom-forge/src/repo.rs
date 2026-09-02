@@ -231,16 +231,27 @@ async fn registered_for_root(db: &Db, repo_root: &Path) -> Result<Option<Managed
     }))
 }
 
+/// Whether `repo_root` is a loom-managed clone — one registered in the `repos`
+/// table, which loom itself cloned from GitHub. Its stored `path` is the managed
+/// clone (`<repos_dir>/<owner>/<name>`); the launch resolves a worktree's repo
+/// root by canonicalizing that path, so both sides are compared canonicalized.
+///
+/// A repo absent from the table is a local checkout the operator pointed loom
+/// at. Two launch gates key on this distinction: a managed clone is
+/// GitHub-backed and drives the branch → PR workflow, so it must present a
+/// GitHub credential and may draw a GitHub App token; a local checkout need do
+/// neither — its GitHub features degrade to no-ops.
+pub async fn is_managed_clone(db: &Db, repo_root: &Path) -> Result<bool> {
+    Ok(registered_for_root(db, repo_root).await?.is_some())
+}
+
 /// Whether `repo_root` is an allowlisted (registered) managed repo — the gate
 /// that decides whether a session's committed `.weaver/config.toml` `[setup]`
-/// script may run. A registered repo's stored `path` is the managed clone
-/// (`<repos_dir>/<owner>/<name>`); the launch resolves the worktree's repo root
-/// by canonicalizing that path, so we compare canonicalized paths on both sides.
-/// A repo not in the `repos` table (e.g. a local bind-mounted checkout) is not
-/// allowlisted, and its setup script is never executed (the design's privileged
-/// code-execution boundary, §6.4).
+/// script may run. A repo not in the `repos` table (e.g. a local bind-mounted
+/// checkout) is not allowlisted, and its setup script is never executed (the
+/// design's privileged code-execution boundary, §6.4).
 pub async fn is_allowlisted(db: &Db, repo_root: &Path) -> Result<bool> {
-    let allowed = registered_for_root(db, repo_root).await?.is_some();
+    let allowed = is_managed_clone(db, repo_root).await?;
     tracing::debug!(repo = %repo_root.display(), allowed, "checked repo allowlist");
     Ok(allowed)
 }
@@ -429,6 +440,31 @@ mod tests {
                 .as_deref(),
             Some("marin-community/marin")
         );
+    }
+
+    #[tokio::test]
+    async fn is_managed_clone_tracks_registration_not_the_origin_remote() {
+        let db = connect_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q", "-b", "main"]).await;
+        run_git(
+            dir.path(),
+            &["remote", "add", "origin", "git@github.com:acme/widget.git"],
+        )
+        .await;
+
+        // A local checkout with a GitHub origin is still not a managed clone.
+        assert!(!is_managed_clone(&db, dir.path()).await.unwrap());
+
+        register(
+            &db,
+            "acme/widget",
+            "https://github.com/acme/widget.git",
+            &dir.path().to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        assert!(is_managed_clone(&db, dir.path()).await.unwrap());
     }
 
     #[test]

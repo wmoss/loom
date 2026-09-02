@@ -142,6 +142,7 @@ onBeforeUnmount(() => document.removeEventListener('pointerdown', onOutsidePoint
 
 <template>
   <div
+    v-if="ws.github"
     ref="root"
     class="flex shrink-0 flex-wrap items-center justify-end gap-1.5 text-xs"
     data-testid="github-associations"

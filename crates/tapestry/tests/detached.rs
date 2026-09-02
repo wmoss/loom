@@ -207,6 +207,12 @@ async fn pty_and_relay_supervisors_derive_shells_with_their_exact_environment() 
 /// worktree shell derived from a pre-upgrade session died at launch, leaving the
 /// browser stuck on "reconnecting". A supervisor must keep deriving shells from
 /// its own running image instead.
+///
+/// Linux-only: the recovery is `self_exe()`'s `/proc/self/exe` re-exec. macOS
+/// has no equivalent handle on the running image — `current_exe()` re-resolves
+/// the (now replaced) path — so the scenario is not recoverable there and the
+/// test would always fail.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 #[serial]
 async fn derives_shells_after_its_own_binary_is_replaced() {

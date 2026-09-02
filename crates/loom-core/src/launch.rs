@@ -414,6 +414,9 @@ pub async fn resolve(
         },
         valid: errors.is_empty(),
         errors,
+        // Repo-scoped advisories are appended by the web layer, which knows the
+        // target repository; profile resolution alone has no repo context.
+        warnings: Vec::new(),
     };
     Ok(ResolvedLaunch {
         profile,

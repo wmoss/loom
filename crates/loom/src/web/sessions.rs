@@ -1605,13 +1605,64 @@ async fn op_launches_resolve(
     };
     let _profile_permit = st.launch_gate.acquire_profile(profile_name).await;
     let _resolver_permit = st.launch_gate.acquire_resolver().await;
-    Ok(super::launches::resolve_launch(
+    let mut resolved = super::launches::resolve_launch(
         st,
         &input.selection,
         &crate::launch::ResolveOptions::default(),
     )
-    .await?
-    .view)
+    .await?;
+    if let Some(warning) = local_repo_credential_warning(
+        st,
+        &context.principal,
+        input.repo.as_deref(),
+        &resolved.view,
+    )
+    .await
+    {
+        resolved.view.warnings.push(warning);
+    }
+    Ok(resolved.view)
+}
+
+/// A non-blocking advisory for the launch preview: the session targets a local
+/// checkout (not a loom-managed clone) and no personal GitHub token is on file,
+/// so `git push` and pull-request actions will be unavailable. Mirrors the
+/// credential decision `provision`/`handoff` make — a managed clone still hard
+/// fails there, so it is never warned about here.
+async fn local_repo_credential_warning(
+    st: &AppState,
+    principal: &Principal,
+    target: Option<&str>,
+    view: &weaver_api::ResolvedLaunchView,
+) -> Option<String> {
+    let target = target.map(str::trim).filter(|value| !value.is_empty())?;
+    // A managed `owner/name` reference is GitHub-backed by definition.
+    if crate::repo::parse_slug(target).is_ok() {
+        return None;
+    }
+    let root = PathBuf::from(target);
+    let root = root.canonicalize().unwrap_or(root);
+    if crate::repo::is_managed_clone(&st.db, &root)
+        .await
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let created_by = principal.is_human().then_some(principal.username.as_str());
+    let has_credential = crate::runtime::github_credential_available(
+        &st.db,
+        created_by,
+        // A local checkout never draws a GitHub App token (see `provision`).
+        None,
+        crate::runtime::user_github_token_allowed(&view.class, view.policy.restricted),
+    )
+    .await
+    .unwrap_or(true);
+    (!has_credential).then(|| {
+        "Local checkout: this session runs without GitHub access — git push and pull-request \
+         actions are unavailable. Add a personal token in Settings > Account to enable them."
+            .to_string()
+    })
 }
 
 async fn op_adopt(context: OperationContext, input: ops::adopt::Input) -> ApiResult<SessionView> {

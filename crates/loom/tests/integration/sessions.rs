@@ -272,6 +272,84 @@ async fn real_agent_without_github_access_is_rejected_before_provisioning() {
     );
 }
 
+/// A local checkout the operator points loom at is not a managed clone, so the
+/// GitHub-credential preflight does not apply — even when its `origin` remote is
+/// on github.com. The session launches and runs locally.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_checkout_with_a_github_origin_launches_without_a_credential() {
+    let ts = TestServer::start().await;
+    sh(
+        ts.repo_path(),
+        "git",
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/widget.git",
+        ],
+    );
+
+    let session = ts
+        .client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "run locally",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+            }),
+        )
+        .await
+        .expect("a local checkout must not require a GitHub credential");
+
+    let id = session["id"].as_str().unwrap();
+    ts.client
+        .post("/api/sessions/delete", json!({ "session": id }))
+        .await
+        .unwrap();
+}
+
+/// Seeding a session from a GitHub issue reads it with loom's App token. A local
+/// checkout is not a managed repository and its `origin` is caller-controlled, so
+/// the launch is refused before any GitHub call rather than borrowing the App's
+/// access to whatever repo the origin names.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_seeding_is_refused_for_a_local_checkout() {
+    let ts = TestServer::start().await;
+    sh(
+        ts.repo_path(),
+        "git",
+        &["remote", "add", "origin", "https://github.com/acme/widget.git"],
+    );
+
+    let err = ts
+        .client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "seed from an issue",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "issue": 5,
+            }),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("requires a loom-managed repository"),
+        "unexpected error: {err}"
+    );
+
+    let list = ts.client.post("/api/sessions/list", json!({})).await.unwrap();
+    assert!(
+        list.as_array().unwrap().is_empty(),
+        "refused launch should not create a session row: {list}"
+    );
+}
+
 /// A user's Account token is Loom's sole direct-token source. It permits an
 /// interactive GitHub launch without App access and reaches the stock client
 /// adapters together with the explicit `direct` mode stamp.
