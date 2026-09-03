@@ -10,13 +10,20 @@ const props = withDefaults(
     fieldClass?: string;
     testid?: string;
     id?: string;
+    /** Which edge the (over-wide) option list is pinned to, so it grows into
+     *  free space rather than off the panel: `'right'` grows rightward (the
+     *  default), `'left'` grows leftward (the new-session drawer). */
+    placement?: 'left' | 'right';
   }>(),
   {
     disabled: false,
     fieldClass: 'bg-surface',
     testid: '',
+    placement: 'right',
   },
 );
+
+const popoverClass = computed(() => (props.placement === 'left' ? 'right-0' : 'left-0'));
 
 const emit = defineEmits<{
   'update:modelValue': [string];
@@ -42,6 +49,14 @@ const matches = computed(() => {
     (choice) => choice.id.toLowerCase().includes(q) || choice.label.toLowerCase().includes(q),
   );
 });
+
+/** Whether `choice.id` is just the label plus a bracketed parameter list
+ *  (Cursor's `grok-4.6[effort=high,fast=true]`) — a launch detail the id
+ *  badge would otherwise surface for no reason, since it adds nothing the
+ *  label doesn't already say. */
+function idIsRedundant(choice: AgentChoice): boolean {
+  return choice.id.startsWith(`${choice.label}[`) && choice.id.endsWith(']');
+}
 
 const inputValue = computed(() => (editing.value ? query.value : currentDisplay.value));
 
@@ -164,7 +179,8 @@ function commit() {
       :id="`${uid}-options`"
       role="listbox"
       data-testid="model-options"
-      class="absolute left-0 right-0 z-20 mt-1 max-h-56 overflow-auto rounded border border-line bg-input shadow-lg"
+      class="absolute z-20 mt-1 max-h-56 w-max min-w-full max-w-[200%] overflow-auto rounded border border-line bg-input shadow-lg"
+      :class="popoverClass"
     >
       <li v-for="(choice, index) in matches" :key="choice.id">
         <button
@@ -174,11 +190,13 @@ function commit() {
           :aria-selected="activeOption === index"
           data-testid="model-option"
           @mousedown.prevent="pick(choice)"
-          class="flex w-full items-baseline gap-2 px-2 py-1.5 text-left hover:bg-subtle"
+          class="flex w-full min-w-0 items-baseline gap-2 px-2 py-1.5 text-left hover:bg-subtle"
           :class="{ 'bg-subtle text-fg': activeOption === index }"
         >
-          <span class="truncate text-sm">{{ choice.label }}</span>
-          <code class="truncate font-mono text-xs text-muted">{{ choice.id }}</code>
+          <span class="whitespace-nowrap text-sm">{{ choice.label }}</span>
+          <code v-if="!idIsRedundant(choice)" class="truncate font-mono text-xs text-muted">{{
+            choice.id
+          }}</code>
         </button>
       </li>
     </ul>

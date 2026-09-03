@@ -345,20 +345,15 @@ impl AcpPromptClient {
         let opened = self.open_new_session(launch).await?;
         let mut options = opened.config_options.unwrap_or_default();
 
-        for (kind, desired) in [
-            ("model", launch.initial_model.as_deref()),
-            ("effort", launch.initial_effort.as_deref()),
-        ] {
-            let Some(desired) = desired.map(str::trim).filter(|value| !value.is_empty()) else {
-                continue;
-            };
+        // `validate` only runs for a fresh session (asserted above).
+        for (kind, desired) in launch_config_steps(launch, true) {
             let Some(details) = config_option_details(&options, kind) else {
                 // Some adapters apply launch selectors out of band and do not
                 // advertise a matching ACP control. session/new is authoritative
                 // for those runtimes, just as it is during the durable handshake.
                 continue;
             };
-            if details.current.as_deref() == Some(desired) {
+            if details.current.as_deref() == Some(desired.as_str()) {
                 continue;
             }
             let unavailable = if details.available.is_empty() {
@@ -370,7 +365,7 @@ impl AcpPromptClient {
                 )
             };
             options = self
-                .set_config_option(&details.id, Value::String(desired.to_string()))
+                .set_config_option(&details.id, Value::String(desired.clone()))
                 .await
                 .with_context(|| unavailable)?;
         }
@@ -584,10 +579,63 @@ fn is_config_option_kind(option: &Value, kind: &str) -> bool {
     let category = option.get("category").and_then(Value::as_str).unwrap_or("");
     match kind {
         "model" => category == "model" || id == "model",
-        "effort" => category == "thought_level" || id == "effort" || id.contains("reasoning"),
+        // The reasoning-effort scale, explicitly *not* the `thinking` toggle:
+        // some Cursor models advertise both under `thought_level` and each is
+        // reconciled on its own (see `launch_config_steps`).
+        "effort" => {
+            id != "thinking"
+                && (category == "thought_level" || id == "effort" || id.contains("reasoning"))
+        }
+        "thinking" => id == "thinking",
+        "fast" => id == "fast",
         "mode" => category == "mode" || id == "mode",
         _ => false,
     }
+}
+
+/// Split a Loom effort selector into its reasoning-scale part and whether it
+/// asks for `thinking` on. `"low-thinking"` → `("low", true)`; `"thinking"` →
+/// `("", true)` (a thinking-only model); `"high"` → `("high", false)`.
+fn split_thinking_selector(effort: &str) -> (&str, bool) {
+    if effort == "thinking" {
+        ("", true)
+    } else if let Some(base) = effort.strip_suffix("-thinking") {
+        (base, true)
+    } else {
+        (effort, false)
+    }
+}
+
+/// The ordered `(kind, config value)` sets a fresh launch's selectors imply.
+/// `effort` may fan out into a reasoning-scale set plus an explicit `thinking`
+/// toggle; a fresh launch also forces Cursor's `fast` off (2x cost, and Loom
+/// exposes no control for it). Each is resolved against the live config
+/// options and skipped when absent or already satisfied by the caller.
+fn launch_config_steps(launch: &AcpLaunch, is_fresh: bool) -> Vec<(&'static str, String)> {
+    let trimmed = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let mut steps = Vec::new();
+    if let Some(model) = trimmed(launch.initial_model.as_deref()) {
+        steps.push(("model", model));
+    }
+    if let Some(effort) = trimmed(launch.initial_effort.as_deref()) {
+        let (scale, wants_thinking) = split_thinking_selector(&effort);
+        if !scale.is_empty() {
+            steps.push(("effort", scale.to_string()));
+        }
+        steps.push((
+            "thinking",
+            if wants_thinking { "true" } else { "false" }.to_string(),
+        ));
+    }
+    if is_fresh {
+        steps.push(("fast", "false".to_string()));
+    }
+    steps
 }
 
 fn config_option_details(config_options: &[Value], kind: &str) -> Option<ConfigOptionDetails> {
@@ -1910,44 +1958,23 @@ impl Task {
         launch: &AcpLaunch,
         cmd_rx: &mut mpsc::Receiver<Command>,
     ) -> Result<()> {
-        for (kind, desired) in [
-            ("model", launch.initial_model.as_deref()),
-            ("effort", launch.initial_effort.as_deref()),
-        ] {
-            let Some(desired) = desired.map(str::trim).filter(|value| !value.is_empty()) else {
-                continue;
-            };
+        let is_fresh = matches!(launch.new_or_load, NewOrLoad::New { .. });
+        // Cursor advertises some models as two `thought_level` axes at once (a
+        // reasoning scale plus a `thinking` toggle); `launch_config_steps`
+        // fans a `low-thinking` selector back out into a set per axis, and
+        // forces `fast` off on a fresh session.
+        for (kind, desired) in launch_config_steps(launch, is_fresh) {
             let option = {
                 let metadata = self.metadata.lock().unwrap();
-                metadata.config_options.iter().find_map(|option| {
-                    let id = option.get("id").and_then(Value::as_str)?;
-                    let category = option.get("category").and_then(Value::as_str);
-                    let matches = match kind {
-                        "model" => category == Some("model") || id == "model",
-                        "effort" => {
-                            category == Some("thought_level")
-                                || id == "effort"
-                                || id.contains("reasoning")
-                        }
-                        _ => false,
-                    };
-                    matches.then(|| {
-                        (
-                            id.to_string(),
-                            option
-                                .get("currentValue")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        )
-                    })
-                })
+                config_option_details(&metadata.config_options, kind)
             };
-            let Some((config_id, current)) = option else {
+            let Some(details) = option else {
                 // Older/custom adapters may not expose this selector. The
                 // launch channel still owns the runtime value in that case.
                 continue;
             };
-            if current.as_deref() == Some(desired) {
+            let (config_id, current) = (details.id, details.current);
+            if current.as_deref() == Some(desired.as_str()) {
                 continue;
             }
 
@@ -1959,7 +1986,7 @@ impl Task {
                     wire::set_config_option_params(
                         &self.acp_session_id,
                         &config_id,
-                        Value::String(desired.to_string()),
+                        Value::String(desired.clone()),
                     ),
                 ))
                 .await?;
@@ -3795,8 +3822,9 @@ fn is_compaction_prompt(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_choice, deny_choice, is_compaction_prompt, preferred_config_value, preferred_mode,
-        queued_prompt_text, LiveTool, PermissionOption,
+        auto_choice, deny_choice, is_compaction_prompt, is_config_option_kind, launch_config_steps,
+        preferred_config_value, preferred_mode, queued_prompt_text, split_thinking_selector,
+        AcpLaunch, LiveTool, NewOrLoad, PermissionOption,
     };
     use crate::acp::wire::{ContentBlock, ToolCallContent};
     use serde_json::json;
@@ -3807,6 +3835,65 @@ mod tests {
         assert!(is_compaction_prompt("  /compact preserve the test context"));
         assert!(!is_compaction_prompt("/compaction"));
         assert!(!is_compaction_prompt("explain /compact"));
+    }
+
+    #[test]
+    fn split_thinking_selector_separates_the_scale_from_the_toggle() {
+        assert_eq!(split_thinking_selector("high"), ("high", false));
+        assert_eq!(split_thinking_selector("low-thinking"), ("low", true));
+        assert_eq!(split_thinking_selector("thinking"), ("", true));
+        assert_eq!(split_thinking_selector("extra-high"), ("extra-high", false));
+    }
+
+    #[test]
+    fn effort_kind_excludes_the_thinking_toggle() {
+        let thinking = json!({ "id": "thinking", "category": "thought_level" });
+        let scale = json!({ "id": "effort", "category": "thought_level" });
+        assert!(!is_config_option_kind(&thinking, "effort"));
+        assert!(is_config_option_kind(&thinking, "thinking"));
+        assert!(is_config_option_kind(&scale, "effort"));
+        assert!(!is_config_option_kind(&scale, "thinking"));
+    }
+
+    #[test]
+    fn launch_config_steps_fan_out_effort_and_force_fast_off() {
+        let launch = |model: &str, effort: &str| AcpLaunch {
+            adapter_cmd: String::new(),
+            cwd: std::path::PathBuf::new(),
+            env: Vec::new(),
+            env_clear: false,
+            mcp_servers: Vec::new(),
+            new_or_load: NewOrLoad::New {
+                cwd: std::path::PathBuf::new(),
+                meta: None,
+            },
+            mode: None,
+            initial_model: (!model.is_empty()).then(|| model.to_string()),
+            initial_effort: (!effort.is_empty()).then(|| effort.to_string()),
+            goal: None,
+            setup_timeout: std::time::Duration::from_secs(1),
+        };
+
+        assert_eq!(
+            launch_config_steps(&launch("grok-4.6", "low-thinking"), true),
+            [
+                ("model", "grok-4.6".to_string()),
+                ("effort", "low".to_string()),
+                ("thinking", "true".to_string()),
+                ("fast", "false".to_string()),
+            ]
+        );
+        // A plain scale value still pins `thinking` off explicitly.
+        assert_eq!(
+            launch_config_steps(&launch("", "high"), true),
+            [
+                ("effort", "high".to_string()),
+                ("thinking", "false".to_string()),
+                ("fast", "false".to_string()),
+            ]
+        );
+        // A resume (not fresh) leaves `fast` alone; blank selectors add nothing.
+        assert_eq!(launch_config_steps(&launch("", ""), false), []);
     }
 
     #[tokio::test]
