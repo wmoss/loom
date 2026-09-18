@@ -26,7 +26,8 @@ pub struct Profile {
     pub max_concurrent: i64,
     pub turn_budget: Option<i64>,
     pub prelude: String,
-    /// Organization-owned instructions appended to the opening prompt.
+    /// Organization-owned instructions appended to the opening prompt. May
+    /// reference `{goal}` to place the session goal inline instead.
     pub instructions: String,
     pub restricted: bool,
     /// JSON array in storage; parsed through [`Profile::github_repositories`].

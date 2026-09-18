@@ -158,6 +158,9 @@ launches. Slack and GitHub choose their trigger profiles with `slack.profile`
 and `github.profile`; both default to `default`. Infrastructure code may read a
 checked-in `AGENTS.md` into this manifest field, but Loom receives and exposes
 the effective text rather than reading a deployment checkout at runtime.
+`instructions` may reference `{goal}` to place the launch goal inline instead
+of Loom's default goal-then-instructions layout; without the placeholder the
+goal comes first as before.
 Loom also seeds lightweight instructions for an untouched `default` profile and
 editable `slack` and `github` starters from its runtime posture. The reviewed
 starter text lives under `crates/loom-policy/profiles/<name>/instructions.md`.

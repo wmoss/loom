@@ -89,7 +89,8 @@ pub mod create {
         #[operand(default = String::from("weaver"))]
         pub prelude: String,
         /// Organization-owned instructions appended to this profile's opening
-        /// prompt for every launch origin.
+        /// prompt for every launch origin. May reference `{goal}` to place the
+        /// session goal inline instead of the default goal-then-instructions order.
         #[operand(default = String::new())]
         pub instructions: String,
         #[operand(default = false)]
@@ -256,7 +257,8 @@ pub mod update {
         #[operand(default = String::from("weaver"))]
         pub prelude: String,
         /// Organization-owned instructions appended to this profile's opening
-        /// prompt for every launch origin.
+        /// prompt for every launch origin. May reference `{goal}` to place the
+        /// session goal inline instead of the default goal-then-instructions order.
         #[operand(default = String::new())]
         pub instructions: String,
         #[operand(default = false)]

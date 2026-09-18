@@ -1496,6 +1496,12 @@ fn entrance_note(tracking_issue: Option<i64>) -> String {
 /// The user's goal is always the opening user message: making an agent fetch it
 /// through `loom summary` on turn one adds latency and duplicates the goal in
 /// context. `none` deliberately omits all Weaver orientation.
+///
+/// A profile's opening instructions may place the goal explicitly with the
+/// `{goal}` placeholder, e.g. to introduce it inline ("You received this
+/// request: {goal}"). When the placeholder is present, the rendered
+/// instructions take the goal's place in the prompt instead of the default
+/// goal-then-instructions layout, so the goal isn't duplicated.
 fn build_launch_prompt(
     goal: &str,
     prelude: &str,
@@ -1504,20 +1510,44 @@ fn build_launch_prompt(
     scratch: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
-    if !goal.is_empty() {
-        parts.push(goal);
+    let templated_goal = template_goal(instructions, goal);
+    let profile_instructions = profile_instructions_section(instructions);
+    if let Some(rendered) = templated_goal.as_deref() {
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
         if prelude == "weaver" {
             parts.push(entrance);
         }
-    }
-    let profile_instructions = profile_instructions_section(instructions);
-    if let Some(instructions) = profile_instructions.as_deref() {
-        parts.push(instructions);
+    } else {
+        if !goal.is_empty() {
+            parts.push(goal);
+            if prelude == "weaver" {
+                parts.push(entrance);
+            }
+        }
+        if let Some(instructions) = profile_instructions.as_deref() {
+            parts.push(instructions);
+        }
     }
     if let Some(scratch) = scratch {
         parts.push(scratch);
     }
     parts.join("\n\n")
+}
+
+/// Placeholder a profile's opening instructions can use to control where the
+/// session goal lands in the opening prompt.
+const GOAL_PLACEHOLDER: &str = "{goal}";
+
+/// Substitute `{goal}` into a profile's opening instructions, if present.
+/// Returns `None` when the placeholder is absent so callers fall back to the
+/// default layout (goal first, instructions appended after).
+fn template_goal(instructions: &str, goal: &str) -> Option<String> {
+    let instructions = instructions.trim();
+    instructions
+        .contains(GOAL_PLACEHOLDER)
+        .then(|| instructions.replace(GOAL_PLACEHOLDER, goal))
 }
 
 pub(crate) fn profile_instructions_section(instructions: &str) -> Option<String> {
@@ -1769,6 +1799,39 @@ mod tests {
             ),
             "do the work\n\nWeaver context.\n\n## Profile instructions\n\nUse the organization workflow."
                 .to_string()
+        );
+    }
+
+    #[test]
+    fn profile_instructions_template_the_goal_in_place() {
+        let instructions = "Handle this ticket: {goal}\n\nFollow the SOP.";
+        assert_eq!(
+            build_launch_prompt("Fix bug X", "none", instructions, "unused", None),
+            "Handle this ticket: Fix bug X\n\nFollow the SOP."
+        );
+        assert_eq!(
+            build_launch_prompt("Fix bug X", "weaver", instructions, "Weaver context.", None),
+            "Handle this ticket: Fix bug X\n\nFollow the SOP.\n\nWeaver context."
+        );
+    }
+
+    #[test]
+    fn profile_instructions_without_the_placeholder_default_to_the_prior_layout() {
+        // No `{goal}` in the instructions: same behavior as before templating
+        // existed, goal first and instructions appended as their own section.
+        let instructions = "Use the organization workflow.";
+        assert_eq!(
+            build_launch_prompt("do the work", "none", instructions, "unused", None),
+            "do the work\n\n## Profile instructions\n\nUse the organization workflow."
+        );
+    }
+
+    #[test]
+    fn goal_placeholder_survives_an_empty_goal() {
+        let instructions = "Ticket: {goal}";
+        assert_eq!(
+            build_launch_prompt("", "none", instructions, "unused", None),
+            "Ticket: "
         );
     }
 }
