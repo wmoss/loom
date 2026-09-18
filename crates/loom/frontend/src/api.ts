@@ -433,6 +433,12 @@ interface AgentsEnvelope {
 
 export const listAgents = () => invokeOperation('agents.list', {});
 
+/** On-demand per-model effort lookup (`agents.model_efforts`) for a harness
+ *  whose catalogue doesn't carry per-model efforts up front — see
+ *  `AgentMetadata.effort_lookup`. */
+export const getModelEfforts = (agent: string, model: string) =>
+  invokeOperation('agents.model_efforts', { agent, model }).then((r) => r.efforts);
+
 interface CustomAgentsEnvelope {
   custom: CustomAgent[];
 }

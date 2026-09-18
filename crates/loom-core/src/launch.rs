@@ -264,7 +264,7 @@ pub async fn resolve(
         None => (profile.effort.clone(), "profile"),
     };
     crate::agent::validate_model(&metadata, &model).map_err(|error| anyhow!(error))?;
-    crate::agent::validate_effort(&metadata, &effort).map_err(|error| anyhow!(error))?;
+    crate::agent::validate_effort(&metadata, &model, &effort).map_err(|error| anyhow!(error))?;
 
     let protocol_requested = selected(&overrides.protocol).or_else(|| {
         (!agent_overridden && !profile.protocol.trim().is_empty())

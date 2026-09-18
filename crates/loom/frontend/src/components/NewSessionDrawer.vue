@@ -1092,6 +1092,7 @@ onActivated(() => void refreshLaunchData());
             :resolved="resolved"
             :fallback="lastResolved"
             :disabled="Boolean((resolved ?? lastResolved)?.policy.strict)"
+            model-dropdown-placement="left"
           />
           <p v-if="resolving" class="text-xs text-faint" aria-live="polite">Checking settings…</p>
           <ul v-else-if="resolved?.errors.length" class="space-y-1 text-xs text-block">
