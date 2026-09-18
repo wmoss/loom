@@ -661,6 +661,12 @@ pub mod launches {
             /// The profile and per-launch overrides to resolve.
             #[operand(skip_cli)]
             pub selection: LaunchSelection,
+            /// The repository the session will target — a managed `owner/name`
+            /// slug or a local worktree path. Used only to surface advisories
+            /// (e.g. a local checkout that will run without GitHub credentials);
+            /// it does not affect the resolved template.
+            #[operand(skip_cli)]
+            pub repo: Option<String>,
         }
 
         pub type Output = ResolvedLaunchView;

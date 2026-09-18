@@ -301,19 +301,29 @@ async fn origin_default_branch(dir: &Path) -> Option<String> {
 /// tracking ref is used as-is; only if that ref doesn't resolve at all do we
 /// fall back to the current branch.
 pub async fn default_base(dir: &Path) -> Result<String> {
+    default_base_with(dir, true).await
+}
+
+/// [`default_base`], with `fetch` gating the network refresh of the tracking
+/// ref. A local checkout the operator pointed loom at forks from the
+/// `origin/<default>` ref it already holds — loom does not reach the network on
+/// its behalf, so a stuck SSH agent or an offline laptop never stalls a launch.
+pub async fn default_base_with(dir: &Path, fetch: bool) -> Result<String> {
     if !has_remote(dir, "origin").await {
         tracing::debug!(dir = %dir.display(), "no origin remote; falling back to current branch");
         return current_branch(dir).await;
     }
     if let Some(default) = origin_default_branch(dir).await {
-        // Best-effort: refresh the tracking ref so the fork point is current.
-        // Ignore network failures — a stale ref still beats the local branch.
-        tracing::info!(dir = %dir.display(), branch = %default, "fetching origin to refresh default base");
-        let fetch_result = git(dir, &["fetch", "origin", &default]).await;
-        tracing::debug!(dir = %dir.display(), branch = %default, ok = fetch_result.is_ok(), "fetch of default branch completed");
+        if fetch {
+            // Best-effort: refresh the tracking ref so the fork point is current.
+            // Ignore network failures — a stale ref still beats the local branch.
+            tracing::info!(dir = %dir.display(), branch = %default, "fetching origin to refresh default base");
+            let fetch_result = git(dir, &["fetch", "origin", &default]).await;
+            tracing::debug!(dir = %dir.display(), branch = %default, ok = fetch_result.is_ok(), "fetch of default branch completed");
+        }
         let remote_ref = format!("origin/{default}");
         if revision_exists(dir, &remote_ref).await {
-            tracing::debug!(dir = %dir.display(), base = %remote_ref, "using fresh origin default as launch base");
+            tracing::debug!(dir = %dir.display(), base = %remote_ref, fetched = fetch, "using origin default as launch base");
             return Ok(remote_ref);
         }
     }
@@ -867,6 +877,32 @@ mod tests {
         run(dir, &["remote", "set-head", "origin", "main"]).await;
 
         assert_eq!(default_base(dir).await.unwrap(), "origin/main");
+    }
+
+    /// A local checkout (`fetch = false`) forks from the `origin/main` tracking
+    /// ref it already holds and never contacts the remote — proven here by
+    /// pointing `origin` at a path that does not exist, which a fetch would fail
+    /// on.
+    #[tokio::test]
+    async fn default_base_without_fetch_uses_the_stale_tracking_ref() {
+        let remote = tempfile::tempdir().unwrap();
+        run(remote.path(), &["init", "-q", "--bare", "-b", "main"]).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        run(dir, &["init", "-q", "-b", "main"]).await;
+        run(dir, &["config", "user.email", "t@t.t"]).await;
+        run(dir, &["config", "user.name", "t"]).await;
+        commit(dir, "T0").await;
+        let remote_url = remote.path().to_string_lossy().to_string();
+        run(dir, &["remote", "add", "origin", &remote_url]).await;
+        run(dir, &["push", "-q", "origin", "main"]).await;
+        run(dir, &["fetch", "-q", "origin"]).await;
+        run(dir, &["remote", "set-head", "origin", "main"]).await;
+
+        // The remote is gone: a fetch would now fail. `fetch = false` skips it.
+        std::fs::remove_dir_all(remote.path()).unwrap();
+        assert_eq!(default_base_with(dir, false).await.unwrap(), "origin/main");
     }
 
     /// A base that exists only on `origin` — never fetched into this checkout —

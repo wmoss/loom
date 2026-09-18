@@ -718,7 +718,12 @@ pub async fn create_warm_session(
 
     let launch_permit = st.launch_gate.acquire(&repo_root).await;
     let repo_root_str = repo_root.display().to_string();
-    let base = git::default_base(&repo_root).await?;
+    // Refresh the base from `origin` only for a loom-managed clone; a local
+    // checkout forks from the tracking ref as it stands (see `default_base_with`).
+    let managed_clone = crate::repo::is_managed_clone(&st.db, &repo_root)
+        .await
+        .unwrap_or(true);
+    let base = git::default_base_with(&repo_root, managed_clone).await?;
 
     // A stable, collision-resistant branch slug per watch; if an old warm
     // branch lingers (a prior warm session was archived), suffix to a fresh one.

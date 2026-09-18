@@ -798,8 +798,8 @@ import type {
 } from './types';
 
 export const listProfiles = () => invokeOperation('profiles.list', {});
-export const resolveSessionLaunch = (selection: LaunchSelection) =>
-  invokeOperation('sessions.launches.resolve', { selection });
+export const resolveSessionLaunch = (selection: LaunchSelection, repo?: string) =>
+  invokeOperation('sessions.launches.resolve', { selection, repo: repo || null });
 export const getMcpRegistry = () => invokeOperation('mcps.get', {});
 export const createCustomMcp = (input: CustomMcpInput) =>
   invokeOperation('mcps.custom.create', input);

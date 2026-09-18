@@ -409,6 +409,20 @@ pub(crate) async fn session_view(
     let legacy_sort_order = placement.as_ref().map(|placement| placement.rank as f64);
     let title_generation =
         crate::metadata_assist::title_view(db, &session.id, branch.title_provenance).await?;
+    // A loom-managed clone always drives the GitHub workflow; a local checkout
+    // does only when its launching user has a personal token to push with (a
+    // local checkout never draws the App credential — see `provision`).
+    let github = crate::repo::is_managed_clone(db, std::path::Path::new(&branch.repo_root))
+        .await
+        .unwrap_or(true)
+        || match session.created_by.as_deref() {
+            Some(user) => crate::user_token::get(db, user)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|token| !token.trim().is_empty()),
+            None => false,
+        };
     Ok(SessionView {
         id: session.id.clone(),
         status: session.status.clone(),
@@ -420,6 +434,7 @@ pub(crate) async fn session_view(
         effort: session.effort.clone(),
         github_repo: session.github_repo.clone(),
         github_issue,
+        github,
         last_activity_at: session
             .last_activity_at
             .clone()

@@ -232,6 +232,7 @@ pub async fn run_profile(cmd: ProfileCmd) -> Result<()> {
                         },
                     })
                     .clone(),
+                    repo: None,
                 })
                 .await?;
             println!("{}", serde_json::to_string_pretty(&resolved)?);
@@ -268,6 +269,7 @@ pub async fn run_profile(cmd: ProfileCmd) -> Result<()> {
                         overrides: overrides.clone(),
                     })
                     .clone(),
+                    repo: None,
                 })
                 .await?;
             let parse_environment = |raw: String, secret: bool| -> anyhow::Result<_> {

@@ -668,6 +668,13 @@ async fn create_inner(
         Some(repo) => Some(repo.slug()),
         None => repo::github_slug_for_root(&st.db, &repo_root).await?,
     };
+    // A local checkout the operator pointed loom at (not a loom-managed clone)
+    // runs without GitHub: no credential is required and no App token is drawn,
+    // so `git`/`gh` inside the session land in `disabled` auth mode. A
+    // slug-form `req.repo` is always registered (`registered_path` above rejects
+    // anything else), so only the path form needs the lookup.
+    let managed_clone =
+        managed_slug.is_some() || repo::is_managed_clone(&st.db, &repo_root).await?;
     let configured_github_repositories = launch_profile
         .github_repositories()
         .map_err(|error| ProvisionError::invalid(error.to_string()))?;
@@ -700,14 +707,15 @@ async fn create_inner(
         extra_env = crate::profile::cleared_environment(extra_env, &allowlist);
     }
     tracing::debug!(model = %model, effort = %effort, protocol = %protocol, "resolved and validated model/effort/protocol");
-    let github_app = if crate::runtime::scopes_an_app_token(&session_github_repositories)
-        || (launch_profile.restricted && managed_slug.is_some())
+    let github_app = if managed_clone
+        && (crate::runtime::scopes_an_app_token(&session_github_repositories)
+            || (launch_profile.restricted && managed_slug.is_some()))
     {
         st.trigger.app()
     } else {
         None
     };
-    if current_github_repo.is_some()
+    if managed_clone
         && !crate::runtime::github_credential_available(
             &st.db,
             created_by.as_deref(),
@@ -807,6 +815,16 @@ async fn create_inner(
     let mut github_repo = None;
     let mut github_issue: Option<i64> = None;
     if let Some(number) = req.issue {
+        // Seeding from a GitHub issue reads it with loom's App installation
+        // token. A local checkout is not a loom-managed repository and its
+        // `origin` is caller-controlled, so honouring this would let any user
+        // read issues from any repo the App is installed on by pointing a
+        // throwaway checkout at it.
+        if !managed_clone {
+            return Err(ProvisionError::invalid(
+                "seeding a session from a GitHub issue requires a loom-managed repository",
+            ));
+        }
         tracing::info!(issue = number, repo = %repo_root.display(), "fetching github issue to seed session");
         let issue = fetch_launch_issue(&st, &repo_root, managed_slug.as_ref(), number)
             .await
@@ -897,12 +915,13 @@ async fn create_inner(
         ));
     }
 
-    // Unless the caller pins a base, fork from a freshly-fetched `origin/<default
-    // branch>` so new work starts from the latest mainline. `default_base`
-    // degrades to the current branch on a remote-less repo.
+    // Unless the caller pins a base, fork from `origin/<default branch>`. For a
+    // loom-managed clone that ref is refreshed from the network first, so work
+    // starts from the latest mainline; for a local checkout loom uses the ref as
+    // it stands and never touches `origin`.
     let mut base = match req.base.clone() {
         Some(b) => b,
-        None => git::default_base(&repo_root).await?,
+        None => git::default_base_with(&repo_root, managed_clone).await?,
     };
     tracing::debug!(base = %base, "resolved base branch");
 
