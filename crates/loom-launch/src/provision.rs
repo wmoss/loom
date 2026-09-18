@@ -3,7 +3,9 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
+use regex::Regex;
 use serde_json::json;
 use weaver_api::{LaunchOverrides, LaunchSelection, ResolvedLaunchView};
 use weaver_core::branch as branch_mod;
@@ -1523,20 +1525,44 @@ fn build_launch_prompt(
     scratch: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
-    if !goal.is_empty() {
-        parts.push(goal);
+    let templated_goal = template_goal(instructions, goal);
+    let profile_instructions = profile_instructions_section(instructions);
+    if let Some(rendered) = templated_goal.as_deref() {
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
         if prelude == "weaver" {
             parts.push(entrance);
         }
-    }
-    let profile_instructions = profile_instructions_section(instructions);
-    if let Some(instructions) = profile_instructions.as_deref() {
-        parts.push(instructions);
+    } else {
+        if !goal.is_empty() {
+            parts.push(goal);
+            if prelude == "weaver" {
+                parts.push(entrance);
+            }
+        }
+        if let Some(instructions) = profile_instructions.as_deref() {
+            parts.push(instructions);
+        }
     }
     if let Some(scratch) = scratch {
         parts.push(scratch);
     }
     parts.join("\n\n")
+}
+
+/// Substitute `{{ goal }}` into a profile's opening instructions, if present.
+/// Returns `None` when the placeholder is absent so callers fall back to the
+/// default layout (goal first, instructions appended after).
+fn template_goal(instructions: &str, goal: &str) -> Option<String> {
+    static PLACEHOLDER: OnceLock<Regex> = OnceLock::new();
+    let placeholder = PLACEHOLDER.get_or_init(|| Regex::new(r"\{\{\s*goal\s*\}\}").unwrap());
+    let instructions = instructions.trim();
+    placeholder.is_match(instructions).then(|| {
+        placeholder
+            .replace_all(instructions, |_: &regex::Captures| goal.to_string())
+            .into_owned()
+    })
 }
 
 pub(crate) fn profile_instructions_section(instructions: &str) -> Option<String> {
@@ -1788,6 +1814,48 @@ mod tests {
             ),
             "do the work\n\nWeaver context.\n\n## Profile instructions\n\nUse the organization workflow."
                 .to_string()
+        );
+    }
+
+    #[test]
+    fn profile_instructions_template_the_goal_in_place() {
+        let instructions = "Handle this ticket: {{goal}}\n\nFollow the SOP.";
+        assert_eq!(
+            build_launch_prompt("Fix bug X", "none", instructions, "unused", None),
+            "Handle this ticket: Fix bug X\n\nFollow the SOP."
+        );
+        assert_eq!(
+            build_launch_prompt("Fix bug X", "weaver", instructions, "Weaver context.", None),
+            "Handle this ticket: Fix bug X\n\nFollow the SOP.\n\nWeaver context."
+        );
+    }
+
+    #[test]
+    fn profile_instructions_placeholder_tolerates_inner_whitespace() {
+        let instructions = "Handle this ticket: {{ goal }}";
+        assert_eq!(
+            build_launch_prompt("Fix bug X", "none", instructions, "unused", None),
+            "Handle this ticket: Fix bug X"
+        );
+    }
+
+    #[test]
+    fn profile_instructions_without_the_placeholder_default_to_the_prior_layout() {
+        // No `{{goal}}` in the instructions: same behavior as before templating
+        // existed, goal first and instructions appended as their own section.
+        let instructions = "Use the organization workflow.";
+        assert_eq!(
+            build_launch_prompt("do the work", "none", instructions, "unused", None),
+            "do the work\n\n## Profile instructions\n\nUse the organization workflow."
+        );
+    }
+
+    #[test]
+    fn goal_placeholder_survives_an_empty_goal() {
+        let instructions = "Ticket: {{goal}}";
+        assert_eq!(
+            build_launch_prompt("", "none", instructions, "unused", None),
+            "Ticket: "
         );
     }
 }
