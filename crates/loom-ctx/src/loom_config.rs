@@ -59,6 +59,21 @@ pub struct LoomConfig {
     pub anthropic_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_auth_token: Option<String>,
+    /// Stored inline, not as a host file path like `tls_cert_file`: the
+    /// destination already lives inside the `loom_home` volume mount, so a
+    /// conditional bind-mount would have to nest inside another mount rather
+    /// than stand alone — matches `github_app_private_key`, the other
+    /// multi-line secret this struct carries inline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_auth_json: Option<String>,
+    /// Opencode's own `opencode.json`, verbatim — written to
+    /// `~/.config/opencode/opencode.json` in standalone mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_config_json: Option<String>,
     /// Slack app-level token (`xapp-…`, needs `connections:write`) — opens the
     /// Socket Mode websocket. With both this and `slack_bot_token` set, loom
     /// connects to Slack and the `/marinbot` trigger goes live.
@@ -81,6 +96,8 @@ pub struct LoomConfig {
     pub host_gid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<String>,
 }
 
 /// One field's identity in the shared `loom config` contract: its stable
@@ -173,6 +190,30 @@ pub static FIELDS: &[FieldSpec] = &[
         set_fn: |c, v| c.openai_api_key = Some(v),
     },
     FieldSpec {
+        env_name: "CURSOR_API_KEY",
+        secret: true,
+        get_fn: |c| c.cursor_api_key.as_deref(),
+        set_fn: |c, v| c.cursor_api_key = Some(v),
+    },
+    FieldSpec {
+        env_name: "CURSOR_AUTH_TOKEN",
+        secret: true,
+        get_fn: |c| c.cursor_auth_token.as_deref(),
+        set_fn: |c, v| c.cursor_auth_token = Some(v),
+    },
+    FieldSpec {
+        env_name: "OPENCODE_AUTH_JSON",
+        secret: true,
+        get_fn: |c| c.opencode_auth_json.as_deref(),
+        set_fn: |c, v| c.opencode_auth_json = Some(v),
+    },
+    FieldSpec {
+        env_name: "OPENCODE_CONFIG_JSON",
+        secret: true,
+        get_fn: |c| c.opencode_config_json.as_deref(),
+        set_fn: |c, v| c.opencode_config_json = Some(v),
+    },
+    FieldSpec {
         env_name: "LOOM_SLACK_APP_TOKEN",
         secret: true,
         get_fn: |c| c.slack_app_token.as_deref(),
@@ -219,6 +260,12 @@ pub static FIELDS: &[FieldSpec] = &[
         secret: false,
         get_fn: |c| c.image.as_deref(),
         set_fn: |c, v| c.image = Some(v),
+    },
+    FieldSpec {
+        env_name: "LOOM_AGENTS",
+        secret: false,
+        get_fn: |c| c.agents.as_deref(),
+        set_fn: |c, v| c.agents = Some(v),
     },
 ];
 
@@ -445,6 +492,10 @@ mod tests {
                 "LOOM_GITHUB_CLIENT_SECRET",
                 "ANTHROPIC_API_KEY",
                 "OPENAI_API_KEY",
+                "CURSOR_API_KEY",
+                "CURSOR_AUTH_TOKEN",
+                "OPENCODE_AUTH_JSON",
+                "OPENCODE_CONFIG_JSON",
                 "LOOM_SLACK_APP_TOKEN",
                 "LOOM_SLACK_BOT_TOKEN",
             ]

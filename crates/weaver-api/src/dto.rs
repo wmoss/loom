@@ -2568,6 +2568,11 @@ pub struct ShellRestartResult {
 pub struct AgentChoiceView {
     pub id: String,
     pub label: String,
+    /// For a model choice: the effort levels valid for this model, harness
+    /// order. Empty for an effort choice or a model without per-model efforts —
+    /// the picker then falls back to the agent's global `efforts` list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<AgentChoiceView>,
 }
 
 /// One agent runtime the picker offers — a builtin (`claude`, `codex`) or an
@@ -2587,6 +2592,13 @@ pub struct AgentMetadataView {
     pub supports_acp: bool,
     /// The agent's declared execution backend: `"terminal"` or `"acp"`.
     pub protocol: String,
+    /// Whether the agent binary is available on the system PATH. The UI hides
+    /// unavailable harnesses (e.g. when `codex` is not installed).
+    pub available: Option<bool>,
+    /// True when a model's effort choices aren't carried in `models[].efforts`
+    /// and must be fetched with `agents.model_efforts` once the picker
+    /// actually selects that model.
+    pub effort_lookup: bool,
 }
 
 /// One operator-defined custom agent definition — a row of the

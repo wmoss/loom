@@ -2604,6 +2604,9 @@ function goTo(anchor: string) {
   left: 0;
   z-index: 20;
   min-width: 9rem;
+  max-height: min(60vh, 22rem);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   border: 1px solid var(--line);
   border-radius: 0.375rem;
   background: var(--surface);

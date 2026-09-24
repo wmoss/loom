@@ -111,6 +111,11 @@ and why; you don't hand-edit `.env` itself.
 | `LOOM_SLACK_APP_TOKEN` / `LOOM_SLACK_BOT_TOKEN` | for `/marinbot` | App-level and bot OAuth tokens for the Slack Socket Mode trigger. Both unset (the default) leaves it off. See [docs/slack-trigger.md](../docs/slack-trigger.md). |
 | `ANTHROPIC_API_KEY` | for Claude | API key for the Claude agents. Alternatively log in interactively (see [first-run](#agent-authentication)). |
 | `OPENAI_API_KEY` | for Codex | API key for the Codex agents; only needed if you launch the `codex` runtime. Alternatively log in interactively (see [first-run](#agent-authentication)). |
+| `LOOM_AGENTS` | no (`claude,codex`) | Comma-separated subset of `claude,codex,opencode,cursor-agent` for `loom-entrypoint` to install into the container. Add `opencode` and/or `cursor-agent` to enable those runtimes; see [Agent runtime](#agent-runtime--client-packages). |
+| `CURSOR_API_KEY` | for Cursor | User API key for the `cursor-agent` CLI (Cursor Dashboard → API Keys). Alternatively log in interactively or set `CURSOR_AUTH_TOKEN` (see [first-run](#agent-authentication)). Only relevant if `cursor-agent` is in `LOOM_AGENTS`. |
+| `CURSOR_AUTH_TOKEN` | no | A long-lived Cursor session token, as an alternative to `CURSOR_API_KEY`. Cursor documents this only for its ACP mode (which is how Loom always launches it), with no stated format or lifetime. |
+| `OPENCODE_AUTH_JSON` | for Opencode | Raw contents of Opencode's own credential store, e.g. `{"anthropic":{"type":"api","key":"sk-…"}}` — written verbatim to `~/.local/share/opencode/auth.json` on every boot. Only relevant if `opencode` is in `LOOM_AGENTS`. |
+| `OPENCODE_CONFIG_JSON` | for Opencode | Raw contents of Opencode's own `opencode.json` — written verbatim to `~/.config/opencode/opencode.json` on every boot. Only relevant if `opencode` is in `LOOM_AGENTS`. |
 | `LOOM_GITHUB_CLIENT_ID` / `_SECRET` | for login | GitHub OAuth app — the owner's only way to sign in on a fresh DB (see [first-run](#first-run-login)). Callback: `https://<LOOM_DOMAIN>/api/auth/github/callback`. |
 | `LOOM_TLS_EMAIL` | no | ACME contact for cert-expiry notices; only used if you uncomment the global block in the Caddyfile. |
 | `LOOM_TLS_CERT_FILE` / `_KEY_FILE` | no | Paths to a pre-generated certificate/key pair, in place of Caddy's automatic HTTPS. Both or neither. See [Bring your own certificate](#bring-your-own-certificate). |
@@ -119,8 +124,8 @@ and why; you don't hand-edit `.env` itself.
 | `DOCKER_GID` | **yes** | Host `docker` group gid the loom container joins to reach the bind-mounted Docker socket for in-session `docker build` (see [Agent runtime](#agent-runtime--client-packages)). `run.py` derives it from the host automatically; the raw `docker compose` Quick start needs it exported by hand. No default — deliberately: on Docker Desktop, where there's no host `docker` group to find, `0` opts into a chmod fallback (`loom-docker-socket-init` in the Dockerfile) that makes the host's `docker.sock` world-writable, which must never happen silently just because a real Linux host's operator forgot to export it. |
 
 Every one of these is an ordinary `loom.toml` field (`tls_email`, `host_uid`,
-`host_gid`, `image`, alongside the credential fields above) — there's no
-special carve-out. You can also always override any of them for one
+`host_gid`, `image`, `agents`, alongside the credential fields above) — there's
+no special carve-out. You can also always override any of them for one
 invocation without touching `loom.toml`, by exporting the same-named env var:
 `loom config render-env`/`push-secrets` resolve `loom.toml` *and* the process
 environment, with the environment winning (see `loom_config`'s module docs).
@@ -132,10 +137,15 @@ profile's allowlisted App access. Session runtimes also need their
 model-provider keys. Run
 `loom setup secrets --config /home/app/loom.toml` via `docker compose exec loom`
 against the running deploy, or as part of the [Quick start](#quick-start)
-sequence before first start. It prompts for `ANTHROPIC_API_KEY` and
-`OPENAI_API_KEY`, and stores them as operator environment variables, live for
-every session from then on, no restart. Leave a key blank to skip it. Run it in
-addition to (not instead of) rendering them into `.env` above.
+sequence before first start. It prompts for `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, `CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`, `OPENCODE_AUTH_JSON`,
+and `OPENCODE_CONFIG_JSON`, and stores the first four as operator environment
+variables, live for every session from then on, no restart.
+`OPENCODE_AUTH_JSON` and `OPENCODE_CONFIG_JSON` only ever land in `loom.toml` —
+they're files Opencode reads, not env vars, so they need a restart (see
+[Agent authentication](#agent-authentication)). Leave
+a key blank to skip it. Run it in addition to (not instead of) rendering them
+into `.env` above.
 
 ## Security posture
 
@@ -347,6 +357,31 @@ the launching user's Loom-stored Account PAT or a session-brokered App token;
 restricted profiles perform GitHub mutations through Loom's server-side
 App-backed endpoint.
 
+Opencode and Cursor are opt-in — add them to `LOOM_AGENTS` (see
+[Required environment](#required-environment)) before they're installed and
+shown as available at all:
+
+- **Cursor (`cursor-agent`)** — set `CURSOR_API_KEY` to a user API key from
+  Cursor Dashboard → API Keys, set `CURSOR_AUTH_TOKEN` to a long-lived session
+  token, or log in interactively once (persisted under
+  `~/.local/share/cursor-agent` on the `loom_home` volume):
+
+  ```sh
+  docker compose exec loom cursor-agent login    # follow the prompts, then exit
+  ```
+
+- **Opencode** — set `OPENCODE_AUTH_JSON` to the contents of the provider
+  credentials it expects, e.g. `{"anthropic":{"type":"api","key":"sk-…"}}`;
+  `loom-entrypoint` writes it to `~/.local/share/opencode/auth.json` on every
+  boot. Set `OPENCODE_CONFIG_JSON` the same way for its `opencode.json`, written
+  to `~/.config/opencode/opencode.json`. Alternatively log in interactively once
+  (the file persists on the `loom_home` volume either way, but a later boot with
+  `OPENCODE_AUTH_JSON` set overwrites it):
+
+  ```sh
+  docker compose exec loom opencode auth login    # follow the prompts, then exit
+  ```
+
 ## Wire the `@loom` GitHub trigger
 
 Opening or editing an issue whose body adds **`@loom work on this`**, or creating
@@ -417,21 +452,39 @@ volume would mount root-owned. To put repos on their own disk, point
 
 The agent tooling the image ships splits by how it updates:
 
-- **The agent runtimes install into the persistent home volume.** The container
-  runs as a non-root user, so a runtime installed into the read-only system dirs
-  could neither self-update (Claude reports "installed in a read-only location")
-  nor be bumped live. The daemon installs both native CLIs into the persisted
-  `loom_home` volume (`~/.local/bin`). Updates survive `up`/`down`/recreate.
-  On every server start, the entrypoint
-  checks the installed versions against `CLAUDE_CODE_VERSION` (default
-  `2.1.280`) and `CODEX_CLI_VERSION` (default `0.156.1`). It installs a
-  mismatched version before starting Loom and fails startup if either pinned
-  version is unavailable. The ACP adapters are checked and installed the same
-  way, at `CLAUDE_ACP_VERSION=0.81.1` and `CODEX_ACP_VERSION=1.13.1` by default.
-  This makes a new image update existing installations on the volume too.
+  nor be bumped live. Instead, the first time the daemon starts it installs the
+  native CLIs `LOOM_AGENTS` selects (default `claude,codex`, so an existing
+  deploy is unaffected) into the persisted `loom_home` volume (`~/.local/bin`,
+  or `~/.opencode/bin` for Opencode), where updates land without a rebuild and
+  survive `up`/`down`/recreate.
+  - **Claude and Codex are pinned and required whenever `LOOM_AGENTS` selects
+    them.** On every server start, the entrypoint checks the installed
+    versions against `CLAUDE_CODE_VERSION` (default `2.1.280`) and
+    `CODEX_CLI_VERSION` (default `0.156.1`), installs a mismatched version
+    before starting Loom, and **fails startup** if either pinned version is
+    unavailable — a new image update therefore updates an existing volume's
+    installs too. The ACP adapters are checked and installed the same way, at
+    `CLAUDE_ACP_VERSION=0.81.1` and `CODEX_ACP_VERSION=1.13.1` by default.
+    Override a version in the `loom` service's `environment:` in
+    [`docker-compose.yml`](standalone/docker-compose.yml).
+  - **Opencode and Cursor are opt-in and best-effort.** Add `opencode`
+    and/or `cursor-agent` to `LOOM_AGENTS` to have `loom-entrypoint` install
+    them; see [Agent authentication](#agent-authentication) for their
+    credentials. Unlike Claude/Codex, a failed or missing install here only
+    warns — the daemon still starts, just without that runtime until a later
+    networked boot. Each updates on demand: remove its binary
+    (`~/.opencode/bin/opencode`, `~/.local/bin/cursor-agent`) and restart the
+    service to reinstall it.
 
-  To override a version in a standalone deployment, set it in the `loom`
-  service's `environment:` in [`docker-compose.yml`](standalone/docker-compose.yml).
+  Set `LOOM_AGENTS` and any version pin in the `loom` service's `environment:`
+  in [`docker-compose.yml`](standalone/docker-compose.yml), or as a
+  `loom.toml` field rendered into `.env`. `LOOM_AGENTS` only ever *installs* —
+  dropping an agent from it doesn't remove a binary a previous boot (with a
+  different `LOOM_AGENTS`) already installed on the persisted volume, so it
+  stays picker-visible until you remove it by hand (the entrypoint warns when
+  this happens, naming the exact path to remove). A misspelled entry (`cursor`
+  instead of `cursor-agent`) is warned about the same way rather than silently
+  installing nothing.
 
 - **Command sandboxing.** The image ships `bubblewrap` + `socat`, the sandbox
   the runtimes reach for on Linux: Claude Code's sandboxed Bash runs commands

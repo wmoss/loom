@@ -442,7 +442,13 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub fn initialize_params() -> Value {
     serde_json::json!({
         "protocolVersion": PROTOCOL_VERSION,
-        "clientCapabilities": {},
+        "clientCapabilities": {
+            // Cursor only splits its bundled `model[effort=…,fast=…]` value
+            // into separate `model`/`effort`/`fast` config options once the
+            // client opts into this (verified live); other adapters ignore
+            // the unrecognized `_meta` field.
+            "_meta": { "parameterizedModelPicker": true },
+        },
     })
 }
 
