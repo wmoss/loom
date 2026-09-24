@@ -221,7 +221,8 @@ async fn validate_input(
         .await?
         .ok_or_else(|| anyhow!("unknown agent '{agent_kind}'"))?;
     crate::agent::validate_model(&meta, input.model.trim()).map_err(|e| anyhow!(e))?;
-    crate::agent::validate_effort(&meta, input.effort.trim()).map_err(|e| anyhow!(e))?;
+    crate::agent::validate_effort(&meta, input.model.trim(), input.effort.trim())
+        .map_err(|e| anyhow!(e))?;
     let protocol = crate::agent::resolve_protocol(
         &meta,
         (!input.protocol.trim().is_empty()).then_some(input.protocol.trim()),

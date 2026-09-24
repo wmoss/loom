@@ -7,7 +7,7 @@ use weaver_api::{
 use crate::profile::{self, Profile, ProfileInput};
 
 use super::operations::{register, Bound, OperationContext};
-use super::{ApiResult, AppError, AppState};
+use super::{env, ApiResult, AppError, AppState};
 
 pub(super) fn input(req: profiles_operations::update::Input, name: String) -> ProfileInput {
     ProfileInput {
@@ -441,6 +441,9 @@ pub(super) async fn set_profile_env_operation(
         )),
     }
     .map_err(|e| AppError::bad_request(e.to_string()))?;
+    if profile_name == profile::DEFAULT_PROFILE {
+        env::invalidate_cursor_catalog_if_credential(&name);
+    }
     let item = profile::get(&st.db, &profile_name)
         .await?
         .ok_or_else(|| AppError::not_found("profile"))?;
@@ -459,6 +462,9 @@ pub(super) async fn delete_profile_env_operation(
         .await?
         .ok_or_else(|| AppError::not_found("profile"))?;
     profile::env_remove(&st.db, &profile_name, &name).await?;
+    if profile_name == profile::DEFAULT_PROFILE {
+        env::invalidate_cursor_catalog_if_credential(&name);
+    }
     let item = profile::get(&st.db, &profile_name)
         .await?
         .ok_or_else(|| AppError::not_found("profile"))?;
