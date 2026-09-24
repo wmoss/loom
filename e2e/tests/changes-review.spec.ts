@@ -1,6 +1,21 @@
 import { expect, test } from '../fixtures/weaver';
+import type { Locator } from '@playwright/test';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
+
+// The diff view's per-line "add a comment" control is a `+` button that only
+// becomes interactive once its row is hovered (`@git-diff-view/vue` renders
+// it `invisible` until `group-hover`), scoped to one side's table so the old
+// and new gutters never collide.
+async function addWidgetButton(
+  fileArticle: Locator,
+  side: 'old' | 'new',
+  line: number,
+): Promise<Locator> {
+  const row = fileArticle.locator(`table[data-mode="${side}"] tr[data-line="${line}"]`);
+  await row.hover();
+  return row.locator('button.diff-add-widget');
+}
 
 test('preserves Changes drafts through refresh and peer-submit conflicts', async ({
   page,
@@ -14,8 +29,10 @@ test('preserves Changes drafts through refresh and peer-submit conflicts', async
   writeFileSync(changedPath, 'first\nsecond\n');
 
   await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
-  await page.getByRole('button', { name: /review\.txt/ }).click();
-  await page.getByRole('button', { name: /Comment on review\.txt new line 1/ }).click();
+  const fileToggle = page.getByRole('button', { name: /review\.txt/ });
+  await fileToggle.click();
+  const article = page.locator('article').filter({ has: fileToggle });
+  await (await addWidgetButton(article, 'new', 1)).click();
   const composer = page.getByTestId('change-comment-composer');
   const input = composer.locator('textarea');
   await input.fill('Explain why this line belongs here.');
@@ -42,7 +59,7 @@ test('preserves Changes drafts through refresh and peer-submit conflicts', async
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
   await staleSave;
   await expect(input).toHaveValue('Explain why this line belongs here.');
-  await page.getByRole('button', { name: /Comment on review\.txt new line 2/ }).click();
+  await (await addWidgetButton(article, 'new', 2)).click();
   await expect(input).toHaveValue('Explain why this line belongs here.');
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
 
