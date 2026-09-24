@@ -17,6 +17,15 @@ async fn env_vars(db: &Db) -> ApiResult<Vec<AgentEnvVarView>> {
     Ok(agent_env::list(db).await?)
 }
 
+/// Cursor's catalogue probe authenticates from the stored environment, so a
+/// change to its credentials must drop the cached result to take effect now
+/// rather than at the next TTL expiry.
+pub(super) fn invalidate_cursor_catalog_if_credential(name: &str) {
+    if name == "CURSOR_API_KEY" || name == "CURSOR_AUTH_TOKEN" {
+        crate::agent::invalidate_builtin_catalog("cursor-agent");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Operation registry — `settings.env.*`. Bound from `web/settings.rs`'s
 // `bound_operations()` (the `settings` bundle owns the descriptors), since
@@ -45,6 +54,7 @@ pub(super) async fn set_settings_env_operation(
         .acquire_profile(profile::DEFAULT_PROFILE)
         .await;
     profile::env_set(&st.db, profile::DEFAULT_PROFILE, &input.name, &input.value).await?;
+    invalidate_cursor_catalog_if_credential(&input.name);
     env_vars(&st.db).await
 }
 
@@ -60,5 +70,6 @@ pub(super) async fn delete_settings_env_operation(
         .acquire_profile(profile::DEFAULT_PROFILE)
         .await;
     profile::env_remove(&st.db, profile::DEFAULT_PROFILE, &input.name).await?;
+    invalidate_cursor_catalog_if_credential(&input.name);
     env_vars(&st.db).await
 }

@@ -25,6 +25,7 @@ fn agent_choice_view(c: crate::agent::AgentChoice) -> AgentChoiceView {
     AgentChoiceView {
         id: c.id,
         label: c.label,
+        efforts: c.efforts.into_iter().map(agent_choice_view).collect(),
     }
 }
 
@@ -39,6 +40,8 @@ fn agent_metadata_view(m: crate::agent::AgentMetadata) -> AgentMetadataView {
         builtin: m.builtin,
         supports_acp: m.supports_acp,
         protocol: m.protocol,
+        available: m.available,
+        effort_lookup: m.effort_lookup,
     }
 }
 
@@ -72,6 +75,7 @@ pub(super) fn bound_operations() -> Vec<Bound> {
         register::<ops::custom::create::Op, _, _>(custom_create_operation),
         register::<ops::custom::update::Op, _, _>(custom_update_operation),
         register::<ops::custom::delete::Op, _, _>(custom_delete_operation),
+        register::<ops::model_efforts::Op, _, _>(model_efforts_operation),
     ]
 }
 
@@ -98,6 +102,20 @@ async fn list_operation(
             .map(custom_agent_view)
             .collect(),
         default_agent,
+    })
+}
+
+/// `agents.model_efforts` — the on-demand per-model effort lookup for a
+/// harness whose catalogue doesn't carry it eagerly (see
+/// `AgentMetadataView::effort_lookup`).
+async fn model_efforts_operation(
+    context: OperationContext,
+    input: ops::model_efforts::Input,
+) -> ApiResult<ops::model_efforts::Output> {
+    let st = context.state;
+    let efforts = crate::agent::model_efforts(&input.agent, &input.model, &st.db).await;
+    Ok(ops::model_efforts::Output {
+        efforts: efforts.into_iter().map(agent_choice_view).collect(),
     })
 }
 
