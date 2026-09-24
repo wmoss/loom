@@ -117,6 +117,30 @@ pub mod list {
     pub type Output = AgentsView;
 }
 
+pub mod model_efforts {
+    use super::prelude::*;
+
+    /// The effort levels available for one specific agent/model pair. Called
+    /// once the picker selects a model, for a harness whose catalogue doesn't
+    /// carry per-model efforts up front (`AgentMetadataView::effort_lookup`) —
+    /// probing every model live during `agents.list` would be too slow.
+    #[operation(id = "agents.model_efforts", actor = SessionSelf, scope = Global, risk = Read,
+                grants = ["loom/agents/read@v1"], cli = "agents model-efforts")]
+    pub struct Input {
+        /// The agent runtime kind (e.g. `cursor-agent`).
+        #[operand(positional)]
+        pub agent: String,
+        /// The exact model id as advertised by that runtime's catalogue.
+        #[operand(positional)]
+        pub model: String,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+    pub struct Output {
+        pub efforts: Vec<AgentChoiceView>,
+    }
+}
+
 pub mod oneshot {
     use super::prelude::*;
 
@@ -156,6 +180,7 @@ static OPERATIONS: &[&OperationSpec] = &[
     custom::create::SPEC,
     custom::update::SPEC,
     custom::delete::SPEC,
+    model_efforts::SPEC,
     oneshot::SPEC,
 ];
 

@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { computed, ref, useId, watch } from 'vue';
 import type {
+  AgentChoice,
   AgentMetadata,
   CloneProfileEnvironment,
   McpRegistry,
   ProfileEnv,
   ProfileInput,
 } from '../types';
+import { getModelEfforts } from '../api';
+import { agentOptionsWithCurrent, isAgentAvailable } from '../lib/agentAvailability';
 import ModelCombobox from './ModelCombobox.vue';
 
 const props = withDefaults(
@@ -26,9 +29,60 @@ const envName = ref('');
 const envValue = ref('');
 const envKind = ref<'literal' | 'gcp_secret'>('literal');
 
+// The profile's own agent stays selectable even when its harness is missing,
+// so opening an existing profile never silently rewrites its agent.
+const agentOptions = computed(() => agentOptionsWithCurrent(props.agents, draft.value.agent_kind));
 const selectedAgent = computed(() =>
   props.agents.find((agent) => agent.kind === draft.value.agent_kind),
 );
+// Effort choices track the selected model when the harness scopes them per
+// model: a known model with its own non-empty list uses that list; an empty
+// per-model list, a raw-typed model, or no model selected all fall back to
+// the agent's global superset — mirroring `validate_effort` on the backend.
+//
+// A harness flagged `effort_lookup` (cursor-agent) carries no per-model
+// efforts in its catalogue — probing every model live to populate it up front
+// is too slow — so they're fetched on demand for whichever model is selected,
+// catalogue entry or raw-typed id alike, and that list is authoritative; see
+// the `watch` below, which also re-validates `draft.value.effort` once the
+// fetch resolves rather than `normalizeAgentChoices` doing it synchronously
+// against a list that isn't loaded yet.
+const lookedUpEfforts = ref<AgentChoice[]>([]);
+const effortsLoading = ref(false);
+watch(
+  () => [selectedAgent.value?.kind, selectedAgent.value?.effort_lookup, draft.value.model] as const,
+  ([kind, needsLookup, model], _old, onCleanup) => {
+    lookedUpEfforts.value = [];
+    effortsLoading.value = false;
+    if (!needsLookup || !kind || !model) return;
+    let stale = false;
+    onCleanup(() => {
+      stale = true;
+    });
+    effortsLoading.value = true;
+    getModelEfforts(kind, model)
+      .then((efforts) => {
+        if (stale) return;
+        lookedUpEfforts.value = efforts;
+        if (draft.value.effort && !efforts.some((choice) => choice.id === draft.value.effort)) {
+          draft.value.effort = '';
+        }
+      })
+      .finally(() => {
+        if (!stale) effortsLoading.value = false;
+      });
+  },
+  { immediate: true },
+);
+
+const effortChoices = computed(() => {
+  if (selectedAgent.value?.effort_lookup) {
+    return lookedUpEfforts.value;
+  }
+  const known = selectedAgent.value?.models.find((m) => m.id === draft.value.model);
+  const modelEfforts = known?.efforts ?? [];
+  return modelEfforts.length ? modelEfforts : (selectedAgent.value?.efforts ?? []);
+});
 const mcpGroups = computed(() => {
   const groups = new Map<string, boolean>();
   for (const set of props.mcpRegistry?.capability_sets ?? []) groups.set(set.group, true);
@@ -97,8 +151,18 @@ function normalizeAgentChoices(metadata = selectedAgent.value) {
   ) {
     draft.value.model = '';
   }
-  if (draft.value.effort && !metadata.efforts.some((choice) => choice.id === draft.value.effort)) {
+  // An `effort_lookup` harness's own `watch` above re-validates the effort
+  // once its async fetch resolves; checking here too would clear it against
+  // a list that hasn't loaded yet.
+  if (
+    !metadata.effort_lookup &&
+    draft.value.effort &&
+    !effortChoices.value.some((choice) => choice.id === draft.value.effort)
+  ) {
     draft.value.effort = '';
+  }
+  if (draft.value.protocol === 'acp' && metadata.supports_acp === false) {
+    draft.value.protocol = '';
   }
 }
 
@@ -135,7 +199,20 @@ function setEnvironment() {
   envValue.value = '';
 }
 
-watch(selectedAgent, normalizeAgentChoices);
+watch(selectedAgent, () => normalizeAgentChoices());
+// Changing the model can narrow the valid effort levels.
+watch(
+  () => draft.value.model,
+  () => normalizeAgentChoices(),
+);
+
+// A new agent has its own models/efforts — reset both rather than carry a
+// selection that doesn't apply. Driven off the control's `change` event, not a
+// `watch`, so loading a different profile keeps its saved model/effort.
+function onAgentChange() {
+  draft.value.model = '';
+  draft.value.effort = '';
+}
 watch(
   () => draft.value.restricted,
   (restricted) => {
@@ -179,9 +256,10 @@ watch(
         data-testid="profile-agent"
         :disabled="disabled"
         class="min-w-0 rounded bg-input px-2 py-1.5"
+        @change="onAgentChange"
       >
-        <option v-for="agent in agents" :key="agent.kind" :value="agent.kind">
-          {{ agent.label }}
+        <option v-for="agent in agentOptions" :key="agent.kind" :value="agent.kind">
+          {{ agent.label }}{{ isAgentAvailable(agent) ? '' : ' — unavailable' }}
         </option>
       </select>
     </div>
@@ -239,7 +317,14 @@ watch(
       </select>
     </div>
     <div class="grid min-w-0 gap-1">
-      <label class="text-xs" :for="`${uid}-effort`">Effort</label>
+      <label class="flex items-center gap-1.5 text-xs" :for="`${uid}-effort`">
+        Effort
+        <span
+          v-if="effortsLoading"
+          class="inline-block h-3 w-3 animate-spin rounded-full border border-current border-t-transparent"
+          aria-label="Loading effort levels"
+        />
+      </label>
       <select
         :id="`${uid}-effort`"
         v-model="draft.effort"
@@ -248,7 +333,7 @@ watch(
         class="min-w-0 rounded bg-input px-2 py-1.5"
       >
         <option value="">Agent default</option>
-        <option v-for="effort in selectedAgent?.efforts ?? []" :key="effort.id" :value="effort.id">
+        <option v-for="effort in effortChoices" :key="effort.id" :value="effort.id">
           {{ effort.label }}
         </option>
       </select>
@@ -263,7 +348,7 @@ watch(
         class="min-w-0 rounded bg-input px-2 py-1.5"
       >
         <option value="">Agent default</option>
-        <option value="acp">ACP</option>
+        <option v-if="selectedAgent?.supports_acp !== false" value="acp">ACP</option>
         <option value="terminal">Terminal</option>
       </select>
     </div>

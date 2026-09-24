@@ -375,6 +375,11 @@ pub async fn serve(state: AppState, listener: TcpListener) -> Result<()> {
         Ok(_) => tracing::debug!("machine-local token ready"),
         Err(e) => tracing::warn!("could not prepare the machine-local token: {e}"),
     }
+    // Prime the harness model/effort catalogues so the first agent picker is
+    // served from cache instead of shelling out to every installed binary.
+    weaver_core::spawn_boxed(Box::pin(crate::agent::warm_builtin_catalogs(
+        state.db.clone(),
+    )));
     weaver_core::spawn_boxed(Box::pin(monitor::run(state.clone())));
     weaver_core::spawn_boxed(Box::pin(repair_acp_sessions_loop(state.clone())));
     weaver_core::spawn_boxed(Box::pin(reap_expired_github_authorizations(state.clone())));

@@ -295,7 +295,7 @@ async fn legacy_handoff_plan(
         .unwrap_or_default()
         .to_string();
     crate::agent::validate_model(&metadata, &model).map_err(HandoffError::bad_request)?;
-    crate::agent::validate_effort(&metadata, &effort).map_err(HandoffError::bad_request)?;
+    crate::agent::validate_effort(&metadata, &model, &effort).map_err(HandoffError::bad_request)?;
     let protocol =
         crate::agent::resolve_protocol(&metadata, None).map_err(HandoffError::bad_request)?;
     if protocol != "acp" {

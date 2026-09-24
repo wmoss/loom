@@ -1,15 +1,26 @@
 <script setup lang="ts">
-import { computed, useId } from 'vue';
-import type { AgentMetadata, LaunchOverrides, ResolvedLaunch } from '../types';
+import { computed, ref, useId, watch } from 'vue';
+import type { AgentChoice, AgentMetadata, LaunchOverrides, ResolvedLaunch } from '../types';
+import { getModelEfforts } from '../api';
+import {
+  agentOptionsWithCurrent,
+  availableAgents,
+  isAgentAvailable,
+} from '../lib/agentAvailability';
 import ModelCombobox from './ModelCombobox.vue';
 
-const props = defineProps<{
-  agents: AgentMetadata[];
-  modelValue: LaunchOverrides;
-  resolved: ResolvedLaunch | null;
-  fallback?: ResolvedLaunch | null;
-  disabled?: boolean;
-}>();
+const props = withDefaults(
+  defineProps<{
+    agents: AgentMetadata[];
+    modelValue: LaunchOverrides;
+    resolved: ResolvedLaunch | null;
+    fallback?: ResolvedLaunch | null;
+    disabled?: boolean;
+    /** Which way the model option list grows; see `ModelCombobox`. */
+    modelDropdownPlacement?: 'left' | 'right';
+  }>(),
+  { modelDropdownPlacement: 'right' },
+);
 
 const emit = defineEmits<{
   'update:modelValue': [LaunchOverrides];
@@ -17,9 +28,56 @@ const emit = defineEmits<{
 const uid = useId();
 const settings = computed(() => props.resolved ?? props.fallback ?? null);
 const effectiveAgent = computed(
-  () => props.modelValue.agent ?? settings.value?.agent ?? props.agents[0]?.kind ?? '',
+  () =>
+    props.modelValue.agent ?? settings.value?.agent ?? availableAgents(props.agents)[0]?.kind ?? '',
 );
+// The effective agent is always an option, marked when its harness is missing,
+// so the control can never display a different agent than the one in effect.
+const agentOptions = computed(() => agentOptionsWithCurrent(props.agents, effectiveAgent.value));
 const metadata = computed(() => props.agents.find((agent) => agent.kind === effectiveAgent.value));
+// Effort choices track the selected model when the harness scopes them per
+// model (codex): a known model with its own non-empty list uses
+// that list; an empty per-model list, a raw-typed model, or no model selected
+// all fall back to the global superset — mirroring `validate_effort` on the
+// backend.
+//
+// A harness flagged `effort_lookup` (cursor-agent) carries no per-model
+// efforts in its catalogue at all — probing every model live to populate it
+// up front is too slow — so they're fetched on demand for whichever model is
+// selected, catalogue entry or raw-typed id alike (`getModelEfforts` handles
+// both), and that fetched list is authoritative.
+const lookedUpEfforts = ref<AgentChoice[]>([]);
+const effortsLoading = ref(false);
+watch(
+  () => [metadata.value?.kind, metadata.value?.effort_lookup, value('model')] as const,
+  ([kind, needsLookup, model], _old, onCleanup) => {
+    lookedUpEfforts.value = [];
+    effortsLoading.value = false;
+    if (!needsLookup || !kind || !model) return;
+    let stale = false;
+    onCleanup(() => {
+      stale = true;
+    });
+    effortsLoading.value = true;
+    getModelEfforts(kind, model)
+      .then((efforts) => {
+        if (!stale) lookedUpEfforts.value = efforts;
+      })
+      .finally(() => {
+        if (!stale) effortsLoading.value = false;
+      });
+  },
+  { immediate: true },
+);
+
+const effortChoices = computed(() => {
+  if (metadata.value?.effort_lookup) {
+    return lookedUpEfforts.value;
+  }
+  const known = metadata.value?.models.find((m) => m.id === value('model'));
+  const modelEfforts = known?.efforts ?? [];
+  return modelEfforts.length ? modelEfforts : (metadata.value?.efforts ?? []);
+});
 
 function value(field: keyof LaunchOverrides): string {
   return props.modelValue[field] ?? (settings.value?.[field] as string | undefined) ?? '';
@@ -32,8 +90,10 @@ function changed(field: keyof LaunchOverrides): boolean {
 function set(field: keyof LaunchOverrides, nextValue: string) {
   const next = { ...props.modelValue, [field]: nextValue };
   if (field === 'agent') {
-    delete next.model;
-    delete next.effort;
+    // A new agent has its own models/efforts — reset both to "Agent default"
+    // rather than carry a selection that doesn't apply.
+    next.model = '';
+    next.effort = '';
   }
   emit('update:modelValue', next);
 }
@@ -63,8 +123,8 @@ function locked(field: keyof LaunchOverrides): boolean {
           class="w-full rounded bg-surface px-2 py-1.5 disabled:opacity-60"
           @change="set('agent', ($event.target as HTMLSelectElement).value)"
         >
-          <option v-for="agent in agents" :key="agent.kind" :value="agent.kind">
-            {{ agent.label }}
+          <option v-for="agent in agentOptions" :key="agent.kind" :value="agent.kind">
+            {{ agent.label }}{{ isAgentAvailable(agent) ? '' : ' — unavailable' }}
           </option>
         </select>
       </label>
@@ -82,6 +142,7 @@ function locked(field: keyof LaunchOverrides): boolean {
           :choices="metadata.models"
           :model-value="value('model')"
           :disabled="locked('model')"
+          :placement="modelDropdownPlacement"
           field-class="bg-surface"
           testid="override-model"
           @update:model-value="set('model', $event)"
@@ -105,7 +166,14 @@ function locked(field: keyof LaunchOverrides): boolean {
 
       <label class="rounded border border-line bg-input p-2 text-xs">
         <span class="mb-1 flex items-center justify-between gap-2">
-          <span class="font-medium text-fg">Effort</span>
+          <span class="flex items-center gap-1.5 font-medium text-fg">
+            Effort
+            <span
+              v-if="effortsLoading"
+              class="inline-block h-3 w-3 animate-spin rounded-full border border-current border-t-transparent"
+              aria-label="Loading effort levels"
+            />
+          </span>
           <span :class="changed('effort') ? 'text-accent' : 'text-faint'">
             {{ changed('effort') ? 'changed' : 'from profile' }}
           </span>
@@ -120,7 +188,7 @@ function locked(field: keyof LaunchOverrides): boolean {
           @change="set('effort', ($event.target as HTMLSelectElement).value)"
         >
           <option value="">Agent default</option>
-          <option v-for="choice in metadata?.efforts ?? []" :key="choice.id" :value="choice.id">
+          <option v-for="choice in effortChoices" :key="choice.id" :value="choice.id">
             {{ choice.label }}
           </option>
         </select>
@@ -172,7 +240,7 @@ function locked(field: keyof LaunchOverrides): boolean {
             class="w-full rounded bg-surface px-2 py-1.5 disabled:opacity-60"
             @change="set('protocol', ($event.target as HTMLSelectElement).value)"
           >
-            <option value="acp">ACP</option>
+            <option v-if="metadata?.supports_acp !== false" value="acp">ACP</option>
             <option value="terminal">Terminal</option>
           </select>
         </label>
