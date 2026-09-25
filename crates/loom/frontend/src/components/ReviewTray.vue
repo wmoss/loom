@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, useId } from 'vue';
+import { computed, onBeforeUnmount, ref, useId, watch } from 'vue';
 import type { Review } from '../types';
 import InlineConfirm from './InlineConfirm.vue';
 
@@ -18,7 +18,9 @@ const props = defineProps<{
   subjectLabel: string;
   discardAction: () => Promise<void>;
   /** Floats bottom-right and expands upward (default). Set false to sit
-   *  inline (e.g. in a header) with its panel popping down below it instead. */
+   *  inline (e.g. in a header) with its panel popping down below it instead;
+   *  that pop-down panel overlays page content and minimizes on outside
+   *  clicks, while the floating dock stays put. */
   floating?: boolean;
 }>();
 const emit = defineEmits<{
@@ -33,10 +35,29 @@ const emit = defineEmits<{
   retry: [review: Review];
 }>();
 const toggleEl = ref<HTMLButtonElement | null>(null);
+const rootEl = ref<HTMLElement | null>(null);
 const overallId = `review-overall-${useId()}`;
 defineExpose({ focusToggle: () => toggleEl.value?.focus() });
 
 const isFloating = computed(() => props.floating !== false);
+
+// The pop-down panel overlays page content, so a pointerdown outside the tray
+// minimizes it back to its toggle. The textarea's blur never fires when its
+// v-if removal unfocuses it, so flush the note through the save handler first.
+function onDocPointerDown(event: PointerEvent) {
+  if (rootEl.value?.contains(event.target as Node)) return;
+  emit('saveOverall');
+  emit('update:open', false);
+}
+
+watch(
+  () => props.open,
+  (open) => {
+    document.removeEventListener('pointerdown', onDocPointerDown);
+    if (open && !isFloating.value) document.addEventListener('pointerdown', onDocPointerDown);
+  },
+);
+onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocPointerDown));
 
 const failed = computed(() =>
   props.reviews.filter(
@@ -73,6 +94,7 @@ function submitShortcut() {
 
 <template>
   <aside
+    ref="rootEl"
     :class="
       isFloating
         ? 'absolute bottom-3 right-3 z-20 w-[min(28rem,calc(100%-1.5rem))] rounded-lg border border-line bg-surface shadow-xl'

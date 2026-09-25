@@ -112,3 +112,35 @@ test('preserves Changes drafts through refresh and peer-submit conflicts', async
   await expect(tray).toContainText('0 pending');
   await peer.close();
 });
+
+test('minimizes the review overlay on outside clicks', async ({ page, weaver }) => {
+  const session = await weaver.seedSession({
+    goal: 'overlay dismiss',
+    name: 'changes-overlay-dismiss',
+  });
+  const changedPath = join(session.work_dir, 'review.txt');
+  writeFileSync(changedPath, 'first\nsecond\n');
+
+  await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
+  const toggle = page.getByTestId('review-tray-toggle');
+  await toggle.click();
+  const note = page.getByTestId('review-overall-note');
+  await expect(note).toBeVisible();
+  await note.fill('Kept through minimizing.');
+
+  // The textarea is removed before its blur can fire, so the outside click
+  // must flush the dirty note itself.
+  const noteSave = page.waitForResponse(
+    (response) =>
+      response.ok() &&
+      response.request().method() === 'POST' &&
+      ['/api/reviews/create', '/api/reviews/update'].includes(new URL(response.url()).pathname),
+  );
+  await page.getByRole('button', { name: 'Refresh' }).click();
+  await noteSave;
+  await expect(note).toHaveCount(0);
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+
+  await toggle.click();
+  await expect(page.getByTestId('review-overall-note')).toHaveValue('Kept through minimizing.');
+});
