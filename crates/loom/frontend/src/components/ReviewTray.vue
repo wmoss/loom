@@ -56,34 +56,17 @@ const recent = computed(
 // before it actually submits, so this only guards the conditions that would
 // make the request invalid outright, not "unsaved" itself.
 function submitShortcut() {
-  console.log('[cmd-enter-debug] submitShortcut called', {
-    layoutBusy: props.layoutBusy,
-    submitting: props.submitting,
-    discarding: props.discarding,
-    hasDraft: Boolean(props.draft),
-    commentCount: props.draft?.comments.length,
-    overallNote: props.overallNote,
-    outdated: props.draft?.outdated,
-    acknowledgeOutdated: props.acknowledgeOutdated,
-  });
-  if (props.layoutBusy || props.submitting || props.discarding) {
-    console.log('[cmd-enter-debug] submitShortcut blocked: layoutBusy/submitting/discarding');
-    return;
-  }
+  if (props.layoutBusy || props.submitting || props.discarding) return;
   if (props.draft) {
-    if (!props.draft.comments.length && !props.overallNote.trim()) {
-      console.log('[cmd-enter-debug] submitShortcut blocked: no comments and no note');
-      return;
-    }
-    if (props.draft.outdated && !props.acknowledgeOutdated) {
-      console.log('[cmd-enter-debug] submitShortcut blocked: outdated and not acknowledged');
+    if (
+      (!props.draft.comments.length && !props.overallNote.trim()) ||
+      (props.draft.outdated && !props.acknowledgeOutdated)
+    ) {
       return;
     }
   } else if (!props.overallNote.trim()) {
-    console.log('[cmd-enter-debug] submitShortcut blocked: no draft yet and no note');
     return;
   }
-  console.log('[cmd-enter-debug] submitShortcut emitting submit');
   emit('submit');
 }
 </script>
@@ -236,13 +219,6 @@ function submitShortcut() {
           :disabled="layoutBusy || submitting || discarding"
           @input="emit('update:overallNote', ($event.target as HTMLTextAreaElement).value)"
           @blur="emit('saveOverall')"
-          @keydown="
-            (e: KeyboardEvent) =>
-              console.log(
-                '[cmd-enter-debug] overall-note keydown',
-                JSON.stringify({ key: e.key, ctrl: e.ctrlKey, meta: e.metaKey }),
-              )
-          "
           @keydown.ctrl.enter.prevent="submitShortcut"
           @keydown.meta.enter.prevent="submitShortcut"
         ></textarea>
@@ -332,13 +308,6 @@ function submitShortcut() {
           :disabled="layoutBusy || submitting || discarding"
           @input="emit('update:overallNote', ($event.target as HTMLTextAreaElement).value)"
           @blur="emit('saveOverall')"
-          @keydown="
-            (e: KeyboardEvent) =>
-              console.log(
-                '[cmd-enter-debug] overall-note keydown',
-                JSON.stringify({ key: e.key, ctrl: e.ctrlKey, meta: e.metaKey }),
-              )
-          "
           @keydown.ctrl.enter.prevent="submitShortcut"
           @keydown.meta.enter.prevent="submitShortcut"
         ></textarea>

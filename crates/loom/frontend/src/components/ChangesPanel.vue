@@ -326,7 +326,6 @@ function cancelPending(onClose: () => void) {
 }
 
 async function confirmPending(onClose: () => void) {
-  console.log('[cmd-enter-debug] confirmPending called, pending =', pending.value);
   if (!pending.value) return;
   if (pending.value.reanchorId != null) {
     await applyReanchor(pending.value.reanchorId, pending.value.anchor);
@@ -599,116 +598,99 @@ onMounted(load);
             {{ file.content }} content is not rendered.
           </p>
           <div v-else :ref="(el) => observeFile(el, file)" :data-file-key="fileKey(file)">
-          <DiffViewWithMultiSelect
-            v-if="mounted.has(fileKey(file)) && gitDiffData(file)"
-            :key="`${fileKey(file)}:${changes?.version}`"
-            :data="gitDiffData(file)!"
-            :diff-view-mode="DiffModeEnum.Split"
-            :diff-view-theme="theme"
-            :diff-view-highlight="true"
-            :diff-view-add-widget="true"
-            :extend-data="extendDataFor(file)"
-            :initial-widget-state="widgetStateFor(file)"
-            :scope-multi-select-to-hunk="scopeToHunk(file)"
-            @on-add-widget-click="(payload) => onAddWidgetClick(file, payload)"
-          >
-            <template #widget="{ onClose }">
-              <form
-                v-if="pending && pending.fileKey === fileKey(file)"
-                class="m-2 rounded border border-accent bg-surface p-2 text-xs shadow-xl"
-                data-testid="change-comment-composer"
-                @submit.prevent="confirmPending(onClose)"
-              >
-                <template v-if="pending.reanchorId != null">
-                  <p class="mb-2 text-2xs text-muted">
-                    Move comment #{{ pending.reanchorId }} to {{ pending.anchor.path.display }} ·
-                    {{ pending.anchor.side }} {{ pending.anchor.start_line }}–{{
-                      pending.anchor.end_line
-                    }}?
-                  </p>
-                  <div class="flex justify-end gap-2">
-                    <button
-                      type="button"
-                      class="btn-secondary px-2 py-1 text-xs"
-                      @click="cancelPending(onClose)"
-                    >
-                      Cancel
-                    </button>
-                    <button type="submit" class="btn-primary px-2 py-1 text-xs">
-                      Move comment here
-                    </button>
-                  </div>
-                </template>
-                <template v-else>
-                  <p class="mb-1 text-2xs font-semibold uppercase text-accent">
-                    {{ pending.anchor.path.display }} · {{ pending.anchor.side }}
-                    {{ pending.anchor.start_line }}–{{ pending.anchor.end_line }}
-                  </p>
-                  <textarea
-                    :ref="setComposerInput"
-                    v-model="pending.body"
-                    rows="3"
-                    class="w-full rounded border border-line bg-input p-2 text-xs"
-                    @keydown="
-                      (e: KeyboardEvent) =>
-                        console.log(
-                          '[cmd-enter-debug] composer keydown',
-                          JSON.stringify({ key: e.key, ctrl: e.ctrlKey, meta: e.metaKey }),
-                        )
-                    "
-                    @keydown.ctrl.enter.prevent="
-                      () => {
-                        console.log('[cmd-enter-debug] composer ctrl+enter matched');
-                        confirmPending(onClose);
-                      }
-                    "
-                    @keydown.meta.enter.prevent="
-                      () => {
-                        console.log('[cmd-enter-debug] composer meta+enter matched');
-                        confirmPending(onClose);
-                      }
-                    "
-                  ></textarea>
-                  <div class="mt-2 flex justify-end gap-2">
-                    <button
-                      type="button"
-                      class="btn-secondary px-2 py-1 text-xs"
-                      @click="cancelPending(onClose)"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      type="submit"
-                      class="btn-primary px-2 py-1 text-xs"
-                      :disabled="!pending.body.trim() || savingComment"
-                    >
-                      {{ savingComment ? 'Saving…' : 'Add pending comment' }}
-                    </button>
-                  </div>
-                </template>
-              </form>
-            </template>
-            <template #extend="{ data }">
-              <div class="space-y-1 bg-surface p-2">
-                <ReviewCommentCard
-                  v-for="comment in data as ReviewComment[]"
-                  :key="comment.id"
-                  :review="draft!"
-                  :comment="comment"
-                  :active="activeComment === comment.id"
-                  :reanchoring="reanchorComment === comment.id"
-                  :error="commentErrors[comment.id] ?? ''"
-                  :delete-action="removeComment"
-                  @focus="activeComment = $event"
-                  @close="activeComment = null"
-                  @edit="editComment"
-                  @reanchor="reanchorComment = $event"
-                  @cancel-reanchor="reanchorComment = null"
-                />
-              </div>
-            </template>
-          </DiffViewWithMultiSelect>
-          <p v-else class="px-4 py-8 text-center text-2xs text-faint">Loading diff…</p>
+            <DiffViewWithMultiSelect
+              v-if="mounted.has(fileKey(file)) && gitDiffData(file)"
+              :key="`${fileKey(file)}:${changes?.version}`"
+              :data="gitDiffData(file)!"
+              :diff-view-mode="DiffModeEnum.Split"
+              :diff-view-theme="theme"
+              :diff-view-highlight="true"
+              :diff-view-add-widget="true"
+              :extend-data="extendDataFor(file)"
+              :initial-widget-state="widgetStateFor(file)"
+              :scope-multi-select-to-hunk="scopeToHunk(file)"
+              @on-add-widget-click="(payload) => onAddWidgetClick(file, payload)"
+            >
+              <template #widget="{ onClose }">
+                <form
+                  v-if="pending && pending.fileKey === fileKey(file)"
+                  class="m-2 rounded border border-accent bg-surface p-2 text-xs shadow-xl"
+                  data-testid="change-comment-composer"
+                  @submit.prevent="confirmPending(onClose)"
+                >
+                  <template v-if="pending.reanchorId != null">
+                    <p class="mb-2 text-2xs text-muted">
+                      Move comment #{{ pending.reanchorId }} to {{ pending.anchor.path.display }} ·
+                      {{ pending.anchor.side }} {{ pending.anchor.start_line }}–{{
+                        pending.anchor.end_line
+                      }}?
+                    </p>
+                    <div class="flex justify-end gap-2">
+                      <button
+                        type="button"
+                        class="btn-secondary px-2 py-1 text-xs"
+                        @click="cancelPending(onClose)"
+                      >
+                        Cancel
+                      </button>
+                      <button type="submit" class="btn-primary px-2 py-1 text-xs">
+                        Move comment here
+                      </button>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <p class="mb-1 text-2xs font-semibold uppercase text-accent">
+                      {{ pending.anchor.path.display }} · {{ pending.anchor.side }}
+                      {{ pending.anchor.start_line }}–{{ pending.anchor.end_line }}
+                    </p>
+                    <textarea
+                      :ref="setComposerInput"
+                      v-model="pending.body"
+                      rows="3"
+                      class="w-full rounded border border-line bg-input p-2 text-xs"
+                      @keydown.ctrl.enter.prevent="confirmPending(onClose)"
+                      @keydown.meta.enter.prevent="confirmPending(onClose)"
+                    ></textarea>
+                    <div class="mt-2 flex justify-end gap-2">
+                      <button
+                        type="button"
+                        class="btn-secondary px-2 py-1 text-xs"
+                        @click="cancelPending(onClose)"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="submit"
+                        class="btn-primary px-2 py-1 text-xs"
+                        :disabled="!pending.body.trim() || savingComment"
+                      >
+                        {{ savingComment ? 'Saving…' : 'Add pending comment' }}
+                      </button>
+                    </div>
+                  </template>
+                </form>
+              </template>
+              <template #extend="{ data }">
+                <div class="space-y-1 bg-surface p-2">
+                  <ReviewCommentCard
+                    v-for="comment in data as ReviewComment[]"
+                    :key="comment.id"
+                    :review="draft!"
+                    :comment="comment"
+                    :active="activeComment === comment.id"
+                    :reanchoring="reanchorComment === comment.id"
+                    :error="commentErrors[comment.id] ?? ''"
+                    :delete-action="removeComment"
+                    @focus="activeComment = $event"
+                    @close="activeComment = null"
+                    @edit="editComment"
+                    @reanchor="reanchorComment = $event"
+                    @cancel-reanchor="reanchorComment = null"
+                  />
+                </div>
+              </template>
+            </DiffViewWithMultiSelect>
+            <p v-else class="px-4 py-8 text-center text-2xs text-faint">Loading diff…</p>
           </div>
         </div>
       </article>

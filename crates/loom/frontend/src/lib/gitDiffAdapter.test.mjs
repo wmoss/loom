@@ -37,7 +37,9 @@ test('reassembles a per-file unified diff from typed hunks', () => {
   assert.deepEqual(data, {
     oldFile: { fileName: 'src/a.rs' },
     newFile: { fileName: 'src/a.rs' },
-    hunks: ['--- a/src/a.rs\n+++ b/src/a.rs\n@@ -2,2 +2,3 @@ fn main() {\n same\n-old\n+new\n+next'],
+    hunks: [
+      '--- a/src/a.rs\n+++ b/src/a.rs\n@@ -2,2 +2,3 @@ fn main() {\n same\n-old\n+new\n+next',
+    ],
   });
 });
 

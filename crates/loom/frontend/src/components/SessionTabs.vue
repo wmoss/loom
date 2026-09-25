@@ -37,9 +37,7 @@ const ACP_TABS: { key: LocalTab; label: string }[] = [
 const localTabs = computed(() => (props.protocol === 'acp' ? ACP_TABS : TERMINAL_TABS));
 
 const tabClass = (active: boolean) =>
-  active
-    ? 'border-accent text-fg font-medium'
-    : 'border-transparent text-muted hover:text-fg';
+  active ? 'border-accent text-fg font-medium' : 'border-transparent text-muted hover:text-fg';
 </script>
 
 <template>
@@ -74,9 +72,7 @@ const tabClass = (active: boolean) =>
       Artifacts
       <!-- When popped out, the Artifacts surface lives in the rail, not here —
            a small glyph marks it open without claiming the work area. -->
-      <span v-if="artifactsPopped" class="ml-1 text-faint" title="Open in the split panel"
-        >⤢</span
-      >
+      <span v-if="artifactsPopped" class="ml-1 text-faint" title="Open in the split panel">⤢</span>
     </router-link>
     <router-link
       :to="`/s/${id}/changes`"
