@@ -648,6 +648,8 @@ onMounted(load);
                     v-model="pending.body"
                     rows="3"
                     class="w-full rounded border border-line bg-input p-2 text-xs"
+                    @keydown.ctrl.enter.prevent="confirmPending(onClose)"
+                    @keydown.meta.enter.prevent="confirmPending(onClose)"
                   ></textarea>
                   <div class="mt-2 flex justify-end gap-2">
                     <button

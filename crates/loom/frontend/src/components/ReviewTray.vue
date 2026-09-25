@@ -50,6 +50,25 @@ const recent = computed(
       .filter((review) => review.status === 'submitted' && !review.legacy)
       .sort((a, b) => b.id - a.id)[0] ?? null,
 );
+
+// Cmd/Ctrl+Enter in the overall note submits without requiring a blur first —
+// `submit` (via the draft controller's freeze) already flushes any dirty note
+// before it actually submits, so this only guards the conditions that would
+// make the request invalid outright, not "unsaved" itself.
+function submitShortcut() {
+  if (props.layoutBusy || props.submitting || props.discarding) return;
+  if (props.draft) {
+    if (
+      (!props.draft.comments.length && !props.overallNote.trim()) ||
+      (props.draft.outdated && !props.acknowledgeOutdated)
+    ) {
+      return;
+    }
+  } else if (!props.overallNote.trim()) {
+    return;
+  }
+  emit('submit');
+}
 </script>
 
 <template>
@@ -200,6 +219,8 @@ const recent = computed(
           :disabled="layoutBusy || submitting || discarding"
           @input="emit('update:overallNote', ($event.target as HTMLTextAreaElement).value)"
           @blur="emit('saveOverall')"
+          @keydown.ctrl.enter.prevent="submitShortcut"
+          @keydown.meta.enter.prevent="submitShortcut"
         ></textarea>
         <p v-if="summarySaving" class="mt-1 text-2xs text-faint" aria-live="polite">
           Saving overall note…
@@ -288,6 +309,8 @@ const recent = computed(
           :disabled="layoutBusy || submitting || discarding"
           @input="emit('update:overallNote', ($event.target as HTMLTextAreaElement).value)"
           @blur="emit('saveOverall')"
+          @keydown.ctrl.enter.prevent="submitShortcut"
+          @keydown.meta.enter.prevent="submitShortcut"
         ></textarea>
         <p v-if="summarySaving" class="mt-1 text-2xs text-faint" aria-live="polite">
           Saving overall note…
