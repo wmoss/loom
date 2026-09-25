@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { DiffModeEnum, DiffViewWithMultiSelect, SplitSide } from '@git-diff-view/vue';
 import type { LineRange } from '@git-diff-view/vue';
 import '@git-diff-view/vue/styles/diff-view-pure.css';
@@ -39,7 +39,12 @@ const reviews = ref<Review[]>([]);
 const loading = ref(false);
 const error = ref('');
 const notice = ref('');
-const expanded = reactive(new Set<string>());
+// Files start expanded (opt out via `collapsed`), so a diff opens ready to
+// read in full; the diff body itself only mounts once scrolled near, so a
+// large change set doesn't pay full render/highlight cost up front.
+const collapsed = reactive(new Set<string>());
+const mounted = reactive(new Set<string>());
+let fileObserver: IntersectionObserver | null = null;
 const activeComment = ref<number | null>(null);
 const reanchorComment = ref<number | null>(null);
 const commentErrors = reactive<Record<number, string>>({});
@@ -162,11 +167,40 @@ function fileKey(file: ChangeFile): string {
   return file.path.bytes;
 }
 
+function isExpanded(file: ChangeFile): boolean {
+  return !collapsed.has(fileKey(file));
+}
+
 function toggleFile(file: ChangeFile) {
   const key = fileKey(file);
-  if (expanded.has(key)) expanded.delete(key);
-  else expanded.add(key);
+  if (collapsed.has(key)) collapsed.delete(key);
+  else collapsed.add(key);
 }
+
+/** Mounts a file's diff once its container scrolls near the viewport, instead of all at once. */
+function ensureFileObserver(): IntersectionObserver {
+  if (!fileObserver) {
+    fileObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const key = (entry.target as HTMLElement).dataset.fileKey;
+          if (key) mounted.add(key);
+          fileObserver?.unobserve(entry.target);
+        }
+      },
+      { rootMargin: '600px 0px' },
+    );
+  }
+  return fileObserver;
+}
+
+function observeFile(el: unknown, file: ChangeFile) {
+  if (!(el instanceof Element) || mounted.has(fileKey(file))) return;
+  ensureFileObserver().observe(el);
+}
+
+onBeforeUnmount(() => fileObserver?.disconnect());
 
 function gitDiffData(file: ChangeFile): GitDiffViewData | null {
   const key = `${changes.value?.version ?? ''}:${fileKey(file)}`;
@@ -453,7 +487,11 @@ function navigate(direction: number) {
   const current = comments.findIndex((comment) => comment.id === activeComment.value);
   const next = comments[(current + direction + comments.length) % comments.length];
   activeComment.value = next.id;
-  if (next.anchor_kind === 'change') expanded.add((next.anchor as ChangeAnchor).path.bytes);
+  if (next.anchor_kind === 'change') {
+    const key = (next.anchor as ChangeAnchor).path.bytes;
+    collapsed.delete(key);
+    mounted.add(key);
+  }
   void nextTick(() =>
     document
       .querySelector(`[data-review-collapsed="${next.id}"], [data-review-card="${next.id}"]`)
@@ -510,10 +548,10 @@ onMounted(load);
         <button
           type="button"
           class="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-subtle"
-          :aria-expanded="expanded.has(fileKey(file))"
+          :aria-expanded="isExpanded(file)"
           @click="toggleFile(file)"
         >
-          <span class="w-4 text-faint">{{ expanded.has(fileKey(file)) ? '▾' : '▸' }}</span>
+          <span class="w-4 text-faint">{{ isExpanded(file) ? '▾' : '▸' }}</span>
           <span class="rounded bg-subtle px-1.5 py-0.5 text-2xs uppercase text-muted">
             {{ file.status }}
           </span>
@@ -524,12 +562,13 @@ onMounted(load);
           >
         </button>
 
-        <div v-if="expanded.has(fileKey(file))" class="overflow-x-auto bg-code text-xs">
+        <div v-if="isExpanded(file)" class="overflow-x-auto bg-code text-xs">
           <p v-if="file.content !== 'text'" class="px-4 py-3 font-mono text-muted">
             {{ file.content }} content is not rendered.
           </p>
+          <div v-else :ref="(el) => observeFile(el, file)" :data-file-key="fileKey(file)">
           <DiffViewWithMultiSelect
-            v-else-if="gitDiffData(file)"
+            v-if="mounted.has(fileKey(file)) && gitDiffData(file)"
             :key="`${fileKey(file)}:${changes?.version}`"
             :data="gitDiffData(file)!"
             :diff-view-mode="DiffModeEnum.Split"
@@ -618,6 +657,8 @@ onMounted(load);
               </div>
             </template>
           </DiffViewWithMultiSelect>
+          <p v-else class="px-4 py-8 text-center text-2xs text-faint">Loading diff…</p>
+          </div>
         </div>
       </article>
     </div>

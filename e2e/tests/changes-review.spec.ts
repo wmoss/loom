@@ -29,8 +29,8 @@ test('preserves Changes drafts through refresh and peer-submit conflicts', async
   writeFileSync(changedPath, 'first\nsecond\n');
 
   await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
+  // Files render expanded by default now, so there's no toggle to click first.
   const fileToggle = page.getByRole('button', { name: /review\.txt/ });
-  await fileToggle.click();
   const article = page.locator('article').filter({ has: fileToggle });
   await (await addWidgetButton(article, 'new', 1)).click();
   const composer = page.getByTestId('change-comment-composer');
