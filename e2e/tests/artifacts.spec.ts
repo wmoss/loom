@@ -358,11 +358,11 @@ test.describe('artifacts surface', () => {
     await page.goto(`${weaver.baseUrl}/s/${session.id}`);
     await expect(page.locator('[data-term-tab="agent"]')).toBeVisible();
 
-    // Review opens its canonical Artifacts route without remounting the session.
-    await page.getByRole('tab', { name: 'Review' }).click();
+    // Artifacts opens its canonical route without remounting the session.
+    await page.getByRole('tab', { name: 'Artifacts' }).click();
     await expect(page).toHaveURL(new RegExp(`/s/${session.id}/artifacts`));
     await expect(page.locator('.markdown-body h1')).toContainText('Plan');
-    await expect(page.getByRole('link', { name: 'Changes', exact: true })).toBeVisible();
+    await expect(page.getByRole('tab', { name: 'Code Review', exact: true })).toBeVisible();
     await expect(page.getByRole('tab', { name: 'Agent' })).toBeVisible();
 
     // Back to Agent — the warm terminal returns and the review route closes.

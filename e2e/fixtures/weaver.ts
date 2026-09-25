@@ -2,7 +2,7 @@ import { test as base, expect } from '@playwright/test';
 import { type ChildProcess, execFileSync, spawn } from 'child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join, resolve } from 'path';
+import { dirname, join, resolve } from 'path';
 
 // Repo layout: this file lives at <weaver>/e2e/fixtures/weaver.ts
 const WEAVER_ROOT = join(__dirname, '..', '..');
@@ -396,6 +396,10 @@ export const test = base.extend<{ weaver: WeaverFixture }, WorkerFixtures>({
       // session's scoped bearer. It belongs to another database and explicit
       // invalid credentials correctly cannot fall through to loopback trust.
       delete childEnv.LOOM_TOKEN;
+      // Same for the production SPA placement: the inherited path would serve
+      // the live deployment's bundle instead of the one just built above, so
+      // the suite would silently test a stale UI.
+      childEnv.WEAVER_STATIC_DIR = dirname(DIST_INDEX);
 
       // Bind to a random free port (0) and parse the actual port from stdout.
       const server: ChildProcess = spawn(LOOM_BINARY, ['server', 'run', '--addr', '127.0.0.1:0'], {

@@ -41,8 +41,11 @@ test.describe('session detail view', () => {
     await expect(help.locator('[data-command-id="session.tab.conversation"] + dd')).toContainText(
       'Open Conversation',
     );
-    await expect(help.locator('[data-command-id="session.tab.review"] + dd')).toContainText(
-      'Open Review',
+    await expect(help.locator('[data-command-id="session.tab.artifacts"] + dd')).toContainText(
+      'Open Artifacts',
+    );
+    await expect(help.locator('[data-command-id="session.tab.changes"] + dd')).toContainText(
+      'Open Code Review',
     );
     await page.keyboard.press('Escape');
     await expect(help).toHaveCount(0);
@@ -56,11 +59,12 @@ test.describe('session detail view', () => {
       'true',
     );
     await page.keyboard.press('3');
-    await expect(page.locator('[data-tab="review"]')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('[data-tab="artifacts"]')).toHaveAttribute('aria-selected', 'true');
     await expect(page).toHaveURL(new RegExp(`/s/${s.id}/artifacts(?:/|$)`));
-    await page.keyboard.press('c');
+    await page.keyboard.press('4');
+    await expect(page.locator('[data-tab="changes"]')).toHaveAttribute('aria-selected', 'true');
     await expect(page).toHaveURL(`${weaver.baseUrl}/s/${s.id}/changes`);
-    await page.keyboard.press('a');
+    await page.keyboard.press('3');
     await expect(page).toHaveURL(new RegExp(`/s/${s.id}/artifacts(?:/|$)`));
     await page.keyboard.press('[');
     await expect(page.locator('[data-tab="conversation"]')).toHaveAttribute(
@@ -68,7 +72,7 @@ test.describe('session detail view', () => {
       'true',
     );
     await page.keyboard.press(']');
-    await expect(page.locator('[data-tab="review"]')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('[data-tab="artifacts"]')).toHaveAttribute('aria-selected', 'true');
     await page.keyboard.press('1');
     await expect(page.locator('[data-tab="terminal"]')).toHaveAttribute('aria-selected', 'true');
     await expect(page).toHaveURL(`${weaver.baseUrl}/s/${s.id}`);
