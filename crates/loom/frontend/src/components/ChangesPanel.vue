@@ -326,6 +326,7 @@ function cancelPending(onClose: () => void) {
 }
 
 async function confirmPending(onClose: () => void) {
+  console.log('[cmd-enter-debug] confirmPending called, pending =', pending.value);
   if (!pending.value) return;
   if (pending.value.reanchorId != null) {
     await applyReanchor(pending.value.reanchorId, pending.value.anchor);
@@ -648,8 +649,25 @@ onMounted(load);
                     v-model="pending.body"
                     rows="3"
                     class="w-full rounded border border-line bg-input p-2 text-xs"
-                    @keydown.ctrl.enter.prevent="confirmPending(onClose)"
-                    @keydown.meta.enter.prevent="confirmPending(onClose)"
+                    @keydown="
+                      (e: KeyboardEvent) =>
+                        console.log(
+                          '[cmd-enter-debug] composer keydown',
+                          JSON.stringify({ key: e.key, ctrl: e.ctrlKey, meta: e.metaKey }),
+                        )
+                    "
+                    @keydown.ctrl.enter.prevent="
+                      () => {
+                        console.log('[cmd-enter-debug] composer ctrl+enter matched');
+                        confirmPending(onClose);
+                      }
+                    "
+                    @keydown.meta.enter.prevent="
+                      () => {
+                        console.log('[cmd-enter-debug] composer meta+enter matched');
+                        confirmPending(onClose);
+                      }
+                    "
                   ></textarea>
                   <div class="mt-2 flex justify-end gap-2">
                     <button
