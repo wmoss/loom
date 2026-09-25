@@ -17,6 +17,9 @@ const props = defineProps<{
   deliveryErrors: Record<number, string>;
   subjectLabel: string;
   discardAction: () => Promise<void>;
+  /** Floats bottom-right and expands upward (default). Set false to sit
+   *  inline (e.g. in a header) with its panel popping down below it instead. */
+  floating?: boolean;
 }>();
 const emit = defineEmits<{
   'update:open': [value: boolean];
@@ -32,6 +35,8 @@ const emit = defineEmits<{
 const toggleEl = ref<HTMLButtonElement | null>(null);
 const overallId = `review-overall-${useId()}`;
 defineExpose({ focusToggle: () => toggleEl.value?.focus() });
+
+const isFloating = computed(() => props.floating !== false);
 
 const failed = computed(() =>
   props.reviews.filter(
@@ -49,15 +54,22 @@ const recent = computed(
 
 <template>
   <aside
-    class="absolute bottom-3 right-3 z-20 w-[min(28rem,calc(100%-1.5rem))] rounded-lg border border-line bg-surface shadow-xl"
+    :class="
+      isFloating
+        ? 'absolute bottom-3 right-3 z-20 w-[min(28rem,calc(100%-1.5rem))] rounded-lg border border-line bg-surface shadow-xl'
+        : 'relative shrink-0'
+    "
     data-testid="review-tray"
     aria-label="Review tray"
   >
-    <div class="flex min-h-10 items-center gap-1.5 px-2">
+    <div
+      class="flex min-h-8 items-center gap-1.5"
+      :class="isFloating ? 'min-h-10 px-2' : 'rounded border border-line bg-surface px-1.5'"
+    >
       <button
         ref="toggleEl"
         type="button"
-        class="min-w-0 flex-1 px-1 py-2 text-left text-xs font-semibold text-fg"
+        class="min-w-0 flex-1 px-1 py-1.5 text-left text-xs font-semibold text-fg"
         data-testid="review-tray-toggle"
         :aria-expanded="open"
         @click="emit('update:open', !open)"
@@ -101,7 +113,15 @@ const recent = computed(
       </button>
     </div>
 
-    <div v-if="open" class="max-h-[min(60vh,34rem)] overflow-auto border-t border-line p-3">
+    <div
+      v-if="open"
+      class="max-h-[min(60vh,34rem)] overflow-auto p-3"
+      :class="
+        isFloating
+          ? 'border-t border-line'
+          : 'absolute right-0 top-full z-30 mt-1 w-[min(28rem,calc(100vw-1.5rem))] rounded-lg border border-line bg-surface shadow-xl'
+      "
+    >
       <div v-if="failed.length" class="mb-3 space-y-2" aria-label="Failed review deliveries">
         <div
           v-for="item in failed"

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import type { ComponentPublicInstance } from 'vue';
 import { DiffModeEnum, DiffViewWithMultiSelect, SplitSide } from '@git-diff-view/vue';
 import type { LineRange } from '@git-diff-view/vue';
 import '@git-diff-view/vue/styles/diff-view-pure.css';
@@ -39,9 +40,6 @@ const reviews = ref<Review[]>([]);
 const loading = ref(false);
 const error = ref('');
 const notice = ref('');
-// Files start expanded (opt out via `collapsed`), so a diff opens ready to
-// read in full; the diff body itself only mounts once scrolled near, so a
-// large change set doesn't pay full render/highlight cost up front.
 const collapsed = reactive(new Set<string>());
 const mounted = reactive(new Set<string>());
 let fileObserver: IntersectionObserver | null = null;
@@ -70,6 +68,12 @@ type Pending = {
 const pending = ref<Pending | null>(null);
 const savingComment = ref(false);
 const composerInput = ref<HTMLTextAreaElement | null>(null);
+// A plain `ref="composerInput"` inside this v-for's scoped slot would make Vue
+// collect it into an array (its v-for-ref behavior is lexical, not runtime),
+// so bind with a function ref instead to keep a single element reference.
+function setComposerInput(el: Element | ComponentPublicInstance | null) {
+  composerInput.value = el instanceof HTMLTextAreaElement ? el : null;
+}
 
 const diffDataCache = new Map<string, GitDiffViewData | null>();
 
@@ -310,7 +314,9 @@ function onAddWidgetClick(
     side,
     reanchorId: reanchorComment.value ?? undefined,
   };
-  void nextTick(() => composerInput.value?.focus());
+  // The library's "+" button focuses itself on mousedown; wait a frame past
+  // that native default action so our focus call isn't immediately stolen back.
+  void nextTick(() => requestAnimationFrame(() => composerInput.value?.focus()));
 }
 
 function cancelPending(onClose: () => void) {
@@ -517,6 +523,31 @@ onMounted(load);
           {{ changes.base.reference }} · {{ changes.base.oid.slice(0, 10) }}
         </p>
       </div>
+      <ReviewTray
+        :floating="false"
+        :reviews="reviews"
+        :draft="draft"
+        :open="trayOpen"
+        :overall-note="overallNote"
+        :summary-saving="summarySaving || summaryDirty"
+        :acknowledge-outdated="acknowledgeOutdated"
+        :error="trayError"
+        :layout-busy="false"
+        :submitting="submitting"
+        :discarding="discarding"
+        :delivery-errors="deliveryErrors"
+        subject-label="changes"
+        :discard-action="discardDraft"
+        @update:open="trayOpen = $event"
+        @update:overall-note="editOverall"
+        @update:acknowledge-outdated="acknowledgeOutdated = $event"
+        @navigate="navigate"
+        @focus-comment="activeComment = $event"
+        @save-overall="saveOverall"
+        @retarget="retarget"
+        @submit="submit"
+        @retry="retryDelivery"
+      />
       <span v-if="changes" class="text-xs text-muted">
         {{ changes.totals.files }} files · +{{ changes.totals.additions }} −{{
           changes.totals.deletions
@@ -547,7 +578,7 @@ onMounted(load);
       <article v-for="file in changes?.files" :key="file.path.bytes" class="border-b border-line">
         <button
           type="button"
-          class="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-subtle"
+          class="sticky top-0 z-10 flex w-full items-center gap-2 border-b border-line bg-surface px-3 py-2 text-left hover:bg-subtle"
           :aria-expanded="isExpanded(file)"
           @click="toggleFile(file)"
         >
@@ -613,7 +644,7 @@ onMounted(load);
                     {{ pending.anchor.start_line }}–{{ pending.anchor.end_line }}
                   </p>
                   <textarea
-                    ref="composerInput"
+                    :ref="setComposerInput"
                     v-model="pending.body"
                     rows="3"
                     class="w-full rounded border border-line bg-input p-2 text-xs"
@@ -663,30 +694,6 @@ onMounted(load);
       </article>
     </div>
 
-    <ReviewTray
-      :reviews="reviews"
-      :draft="draft"
-      :open="trayOpen"
-      :overall-note="overallNote"
-      :summary-saving="summarySaving || summaryDirty"
-      :acknowledge-outdated="acknowledgeOutdated"
-      :error="trayError"
-      :layout-busy="false"
-      :submitting="submitting"
-      :discarding="discarding"
-      :delivery-errors="deliveryErrors"
-      subject-label="changes"
-      :discard-action="discardDraft"
-      @update:open="trayOpen = $event"
-      @update:overall-note="editOverall"
-      @update:acknowledge-outdated="acknowledgeOutdated = $event"
-      @navigate="navigate"
-      @focus-comment="activeComment = $event"
-      @save-overall="saveOverall"
-      @retarget="retarget"
-      @submit="submit"
-      @retry="retryDelivery"
-    />
     <p v-if="notice" class="absolute bottom-1 left-3 text-2xs text-accent" role="status">
       {{ notice }}
     </p>
