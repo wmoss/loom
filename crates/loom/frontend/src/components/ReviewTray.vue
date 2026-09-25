@@ -17,10 +17,11 @@ const props = defineProps<{
   deliveryErrors: Record<number, string>;
   subjectLabel: string;
   discardAction: () => Promise<void>;
-  /** Floats bottom-right and expands upward (default). Set false to sit
-   *  inline (e.g. in a header) with its panel popping down below it instead;
-   *  that pop-down panel overlays page content and minimizes on outside
-   *  clicks, while the floating dock stays put. */
+  /** Floats bottom-right and expands upward. Set false to sit inline (e.g.
+   *  in a header) with its panel popping down below it instead; that pop-down
+   *  panel overlays page content and minimizes on outside clicks, while the
+   *  floating dock stays put. Pass it at every call site: an absent Boolean
+   *  prop casts to false, never undefined. */
   floating?: boolean;
 }>();
 const emit = defineEmits<{
