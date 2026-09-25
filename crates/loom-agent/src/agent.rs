@@ -4,11 +4,13 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use crate::acp::{AcpLaunch, NewOrLoad};
 use crate::backend;
@@ -21,18 +23,29 @@ use weaver_core::BoxFut;
 pub struct AgentChoice {
     pub id: String,
     pub label: String,
+    /// For a model choice: the effort levels valid for *this* model, in the
+    /// order the harness presents them. Empty for an effort choice, and for a
+    /// model whose harness does not scope effort per model (the picker then
+    /// falls back to the agent's global effort list).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<AgentChoice>,
 }
 
 impl AgentChoice {
+    fn leaf(id: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            efforts: Vec::new(),
+        }
+    }
+
     /// Materialize a builtin's static `(id, label)` table into the owned choices
     /// the metadata carries.
     fn list(pairs: &[(&str, &str)]) -> Vec<AgentChoice> {
         pairs
             .iter()
-            .map(|(id, label)| AgentChoice {
-                id: (*id).to_string(),
-                label: (*label).to_string(),
-            })
+            .map(|(id, label)| Self::leaf(*id, *label))
             .collect()
     }
 }
@@ -47,6 +60,9 @@ pub struct AgentMetadata {
     pub label: String,
     pub models: Vec<AgentChoice>,
     pub efforts: Vec<AgentChoice>,
+    /// True when efforts must be fetched per model via `agents.model_efforts`
+    /// instead of being carried in the catalogue (cursor-agent).
+    pub effort_lookup: bool,
     pub accepts_raw_model: bool,
     pub supports_hooks: bool,
     /// True for the code-shipped `claude`/`codex`; false for an operator-defined
@@ -60,6 +76,10 @@ pub struct AgentMetadata {
     /// A create request may override a builtin's default (`--protocol
     /// terminal` keeps the PTY); see [`resolve_protocol`].
     pub protocol: String,
+    /// Whether the agent binary is available on the system PATH. Used by the
+    /// UI to hide unavailable agent harnesses (e.g. when `codex` is not
+    /// installed).
+    pub available: Option<bool>,
 }
 
 pub struct AgentInstance {
@@ -71,18 +91,14 @@ pub type AgentFuture<'a> = Pin<Box<dyn Future<Output = Result<AgentInstance>> + 
 pub trait AgentType: Sync {
     fn metadata(&self) -> AgentMetadata;
 
-    fn validate(&self, model: &str, effort: &str) -> Result<(), String> {
-        let metadata = self.metadata();
-        validate_model(&metadata, model)?;
-        validate_effort(&metadata, effort)
-    }
-
     fn create<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a>;
     fn adopt<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a>;
 }
 
 pub struct ClaudeAgentType;
 pub struct CodexAgentType;
+pub struct OpenCodeAgentType;
+pub struct CursorAgentType;
 
 /// A [`CustomAgent`] row wrapped as an [`AgentType`]: its stages drive the launch
 /// script, and its metadata is derived from the stored fields.
@@ -143,22 +159,32 @@ const CODEX_EFFORT_CHOICES: &[(&str, &str)] = &[
 
 static CLAUDE_AGENT_TYPE: ClaudeAgentType = ClaudeAgentType;
 static CODEX_AGENT_TYPE: CodexAgentType = CodexAgentType;
+static OPENCODE_AGENT_TYPE: OpenCodeAgentType = OpenCodeAgentType;
+static CURSOR_AGENT_TYPE: CursorAgentType = CursorAgentType;
 
-/// The builtin agent for `kind`, if it names one (`claude`/`codex`). Custom
-/// agents live in the database and are resolved by [`resolve`]; this covers only
-/// the code-shipped runtimes, which need no DB lookup.
-pub fn builtin_agent_type(kind: &str) -> Option<&'static dyn AgentType> {
-    match BuiltinAgentKind::parse(kind)? {
-        BuiltinAgentKind::Claude => Some(&CLAUDE_AGENT_TYPE),
-        BuiltinAgentKind::Codex => Some(&CODEX_AGENT_TYPE),
+/// The `AgentType` for a builtin kind. Exhaustive, so a new [`BuiltinAgentKind`]
+/// variant forces an arm here.
+fn builtin_agent_type_for(kind: BuiltinAgentKind) -> &'static dyn AgentType {
+    match kind {
+        BuiltinAgentKind::Claude => &CLAUDE_AGENT_TYPE,
+        BuiltinAgentKind::Codex => &CODEX_AGENT_TYPE,
+        BuiltinAgentKind::OpenCode => &OPENCODE_AGENT_TYPE,
+        BuiltinAgentKind::CursorAgent => &CURSOR_AGENT_TYPE,
     }
+}
+
+/// The builtin agent for `kind`, if it names one. Custom agents live in the
+/// database and are resolved by [`resolve`]; this covers only the code-shipped
+/// runtimes, which need no DB lookup.
+pub fn builtin_agent_type(kind: &str) -> Option<&'static dyn AgentType> {
+    Some(builtin_agent_type_for(BuiltinAgentKind::parse(kind)?))
 }
 
 /// The builtin agents' metadata, in picker order.
 pub fn builtin_metadata() -> Vec<AgentMetadata> {
-    [&CLAUDE_AGENT_TYPE as &dyn AgentType, &CODEX_AGENT_TYPE]
+    BuiltinAgentKind::ALL
         .into_iter()
-        .map(AgentType::metadata)
+        .map(|kind| builtin_agent_type_for(kind).metadata())
         .collect()
 }
 
@@ -206,6 +232,86 @@ async fn refresh_codex_metadata(metadata: &mut AgentMetadata) {
     apply_codex_catalog(metadata, &output.stdout);
 }
 
+pub async fn is_claude_available() -> bool {
+    binary_on_path("claude").await
+}
+
+pub async fn is_codex_available() -> bool {
+    binary_on_path("codex").await
+}
+
+pub async fn is_opencode_available() -> bool {
+    binary_on_path("opencode").await
+}
+
+pub async fn is_cursor_agent_available() -> bool {
+    cursor_agent_bin().await.is_some()
+}
+
+/// How to invoke Cursor's CLI agent: the Homebrew `cursor-agent` binary when
+/// present, else the `cursor agent` subcommand. `None` when neither is on
+/// `PATH`.
+async fn cursor_agent_bin() -> Option<&'static str> {
+    if binary_on_path("cursor-agent").await {
+        Some("cursor-agent")
+    } else if binary_on_path("cursor").await {
+        Some("cursor agent")
+    } else {
+        None
+    }
+}
+
+/// Whether `bin` resolves to an executable file on `PATH`.
+///
+/// Reports presence, not health: a binary that exists but misbehaves still
+/// counts as available. On Windows every `PATHEXT` suffix is tried, since an
+/// npm-installed CLI ships as `bin.cmd`/`bin.ps1` and never `bin.exe`;
+/// elsewhere the file must be a regular file with an execute bit. The
+/// filesystem walk runs on a blocking thread so a slow `PATH` entry cannot
+/// stall the async runtime.
+async fn binary_on_path(bin: &str) -> bool {
+    let bin = bin.to_string();
+    tokio::task::spawn_blocking(move || {
+        let Some(path) = std::env::var_os("PATH") else {
+            return false;
+        };
+        let names = candidate_names(&bin);
+        std::env::split_paths(&path)
+            .any(|dir| names.iter().any(|name| is_executable_file(&dir.join(name))))
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn candidate_names(bin: &str) -> Vec<String> {
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let mut names = vec![bin.to_string()];
+    for ext in exts.split(';').filter(|ext| !ext.is_empty()) {
+        names.push(format!("{bin}{}", ext.to_ascii_lowercase()));
+    }
+    names
+}
+
+#[cfg(not(windows))]
+fn candidate_names(bin: &str) -> [String; 1] {
+    [bin.to_string()]
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(not(windows))]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
 fn apply_codex_catalog(metadata: &mut AgentMetadata, bytes: &[u8]) {
     let Ok(catalog) = serde_json::from_slice::<CodexModelCatalog>(bytes) else {
         return;
@@ -219,19 +325,27 @@ fn apply_codex_catalog(metadata: &mut AgentMetadata, bytes: &[u8]) {
         if model.visibility != "list" || !seen_models.insert(model.slug.clone()) {
             continue;
         }
+        let mut model_efforts = Vec::new();
+        for level in model.supported_reasoning_levels {
+            model_efforts.push(AgentChoice::leaf(
+                level.effort.clone(),
+                effort_label(&level.effort),
+            ));
+            if seen_efforts.insert(level.effort.clone()) {
+                efforts.push(AgentChoice::leaf(
+                    level.effort.clone(),
+                    effort_label(&level.effort),
+                ));
+            }
+        }
+        sort_efforts(&mut model_efforts);
         models.push(AgentChoice {
             id: model.slug,
             label: model.display_name,
+            efforts: model_efforts,
         });
-        for level in model.supported_reasoning_levels {
-            if seen_efforts.insert(level.effort.clone()) {
-                efforts.push(AgentChoice {
-                    label: effort_label(&level.effort),
-                    id: level.effort,
-                });
-            }
-        }
     }
+    sort_efforts(&mut efforts);
     if !models.is_empty() {
         metadata.models = models;
     }
@@ -241,16 +355,594 @@ fn apply_codex_catalog(metadata: &mut AgentMetadata, bytes: &[u8]) {
 }
 
 fn effort_label(effort: &str) -> String {
+    // A compound key like `high-fast` labels each part: "High (Fast)".
+    if let Some((level, rest)) = effort.split_once('-') {
+        let rest = rest
+            .split('-')
+            .map(title_word)
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!("{} ({rest})", one_word_effort_label(level));
+    }
+    one_word_effort_label(effort)
+}
+
+fn one_word_effort_label(effort: &str) -> String {
     match effort {
         "xhigh" => "X-High".to_string(),
-        other => {
-            let mut chars = other.chars();
+        other => title_word(other),
+    }
+}
+
+fn title_word(word: &str) -> String {
+    match word {
+        "gpt" => "GPT".to_string(),
+        "glm" => "GLM".to_string(),
+        "oss" => "OSS".to_string(),
+        // A version token (`4.6`, `120b`, `5.1`) stays verbatim.
+        _ if word.starts_with(|c: char| c.is_ascii_digit()) => word.to_string(),
+        _ => {
+            let mut chars = word.chars();
             chars
                 .next()
                 .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
                 .unwrap_or_default()
         }
     }
+}
+
+/// Sort key for an effort id so a picker shows `low → medium → high → xhigh →
+/// max` (each base, then its `…-thinking` twin, then `…-fast`) instead of
+/// alphabetically, regardless of what order the harness listed them in.
+fn effort_sort_key(effort: &str) -> (u8, u8, u8) {
+    let mut parts = effort.split('-');
+    let mut base = parts.next().unwrap_or_default();
+    let mut rest: Vec<&str> = parts.collect();
+    // Cursor's GPT-family models spell it out as two words instead of using
+    // the `xhigh` abbreviation other models share.
+    if base == "extra" && rest.first() == Some(&"high") {
+        base = "xhigh";
+        rest.remove(0);
+    }
+    let thinking = rest.contains(&"thinking");
+    let fast = rest.contains(&"fast");
+    let rank = match base {
+        "none" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" => 5,
+        "max" => 6,
+        "fast" => 7,
+        _ => 8,
+    };
+    (rank, u8::from(thinking), u8::from(fast))
+}
+
+fn sort_efforts(efforts: &mut [AgentChoice]) {
+    efforts.sort_by_key(|choice| effort_sort_key(&choice.id));
+}
+
+/// Run a local, stateless catalogue command with a short deadline, returning its
+/// stdout on success. A missing binary, non-zero exit, empty output, or timeout
+/// yields `None` so the caller keeps whatever choices it already had. This only
+/// ever runs off the request path (see the catalogue cache).
+async fn catalog_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let cmd = format!("{program} {}", args.join(" "));
+    let output = match tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(program)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            tracing::warn!(command = %cmd, %error, "harness model catalogue command failed to run");
+            return None;
+        }
+        Err(_) => {
+            tracing::warn!(command = %cmd, "harness model catalogue command timed out");
+            return None;
+        }
+    };
+    if !output.status.success() {
+        tracing::warn!(
+            command = %cmd,
+            code = output.status.code().unwrap_or(-1),
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "harness model catalogue command exited non-zero"
+        );
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if stdout.trim().is_empty() {
+        tracing::warn!(
+            command = %cmd,
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "harness model catalogue command produced no output"
+        );
+        return None;
+    }
+    tracing::debug!(command = %cmd, lines = stdout.lines().count(), "refreshed harness model catalogue");
+    Some(stdout)
+}
+
+/// `"cursor agent"` → `("cursor", vec!["agent"])`; `"cursor-agent"` →
+/// `("cursor-agent", vec![])`.
+fn split_bin(bin: &str) -> (&str, Vec<&str>) {
+    let mut parts = bin.split_whitespace();
+    let program = parts.next().unwrap_or(bin);
+    (program, parts.collect())
+}
+
+/// Populate model efforts using `opencode models --verbose`.
+async fn refresh_opencode_metadata(metadata: &mut AgentMetadata) {
+    let Some(entries) = acp_model_catalog("opencode", &["acp"]).await else {
+        return;
+    };
+    let efforts_by_model = catalog_stdout("opencode", &["models", "--verbose"])
+        .await
+        .map(|stdout| parse_opencode_models_verbose(&stdout))
+        .unwrap_or_default();
+    let models: Vec<AgentChoice> = entries
+        .into_iter()
+        .map(|(id, label)| {
+            let efforts = efforts_by_model.get(&id).cloned().unwrap_or_default();
+            AgentChoice { id, label, efforts }
+        })
+        .collect();
+    if !models.is_empty() {
+        metadata.models = models;
+    }
+}
+
+fn parse_opencode_models_verbose(stdout: &str) -> HashMap<String, Vec<AgentChoice>> {
+    let mut by_model = HashMap::new();
+    let mut remaining = stdout;
+    loop {
+        let trimmed = remaining.trim_start();
+        if trimmed.is_empty() {
+            break;
+        }
+        let Some(newline) = trimmed.find('\n') else {
+            break;
+        };
+        let key = trimmed[..newline].trim().to_string();
+        let after_key = &trimmed[newline + 1..];
+        let mut stream = serde_json::Deserializer::from_str(after_key).into_iter::<Value>();
+        let Some(Ok(value)) = stream.next() else {
+            break;
+        };
+        let consumed = stream.byte_offset();
+        drop(stream);
+
+        if let Some(variants) = value.get("variants").and_then(Value::as_object) {
+            let mut efforts: Vec<AgentChoice> = variants
+                .keys()
+                .filter(|variant| variant.as_str() != "default")
+                .map(|variant| AgentChoice::leaf(variant.clone(), effort_label(variant)))
+                .collect();
+            if !efforts.is_empty() {
+                sort_efforts(&mut efforts);
+                by_model.insert(key, efforts);
+            }
+        }
+        remaining = &after_key[consumed..];
+    }
+    by_model
+}
+
+async fn refresh_cursor_agent_metadata(metadata: &mut AgentMetadata, db: &Db) {
+    let Some(bin) = cursor_agent_bin().await else {
+        return;
+    };
+    let (program, mut args) = split_bin(bin);
+    args.push("acp");
+    let Some(models) = cursor_model_catalog(program, &args, db).await else {
+        return;
+    };
+    if !models.is_empty() {
+        metadata.models = models;
+    }
+}
+
+async fn cursor_model_catalog(program: &str, args: &[&str], db: &Db) -> Option<Vec<AgentChoice>> {
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        cursor_model_catalog_inner(program, args, db),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn cursor_model_catalog_inner(
+    program: &str,
+    args: &[&str],
+    db: &Db,
+) -> Option<Vec<AgentChoice>> {
+    let (_session, response) = open_cursor_acp_session(program, args, db).await?;
+    let available = response
+        .get("result")?
+        .get("models")?
+        .get("availableModels")?
+        .as_array()?
+        .iter()
+        .filter_map(|model| {
+            let id = model.get("modelId")?.as_str()?.to_string();
+            let name = model
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&id)
+                .to_string();
+            Some(AgentChoice::leaf(id, name))
+        })
+        .collect::<Vec<_>>();
+    (!available.is_empty()).then_some(available)
+}
+
+/// The effort choices for one specific agent/model pair, fetched live rather
+/// than carried in the catalogue. Only cursor-agent needs this (see
+/// [`refresh_cursor_agent_metadata`]); every other builtin already carries
+/// per-model efforts in its cached catalogue, so this just reads that back.
+/// `model` blank or unrecognized yields no choices — the caller falls back to
+/// "Agent default".
+pub async fn model_efforts(kind: &str, model: &str, db: &Db) -> Vec<AgentChoice> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Vec::new();
+    }
+    match BuiltinAgentKind::parse(kind) {
+        Some(BuiltinAgentKind::CursorAgent) => {
+            return cursor_model_effort_lookup(model, db)
+                .await
+                .unwrap_or_default();
+        }
+        // `agents.model_efforts` is a public operation and `kind` is caller-
+        // supplied — a custom agent name or garbage string must degrade to "no
+        // choices", not reach `builtin_catalog`'s `expect("known builtin kind")`.
+        None => return Vec::new(),
+        Some(_) => {}
+    }
+    let entry = builtin_catalog(kind, db).await;
+    entry
+        .models
+        .iter()
+        .find(|choice| choice.id == model)
+        .map(|choice| choice.efforts.clone())
+        .unwrap_or_default()
+}
+
+struct EffortLookupEntry {
+    efforts: Vec<AgentChoice>,
+    refreshed_at: Instant,
+}
+
+impl EffortLookupEntry {
+    fn is_fresh(&self) -> bool {
+        self.refreshed_at.elapsed() < CATALOG_TTL
+    }
+}
+
+/// Cached per-`(kind, model)` result of an on-demand [`model_efforts`] lookup,
+/// so switching back and forth between the same couple of models in the
+/// picker doesn't re-open a `cursor-agent acp` process each time.
+fn effort_lookup_cache() -> &'static RwLock<HashMap<(String, String), EffortLookupEntry>> {
+    static CACHE: OnceLock<RwLock<HashMap<(String, String), EffortLookupEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+async fn cursor_model_effort_lookup(model: &str, db: &Db) -> Option<Vec<AgentChoice>> {
+    let key = ("cursor-agent".to_string(), model.to_string());
+    if let Some(entry) = effort_lookup_cache().read().unwrap().get(&key) {
+        if entry.is_fresh() {
+            return Some(entry.efforts.clone());
+        }
+    }
+    let bin = cursor_agent_bin().await?;
+    let (program, mut args) = split_bin(bin);
+    args.push("acp");
+    let efforts = tokio::time::timeout(
+        Duration::from_secs(20),
+        cursor_single_model_effort(program, &args, model, db),
+    )
+    .await
+    .ok()
+    .flatten()?;
+    effort_lookup_cache().write().unwrap().insert(
+        key,
+        EffortLookupEntry {
+            efforts: efforts.clone(),
+            refreshed_at: Instant::now(),
+        },
+    );
+    Some(efforts)
+}
+
+async fn cursor_single_model_effort(
+    program: &str,
+    args: &[&str],
+    model: &str,
+    db: &Db,
+) -> Option<Vec<AgentChoice>> {
+    let (mut session, _) = open_cursor_acp_session(program, args, db).await?;
+    write_acp_frame(
+        &mut session.stdin,
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "session/set_config_option",
+                "params": { "sessionId": session.session_id, "configId": "model", "value": model } }),
+    )
+    .await?;
+    let response = read_acp_response(&mut session.lines, &mut session.stdin, 3).await?;
+    let options = response.get("result")?.get("configOptions")?.as_array()?;
+    Some(effort_config_options(options))
+}
+
+/// A live `cursor-agent acp` handshake: `initialize` (opting into
+/// `_meta.parameterizedModelPicker`, which splits a model's bundled
+/// effort/speed into separate config options — verified live) then
+/// `session/new` in a scratch directory. Returns the open session alongside
+/// the raw `session/new` response so callers needing `models.availableModels`
+/// and callers only needing the session id share one handshake.
+struct CursorAcpSession {
+    _child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    session_id: String,
+}
+
+/// Cursor's credentials from the default profile's stored environment, so a
+/// catalogue probe authenticates the same way a launched session does. The
+/// process environment still supplies anything the deploy passed in directly.
+async fn cursor_agent_credentials(db: &Db) -> Vec<(String, String)> {
+    crate::agent_env::pairs(db)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(name, value)| {
+            (name == "CURSOR_API_KEY" || name == "CURSOR_AUTH_TOKEN") && !value.is_empty()
+        })
+        .collect()
+}
+
+async fn open_cursor_acp_session(
+    program: &str,
+    args: &[&str],
+    db: &Db,
+) -> Option<(CursorAcpSession, Value)> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(args)
+        .envs(cursor_agent_credentials(db).await)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().ok()?;
+    let mut stdin = child.stdin.take()?;
+    let mut lines = BufReader::new(child.stdout.take()?).lines();
+
+    write_acp_frame(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": { "_meta": { "parameterizedModelPicker": true } },
+                } }),
+    )
+    .await?;
+    let cwd = std::env::temp_dir();
+    write_acp_frame(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": { "cwd": cwd.to_string_lossy(), "mcpServers": [] } }),
+    )
+    .await?;
+    let response = read_acp_response(&mut lines, &mut stdin, 2).await?;
+    let session_id = response
+        .get("result")?
+        .get("sessionId")?
+        .as_str()?
+        .to_string();
+    Some((
+        CursorAcpSession {
+            _child: child,
+            stdin,
+            lines,
+            session_id,
+        },
+        response,
+    ))
+}
+
+/// Read ACP frames until one with `id` arrives, answering any interleaved
+/// agent→client request with an empty result so the adapter never blocks
+/// waiting on us. `None` on EOF or a broken pipe.
+async fn read_acp_response(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    stdin: &mut tokio::process::ChildStdin,
+    id: u64,
+) -> Option<Value> {
+    loop {
+        let line = lines.next_line().await.ok()??;
+        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if frame.get("method").is_some() {
+            if let Some(request_id) = frame.get("id").cloned() {
+                let _ = write_acp_frame(
+                    stdin,
+                    json!({ "jsonrpc": "2.0", "id": request_id, "result": {} }),
+                )
+                .await;
+            }
+            continue;
+        }
+        if frame.get("id").and_then(Value::as_u64) == Some(id) {
+            return Some(frame);
+        }
+    }
+}
+
+/// The effort choices for the currently-selected model, from its
+/// `thought_level` config option(s). Cursor exposes some models as *two* axes
+/// at once — a `low…max` reasoning scale and a `thinking` on/off toggle —
+/// which are flattened into one list: `low`, `low-thinking`, `medium`,
+/// `medium-thinking`, …. A model with only the scale, or only the toggle, is
+/// returned as-is. Labels come from each option's own `name` (`"Extra High"`,
+/// …). Empty when the model exposes no effort control.
+fn effort_config_options(config_options: &[Value]) -> Vec<AgentChoice> {
+    let thought_level: Vec<&Value> = config_options
+        .iter()
+        .filter(|option| option.get("category").and_then(Value::as_str) == Some("thought_level"))
+        .collect();
+    let is_thinking =
+        |option: &&Value| option.get("id").and_then(Value::as_str) == Some("thinking");
+    let scale = thought_level.iter().find(|option| !is_thinking(option));
+    let has_thinking = thought_level.iter().any(is_thinking);
+
+    let mut efforts: Vec<AgentChoice> = match (scale, has_thinking) {
+        (Some(scale), true) => option_value_labels(scale)
+            .flat_map(|(value, label)| {
+                [
+                    AgentChoice::leaf(value.clone(), label.clone()),
+                    AgentChoice::leaf(format!("{value}-thinking"), format!("{label} (Thinking)")),
+                ]
+            })
+            .collect(),
+        (Some(scale), false) => option_value_labels(scale)
+            .map(|(value, label)| AgentChoice::leaf(value, label))
+            .collect(),
+        (None, true) => vec![AgentChoice::leaf("thinking", "Thinking")],
+        (None, false) => return Vec::new(),
+    };
+    sort_efforts(&mut efforts);
+    efforts
+}
+
+/// A config option's `(value, name)` pairs, `name` falling back to `value`.
+fn option_value_labels(option: &Value) -> impl Iterator<Item = (String, String)> + '_ {
+    option
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let value = entry.get("value")?.as_str()?.to_string();
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&value)
+                .to_string();
+            Some((value, name))
+        })
+}
+
+/// One-shot ACP handshake against `<program> <args>`: `initialize` then
+/// `session/new` in a scratch directory, returning the `model` config
+/// option's `(value, label)` pairs — the exact strings the adapter accepts
+/// back on `session/set_config_option`. `None` on any failure (not installed,
+/// not authenticated, protocol mismatch, timeout); any agent-to-client
+/// request received meanwhile is answered with an empty result so the adapter
+/// doesn't block waiting on us.
+async fn acp_model_catalog(program: &str, args: &[&str]) -> Option<Vec<(String, String)>> {
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        acp_model_catalog_inner(program, args),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn write_acp_frame(stdin: &mut tokio::process::ChildStdin, value: Value) -> Option<()> {
+    use tokio::io::AsyncWriteExt;
+    stdin.write_all(value.to_string().as_bytes()).await.ok()?;
+    stdin.write_all(b"\n").await.ok()
+}
+
+async fn acp_model_catalog_inner(program: &str, args: &[&str]) -> Option<Vec<(String, String)>> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let mut lines = BufReader::new(child.stdout.take()?).lines();
+
+    write_acp_frame(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": 1, "clientCapabilities": {} } }),
+    )
+    .await?;
+    let cwd = std::env::temp_dir();
+    write_acp_frame(
+        &mut stdin,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": { "cwd": cwd.to_string_lossy(), "mcpServers": [] } }),
+    )
+    .await?;
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if frame.get("method").is_some() {
+            // An agent→client request (permission, fs read, …): answer
+            // permissively so a handshake-only probe never blocks the adapter.
+            if let Some(id) = frame.get("id") {
+                let _ = write_acp_frame(
+                    &mut stdin,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                )
+                .await;
+            }
+            continue;
+        }
+        if frame.get("id").and_then(Value::as_u64) == Some(2) {
+            return model_config_options(&frame);
+        }
+    }
+    None
+}
+
+/// The `model`-category config option's `(value, label)` list from a
+/// `session/new` response, or `None` if the response carries no such option
+/// (an error reply, or an adapter with no model selector).
+fn model_config_options(session_new_response: &Value) -> Option<Vec<(String, String)>> {
+    let options = session_new_response
+        .get("result")?
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|option| option.get("category").and_then(Value::as_str) == Some("model"))?
+        .get("options")?
+        .as_array()?;
+    Some(
+        options
+            .iter()
+            .filter_map(|entry| {
+                let value = entry.get("value")?.as_str()?.to_string();
+                let name = entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&value)
+                    .to_string();
+                Some((value, name))
+            })
+            .collect(),
+    )
 }
 
 /// A launchable agent resolved from a kind: either a builtin static type or a
@@ -283,14 +975,172 @@ pub async fn resolve(db: &Db, kind: &str) -> Result<Option<ResolvedAgent>> {
 /// Every agent's metadata — the builtins followed by the operator's custom agents
 /// (name order). What `GET /api/agents` lists and the picker renders.
 pub async fn agent_metadata(db: &Db) -> Result<Vec<AgentMetadata>> {
-    let mut out = builtin_metadata();
-    if let Some(codex) = out.iter_mut().find(|meta| meta.kind == "codex") {
-        refresh_codex_metadata(codex).await;
+    // Probe availability and refresh each builtin's model catalogue
+    // concurrently — several of these shell out, some over the network.
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, meta) in builtin_metadata().into_iter().enumerate() {
+        let db = db.clone();
+        tasks.spawn(async move { (index, enrich_builtin(meta, &db).await) });
     }
+    let mut enriched: Vec<(usize, AgentMetadata)> = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        enriched.push(joined.map_err(|e| anyhow!("agent metadata task panicked: {e}"))?);
+    }
+    enriched.sort_by_key(|(index, _)| *index);
+    let mut out: Vec<AgentMetadata> = enriched.into_iter().map(|(_, meta)| meta).collect();
+
     for a in crate::custom_agents::list(db).await? {
-        out.push(CustomAgentType::new(a).metadata());
+        let mut meta = CustomAgentType::new(a).metadata();
+        // A custom agent is an operator-defined command, not a binary loom probes.
+        meta.available = Some(true);
+        out.push(meta);
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Builtin catalogue cache
+//
+// Probing a harness binary's model list shells out (`codex debug models`,
+// `opencode models --verbose`, `cursor-agent models`) and some of
+// those calls reach the network. Doing that on every `GET /api/agents` and
+// every launch preview made the picker slow to appear. Results are cached
+// process-wide with a TTL; `warm_builtin_catalogs` primes it at server start so
+// the first picker render is already served from cache. Once primed, a stale
+// entry is served immediately while a single background pass refreshes it.
+// ---------------------------------------------------------------------------
+
+const CATALOG_TTL: Duration = Duration::from_secs(600);
+
+#[derive(Clone)]
+struct CatalogEntry {
+    models: Vec<AgentChoice>,
+    efforts: Vec<AgentChoice>,
+    available: bool,
+    refreshed_at: Instant,
+}
+
+impl CatalogEntry {
+    fn is_fresh(&self) -> bool {
+        self.refreshed_at.elapsed() < CATALOG_TTL
+    }
+}
+
+fn catalog_cache() -> &'static RwLock<HashMap<String, CatalogEntry>> {
+    static CACHE: OnceLock<RwLock<HashMap<String, CatalogEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Probe availability and the model/effort catalogue for one builtin directly
+/// from its binary, with no cache. The slow path.
+async fn probe_builtin(kind: &str, db: &Db) -> CatalogEntry {
+    let available = builtin_available(kind).await;
+    let mut meta = builtin_agent_type(kind)
+        .expect("known builtin kind")
+        .metadata();
+    if available {
+        refresh_builtin_catalog(&mut meta, db).await;
+    }
+    CatalogEntry {
+        models: meta.models,
+        efforts: meta.efforts,
+        available,
+        refreshed_at: Instant::now(),
+    }
+}
+
+fn store_catalog(kind: &str, entry: CatalogEntry) {
+    catalog_cache()
+        .write()
+        .unwrap()
+        .insert(kind.to_string(), entry);
+}
+
+/// Drop a builtin's cached catalogue so its next read re-probes it — used when
+/// an operator's stored credentials change and the cached result would differ.
+pub fn invalidate_builtin_catalog(kind: &str) {
+    catalog_cache().write().unwrap().remove(kind);
+}
+
+fn apply_catalog(meta: &mut AgentMetadata, entry: &CatalogEntry) {
+    if !entry.models.is_empty() {
+        meta.models = entry.models.clone();
+    }
+    if !entry.efforts.is_empty() {
+        meta.efforts = entry.efforts.clone();
+    }
+}
+
+/// Refresh every builtin's catalogue in parallel and repopulate the cache.
+/// Idempotent and self-deduping — a second caller while one is running returns
+/// at once. Spawn it at server start, and again (in the background) whenever a
+/// served entry has gone stale.
+pub async fn warm_builtin_catalogs(db: Db) {
+    static RUNNING: AtomicBool = AtomicBool::new(false);
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mut tasks = tokio::task::JoinSet::new();
+    for meta in builtin_metadata() {
+        let db = db.clone();
+        tasks.spawn(async move {
+            let kind = meta.kind.clone();
+            (kind.clone(), probe_builtin(&kind, &db).await)
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok((kind, entry)) = joined {
+            store_catalog(&kind, entry);
+        }
+    }
+    RUNNING.store(false, Ordering::SeqCst);
+}
+
+/// The cached catalogue for `kind`: a fresh hit is returned as-is, a stale hit
+/// is returned while a background pass refreshes every builtin, and a cold miss
+/// blocks on a direct probe (then caches it).
+async fn builtin_catalog(kind: &str, db: &Db) -> CatalogEntry {
+    if let Some(entry) = catalog_cache().read().unwrap().get(kind).cloned() {
+        if !entry.is_fresh() {
+            let db = db.clone();
+            weaver_core::spawn_boxed(Box::pin(warm_builtin_catalogs(db)));
+        }
+        return entry;
+    }
+    let entry = probe_builtin(kind, db).await;
+    store_catalog(kind, entry.clone());
+    entry
+}
+
+/// Stamp a builtin's `available` flag and model/effort lists from the cache.
+async fn enrich_builtin(mut meta: AgentMetadata, db: &Db) -> AgentMetadata {
+    let entry = builtin_catalog(&meta.kind, db).await;
+    meta.available = Some(entry.available);
+    apply_catalog(&mut meta, &entry);
+    meta
+}
+
+async fn builtin_available(kind: &str) -> bool {
+    match BuiltinAgentKind::parse(kind) {
+        Some(BuiltinAgentKind::Claude) => is_claude_available().await,
+        Some(BuiltinAgentKind::Codex) => is_codex_available().await,
+        Some(BuiltinAgentKind::OpenCode) => is_opencode_available().await,
+        Some(BuiltinAgentKind::CursorAgent) => is_cursor_agent_available().await,
+        // A custom agent is an operator-defined command, not a probed binary.
+        None => true,
+    }
+}
+
+/// Refresh one builtin's model/effort choices from its installed binary. A
+/// no-op for a runtime that ships a static catalogue (claude) or whose binary
+/// is absent.
+async fn refresh_builtin_catalog(meta: &mut AgentMetadata, db: &Db) {
+    match BuiltinAgentKind::parse(&meta.kind) {
+        Some(BuiltinAgentKind::Claude) | None => {}
+        Some(BuiltinAgentKind::Codex) => refresh_codex_metadata(meta).await,
+        Some(BuiltinAgentKind::OpenCode) => refresh_opencode_metadata(meta).await,
+        Some(BuiltinAgentKind::CursorAgent) => refresh_cursor_agent_metadata(meta, db).await,
+    }
 }
 
 /// The metadata for one agent kind, or `None` when it names no agent.
@@ -299,8 +1149,14 @@ pub async fn metadata_for(db: &Db, kind: &str) -> Result<Option<AgentMetadata>> 
         return Ok(None);
     };
     let mut metadata = resolved.as_type().metadata();
-    if metadata.kind == "codex" {
-        refresh_codex_metadata(&mut metadata).await;
+    // Use the cached catalogue for launch validation, but leave `available`
+    // unset: it feeds the resolver-revision hash, and a transient PATH probe
+    // must not churn every open launch form.
+    if metadata.builtin {
+        let entry = builtin_catalog(&metadata.kind, db).await;
+        if entry.available {
+            apply_catalog(&mut metadata, &entry);
+        }
     }
     Ok(Some(metadata))
 }
@@ -332,11 +1188,36 @@ pub fn validate_model(metadata: &AgentMetadata, model: &str) -> Result<(), Strin
     }
 }
 
-/// Check that `effort` is one of `metadata`'s offered choices (blank is always
-/// allowed — the agent's own default). A key-free reason on mismatch.
-pub fn validate_effort(metadata: &AgentMetadata, effort: &str) -> Result<(), String> {
+/// Check that `effort` is valid for `model` on this agent (blank is always
+/// allowed — the agent's own default). The selected model's own effort list
+/// wins when the catalogue carries it (opencode, codex);
+/// otherwise the agent's global list is used. Agents whose per-model efforts
+/// are fetched on demand (`effort_lookup`, i.e. cursor) can't be checked
+/// statically — the ACP launch handshake validates those against the live
+/// advertised set. A key-free reason on mismatch.
+pub fn validate_effort(metadata: &AgentMetadata, model: &str, effort: &str) -> Result<(), String> {
     let effort = effort.trim();
     if effort.is_empty() {
+        return Ok(());
+    }
+    let model = model.trim();
+    if let Some(model_efforts) = metadata
+        .models
+        .iter()
+        .find(|choice| choice.id == model)
+        .map(|choice| &choice.efforts)
+        .filter(|efforts| !efforts.is_empty())
+    {
+        return if model_efforts.iter().any(|choice| choice.id == effort) {
+            Ok(())
+        } else {
+            Err(format!(
+                "unknown effort '{effort}' for {} model '{model}'",
+                metadata.kind
+            ))
+        };
+    }
+    if metadata.effort_lookup {
         return Ok(());
     }
     if metadata.efforts.iter().any(|choice| choice.id == effort) {
@@ -439,6 +1320,49 @@ fn codex_command(ctx: &AgentLaunchContext<'_>) -> String {
     }
 }
 
+fn spaced(args: String) -> String {
+    if args.is_empty() {
+        String::new()
+    } else {
+        format!(" {args}")
+    }
+}
+
+/// The Opencode TUI is the terminal fallback for the ACP builtin: `--continue`
+/// resumes in an existing worktree, a fresh run preloads the goal via
+/// `--prompt`.
+fn opencode_command(ctx: &AgentLaunchContext<'_>, mode: LaunchMode) -> String {
+    let args = spaced(join_args([
+        model_flag(ctx.model).map(|m| format!("--model {m}"))
+    ]));
+    match (mode, ctx.goal_file.or(ctx.primer_file)) {
+        (LaunchMode::Adopt, _) => format!("opencode --continue{args}"),
+        (LaunchMode::Fresh, Some(f)) => {
+            format!(
+                "opencode{args} --prompt \"$(cat {})\"",
+                sh_single_quote_path(f)
+            )
+        }
+        (LaunchMode::Fresh, None) => format!("opencode{args}"),
+    }
+}
+
+/// Cursor's CLI as the terminal fallback: `--continue` resumes, a fresh run
+/// takes the goal positionally. `--model` is passed through verbatim (Cursor
+/// scopes effort inside the model id / bracket parameters).
+fn cursor_agent_command(bin: &str, ctx: &AgentLaunchContext<'_>, mode: LaunchMode) -> String {
+    let args = spaced(join_args([
+        model_flag(ctx.model).map(|m| format!("--model {m}"))
+    ]));
+    match (mode, ctx.goal_file.or(ctx.primer_file)) {
+        (LaunchMode::Adopt, _) => format!("{bin} --continue{args}"),
+        (LaunchMode::Fresh, Some(f)) => {
+            format!("{bin}{args} \"$(cat {})\"", sh_single_quote_path(f))
+        }
+        (LaunchMode::Fresh, None) => format!("{bin}{args}"),
+    }
+}
+
 /// The inner launch command for a custom agent: its `setup` stage (if any), then
 /// the stage command for this `mode`. Fresh runs `launch` with the goal file
 /// appended as a positional argument (mirroring the builtin runtimes); adopt runs
@@ -515,11 +1439,13 @@ impl AgentType for ClaudeAgentType {
             label: "Claude".to_string(),
             models: AgentChoice::list(MODEL_CHOICES),
             efforts: AgentChoice::list(EFFORT_CHOICES),
+            effort_lookup: false,
             accepts_raw_model: true,
             supports_hooks: true,
             builtin: true,
             supports_acp: true,
             protocol: "acp".to_string(),
+            available: None,
         }
     }
 
@@ -545,11 +1471,13 @@ impl AgentType for CodexAgentType {
             label: "Codex".to_string(),
             models: AgentChoice::list(CODEX_MODEL_CHOICES),
             efforts: AgentChoice::list(CODEX_EFFORT_CHOICES),
+            effort_lookup: false,
             accepts_raw_model: false,
             supports_hooks: false,
             builtin: true,
             supports_acp: true,
             protocol: "acp".to_string(),
+            available: None,
         }
     }
 
@@ -562,6 +1490,83 @@ impl AgentType for CodexAgentType {
     }
 }
 
+impl AgentType for OpenCodeAgentType {
+    fn metadata(&self) -> AgentMetadata {
+        AgentMetadata {
+            kind: "opencode".to_string(),
+            label: "Opencode".to_string(),
+            // Populated from opencode's own ACP handshake by
+            // `refresh_opencode_metadata`, including per-model efforts.
+            models: Vec::new(),
+            efforts: Vec::new(),
+            effort_lookup: false,
+            accepts_raw_model: true,
+            supports_hooks: false,
+            builtin: true,
+            supports_acp: true,
+            protocol: "acp".to_string(),
+            available: None,
+        }
+    }
+
+    fn create<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(async move {
+            start_terminal(&ctx, "opencode", &opencode_command(&ctx, LaunchMode::Fresh)).await
+        })
+    }
+
+    fn adopt<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(async move {
+            start_terminal(&ctx, "opencode", &opencode_command(&ctx, LaunchMode::Adopt)).await
+        })
+    }
+}
+
+impl AgentType for CursorAgentType {
+    fn metadata(&self) -> AgentMetadata {
+        AgentMetadata {
+            kind: "cursor-agent".to_string(),
+            label: "Cursor".to_string(),
+            // The model list is populated from Cursor's own ACP handshake by
+            // `refresh_cursor_agent_metadata`; per-model efforts are fetched
+            // lazily (`effort_lookup`) rather than carried here.
+            models: Vec::new(),
+            efforts: Vec::new(),
+            effort_lookup: true,
+            accepts_raw_model: true,
+            supports_hooks: false,
+            builtin: true,
+            supports_acp: true,
+            protocol: "acp".to_string(),
+            available: None,
+        }
+    }
+
+    fn create<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(async move {
+            let bin = cursor_agent_bin().await.unwrap_or("cursor-agent");
+            start_terminal(
+                &ctx,
+                "cursor-agent",
+                &cursor_agent_command(bin, &ctx, LaunchMode::Fresh),
+            )
+            .await
+        })
+    }
+
+    fn adopt<'a>(&'a self, ctx: AgentLaunchContext<'a>) -> AgentFuture<'a> {
+        Box::pin(async move {
+            let bin = cursor_agent_bin().await.unwrap_or("cursor-agent");
+            start_terminal(
+                &ctx,
+                "cursor-agent",
+                &cursor_agent_command(bin, &ctx, LaunchMode::Adopt),
+            )
+            .await
+        })
+    }
+}
+
 impl AgentType for CustomAgentType {
     fn metadata(&self) -> AgentMetadata {
         AgentMetadata {
@@ -571,6 +1576,7 @@ impl AgentType for CustomAgentType {
             // any such flags into the stage commands themselves.
             models: Vec::new(),
             efforts: Vec::new(),
+            effort_lookup: false,
             accepts_raw_model: false,
             supports_hooks: self.agent.reports_status,
             builtin: false,
@@ -580,6 +1586,7 @@ impl AgentType for CustomAgentType {
             } else {
                 self.agent.protocol.clone()
             },
+            available: None,
         }
     }
 
@@ -1028,9 +2035,9 @@ fn loom_bin_path() -> String {
 
 /// Resolve the execution backend for a launch: the agent's declared `protocol`
 /// unless the create request overrides it. A blank/absent override keeps the
-/// declared value. Both builtins may opt into `acp` (claude via
-/// `claude-agent-acp`, codex via `codex-acp`); a terminal-only custom agent has
-/// no ACP adapter, so it is rejected. Returns a key-free reason.
+/// declared value. A runtime with no ACP adapter (`supports_acp == false`, e.g.
+/// a terminal-only custom agent) cannot be forced to `acp`.
+/// Returns a key-free reason.
 pub fn resolve_protocol(meta: &AgentMetadata, requested: Option<&str>) -> Result<String, String> {
     let declared = if meta.protocol.is_empty() {
         "terminal"
@@ -1049,8 +2056,7 @@ pub fn resolve_protocol(meta: &AgentMetadata, requested: Option<&str>) -> Result
         return Ok(declared.to_string());
     }
     if req == "acp" {
-        // Both builtins have an adapter; a terminal custom agent does not.
-        return if meta.builtin {
+        return if meta.supports_acp {
             Ok("acp".to_string())
         } else {
             Err(format!(
@@ -1133,13 +2139,20 @@ pub async fn build_acp_launch(
     open: AcpOpen,
 ) -> Result<AcpLaunch> {
     let is_fresh = matches!(open, AcpOpen::Fresh);
-    let is_codex = spec.custom.is_none() && spec.runtime == "codex";
-    let is_claude = spec.custom.is_none() && !is_codex;
+    let builtin_runtime = spec.custom.is_none().then_some(spec.runtime);
+    let is_codex = builtin_runtime == Some("codex");
+    let is_claude = builtin_runtime == Some("claude");
+    let is_opencode = builtin_runtime == Some("opencode");
+    let is_cursor_agent = builtin_runtime == Some("cursor-agent");
     let adapter_cmd = match spec.custom {
         // The `launch` command *is* the adapter; setup runs first, as for a
         // terminal custom agent.
         Some(agent) => join_shell(&[agent.setup.trim(), agent.launch.trim()]),
         None if is_codex => codex_acp_cmd(db).await,
+        None if is_opencode => opencode_acp_cmd(db).await,
+        None if is_cursor_agent => cursor_agent_acp_cmd(db).await,
+        // The `claude` builtin, and any unrecognised builtin, use the claude
+        // adapter — the historical default.
         None => claude_acp_cmd(db).await,
     };
 
@@ -1159,9 +2172,9 @@ pub async fn build_acp_launch(
         .context("invalid session runtime-permission snapshot")?;
     let mcp_snapshot: weaver_api::McpPolicySnapshot =
         serde_json::from_str(spec.mcp_access).context("invalid session MCP policy snapshot")?;
-    if is_codex && goal_text.is_none() {
-        // No appendSystemPrompt analogue: a primer-only launch seeds the primer
-        // positionally, mirroring the terminal path's
+    if (is_codex || is_opencode || is_cursor_agent) && goal_text.is_none() {
+        // No appendSystemPrompt analogue on these adapters: a primer-only
+        // launch seeds the primer positionally, mirroring the terminal path's
         // `goal_file.or(primer_file)`.
         goal_text = primer_text.clone();
     }
@@ -1234,10 +2247,14 @@ pub async fn build_acp_launch(
         new_or_load,
         // Codex boots directly in its mapped mode via `INITIAL_AGENT_MODE`; a
         // post-setup `session/set_mode` would re-send a claude-flavored id it
-        // does not advertise.
-        mode: (!is_codex).then(|| spec.mode.to_string()),
+        // does not advertise. Opencode and Cursor advertise their own mode
+        // vocabularies, and a `session/set_mode` with an unknown id fails the
+        // launch, so leave their mode to the adapter's default too.
+        mode: (!is_codex && !is_opencode && !is_cursor_agent).then(|| spec.mode.to_string()),
         // Loading must preserve adapter-restored live choices: the user may
-        // have changed either selector after launch.
+        // have changed either selector after launch. A blank selector (the
+        // usual case for opencode/cursor, whose models are chosen live over
+        // ACP) leaves the adapter on its own default.
         initial_model: (is_fresh && !spec.model.trim().is_empty())
             .then(|| spec.model.trim().to_string()),
         initial_effort: (is_fresh && !spec.effort.trim().is_empty())
@@ -1336,6 +2353,38 @@ async fn codex_acp_cmd(db: &Db) -> String {
         return cmd;
     }
     npm_adapter_cmd("codex-acp", "@agentclientprotocol/codex-acp")
+}
+
+/// An operator override for an ACP adapter command: an env var wins, then a
+/// config setting.
+async fn acp_cmd_override(db: &Db, env_var: &str, setting: &str) -> Option<String> {
+    if let Ok(cmd) = std::env::var(env_var) {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            return Some(cmd.to_string());
+        }
+    }
+    weaver_core::config::get(db, setting)
+        .await
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Opencode's built-in ACP server (`opencode acp`); `WEAVER_OPENCODE_ACP_CMD`
+/// or the `acp.opencode_cmd` setting override it.
+async fn opencode_acp_cmd(db: &Db) -> String {
+    acp_cmd_override(db, "WEAVER_OPENCODE_ACP_CMD", "acp.opencode_cmd")
+        .await
+        .unwrap_or_else(|| "opencode acp".to_string())
+}
+
+/// Cursor's built-in ACP server (`cursor-agent acp`, or `cursor agent acp`);
+/// `WEAVER_CURSOR_ACP_CMD` or the `acp.cursor_cmd` setting override it.
+async fn cursor_agent_acp_cmd(db: &Db) -> String {
+    if let Some(cmd) = acp_cmd_override(db, "WEAVER_CURSOR_ACP_CMD", "acp.cursor_cmd").await {
+        return cmd;
+    }
+    format!("{} acp", cursor_agent_bin().await.unwrap_or("cursor-agent"))
 }
 
 /// Apply Loom's Codex policy on top of the shared provider login and any
@@ -2117,6 +3166,43 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    #[tokio::test]
+    async fn model_efforts_degrades_on_an_unknown_kind_instead_of_panicking() {
+        // `agents.model_efforts` forwards a caller-supplied `agent` straight
+        // through — a custom agent's name or a garbage string must come back
+        // empty, not panic the request.
+        let db = crate::db::connect_in_memory().await.unwrap();
+        assert!(
+            model_efforts("totally-not-a-real-agent-kind", "some-model", &db)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_probe_credentials_come_from_the_stored_environment() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        crate::agent_env::set(&db, "CURSOR_API_KEY", "key-1")
+            .await
+            .unwrap();
+        crate::agent_env::set(&db, "CURSOR_AUTH_TOKEN", "token-1")
+            .await
+            .unwrap();
+        crate::agent_env::set(&db, "ANTHROPIC_API_KEY", "other")
+            .await
+            .unwrap();
+
+        let mut creds = cursor_agent_credentials(&db).await;
+        creds.sort();
+        assert_eq!(
+            creds,
+            vec![
+                ("CURSOR_API_KEY".to_string(), "key-1".to_string()),
+                ("CURSOR_AUTH_TOKEN".to_string(), "token-1".to_string()),
+            ]
+        );
+    }
+
     #[cfg(unix)]
     fn write_executable(path: &Path, source: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -2320,6 +3406,303 @@ mod tests {
         let metadata = CLAUDE_AGENT_TYPE.metadata();
 
         assert!(validate_model(&metadata, "claude-opus-4-8").is_ok());
+    }
+
+    #[test]
+    fn validate_effort_scopes_to_the_selected_model() {
+        let mut metadata = OPENCODE_AGENT_TYPE.metadata();
+        metadata.models = vec![
+            AgentChoice {
+                id: "glm-flash".into(),
+                label: "GLM Flash".into(),
+                efforts: vec![
+                    AgentChoice::leaf("low", "Low"),
+                    AgentChoice::leaf("high", "High"),
+                ],
+            },
+            AgentChoice::leaf("big-pickle", "Big Pickle"),
+        ];
+
+        // A model that carries an effort list is checked against *its* list…
+        assert!(validate_effort(&metadata, "glm-flash", "high").is_ok());
+        assert!(validate_effort(&metadata, "glm-flash", "xhigh").is_err());
+        // …a model with no per-model efforts and no global list rejects any.
+        assert!(validate_effort(&metadata, "big-pickle", "high").is_err());
+        // Blank effort is always fine.
+        assert!(validate_effort(&metadata, "glm-flash", "").is_ok());
+
+        // Cursor's efforts are fetched on demand, so the static check defers.
+        let cursor = CURSOR_AGENT_TYPE.metadata();
+        assert!(cursor.effort_lookup);
+        assert!(validate_effort(&cursor, "grok-4.6", "high").is_ok());
+    }
+
+    #[test]
+    fn new_builtin_harnesses_are_registered() {
+        for kind in ["opencode", "cursor-agent"] {
+            assert!(
+                builtin_agent_type(kind).is_some(),
+                "{kind} should resolve to a builtin"
+            );
+            assert!(
+                builtin_metadata().iter().any(|m| m.kind == kind),
+                "{kind} should appear in the picker list"
+            );
+        }
+        assert!(OPENCODE_AGENT_TYPE.metadata().supports_acp);
+        assert!(CURSOR_AGENT_TYPE.metadata().supports_acp);
+        // Cursor's catalogue carries the model list only; the picker fetches
+        // effort choices per model on demand instead.
+        assert!(CURSOR_AGENT_TYPE.metadata().effort_lookup);
+        assert!(!OPENCODE_AGENT_TYPE.metadata().effort_lookup);
+    }
+
+    #[test]
+    fn extracts_the_model_config_option_from_a_session_new_response() {
+        // Shaped like a real `session/new` reply: a `mode` option ahead of the
+        // `model` option, each carrying the exact strings `set_config_option`
+        // accepts back.
+        let response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "result": {
+                "sessionId": "s1",
+                "configOptions": [
+                    { "id": "mode", "category": "mode", "options": [
+                        { "value": "agent", "name": "Agent" },
+                    ] },
+                    { "id": "model", "category": "model", "options": [
+                        { "value": "default[]", "name": "Auto" },
+                        { "value": "grok-4.6[effort=high,fast=true]", "name": "grok-4.6" },
+                        { "value": "opencode/big-pickle" },
+                    ] },
+                ],
+            },
+        });
+        assert_eq!(
+            model_config_options(&response).unwrap(),
+            [
+                ("default[]".to_string(), "Auto".to_string()),
+                (
+                    "grok-4.6[effort=high,fast=true]".to_string(),
+                    "grok-4.6".to_string()
+                ),
+                // No `name` field: the value doubles as its own label.
+                (
+                    "opencode/big-pickle".to_string(),
+                    "opencode/big-pickle".to_string()
+                ),
+            ]
+        );
+
+        // An error reply (no `configOptions`) yields no models rather than a
+        // spurious empty list.
+        let error_response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2,
+            "error": { "code": -32602, "message": "not authenticated" },
+        });
+        assert!(model_config_options(&error_response).is_none());
+    }
+
+    #[test]
+    fn codex_catalog_scopes_efforts_per_model() {
+        let mut metadata = CODEX_AGENT_TYPE.metadata();
+        apply_codex_catalog(
+            &mut metadata,
+            br#"{"models":[
+                {"slug":"gpt-fast","display_name":"Fast","visibility":"list",
+                 "supported_reasoning_levels":[]},
+                {"slug":"gpt-think","display_name":"Think","visibility":"list",
+                 "supported_reasoning_levels":[{"effort":"high"},{"effort":"low"}]}
+            ]}"#,
+        );
+        let fast = metadata.models.iter().find(|m| m.id == "gpt-fast").unwrap();
+        let think = metadata
+            .models
+            .iter()
+            .find(|m| m.id == "gpt-think")
+            .unwrap();
+        assert!(fast.efforts.is_empty());
+        assert_eq!(
+            think
+                .efforts
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "high"]
+        );
+    }
+
+    #[test]
+    fn effort_config_options_reads_thought_level_names_in_ranked_order() {
+        // Shaped like cursor's `session/set_config_option` reply after
+        // selecting a model: `mode` and `model` options sit alongside a single
+        // `thought_level` scale (id varies — `effort` here, `reasoning`
+        // elsewhere — but it is found by category).
+        let config_options = serde_json::json!([
+            { "id": "mode", "category": "mode", "options": [] },
+            { "id": "model", "category": "model", "options": [] },
+            { "id": "effort", "category": "thought_level", "options": [
+                { "value": "high", "name": "High" },
+                { "value": "low", "name": "Low" },
+                { "value": "extra-high", "name": "Extra High" },
+                { "value": "untitled" },
+            ] },
+        ]);
+        let efforts = effort_config_options(config_options.as_array().unwrap());
+        assert_eq!(
+            efforts
+                .iter()
+                .map(|e| (e.id.as_str(), e.label.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("low", "Low"),
+                ("high", "High"),
+                ("extra-high", "Extra High"),
+                // No `name` field: the value doubles as its own label, same as
+                // the plain model-catalogue parsing.
+                ("untitled", "untitled"),
+            ]
+        );
+
+        // A model with no `thought_level` option (no effort control) yields
+        // nothing rather than picking up an unrelated select.
+        let no_effort = serde_json::json!([
+            { "id": "model", "category": "model", "options": [] },
+        ]);
+        assert!(effort_config_options(no_effort.as_array().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn effort_config_options_flattens_a_scale_and_thinking_toggle() {
+        // Cursor's `claude-opus-*` models advertise both a reasoning scale and
+        // a `thinking` on/off toggle; the two are flattened into `low`,
+        // `low-thinking`, `high`, `high-thinking`, … in ranked order.
+        let config_options = serde_json::json!([
+            { "id": "thinking", "category": "thought_level", "options": [
+                { "value": "false", "name": "Off" },
+                { "value": "true", "name": "On" },
+            ] },
+            { "id": "effort", "category": "thought_level", "options": [
+                { "value": "high", "name": "High" },
+                { "value": "low", "name": "Low" },
+            ] },
+        ]);
+        let efforts = effort_config_options(config_options.as_array().unwrap());
+        assert_eq!(
+            efforts
+                .iter()
+                .map(|e| (e.id.as_str(), e.label.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("low", "Low"),
+                ("low-thinking", "Low (Thinking)"),
+                ("high", "High"),
+                ("high-thinking", "High (Thinking)"),
+            ]
+        );
+
+        // A thinking-only model (no scale) offers the toggle as one entry.
+        let thinking_only = serde_json::json!([
+            { "id": "thinking", "category": "thought_level", "options": [
+                { "value": "false", "name": "Off" },
+                { "value": "true", "name": "On" },
+            ] },
+        ]);
+        assert_eq!(
+            effort_config_options(thinking_only.as_array().unwrap())
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            ["thinking"]
+        );
+    }
+
+    #[test]
+    fn parse_opencode_models_verbose_extracts_variant_keys_and_drops_default() {
+        let stdout = concat!(
+            "opencode/big-pickle\n",
+            "{\n  \"variants\": {}\n}\n",
+            "opencode/claude-fable-5-1\n",
+            "{\n  \"variants\": {\n",
+            "    \"default\": {},\n",
+            "    \"high\": {\"effort\": \"high\"},\n",
+            "    \"low\": {\"effort\": \"low\"}\n",
+            "  }\n}\n",
+        );
+        let catalog = parse_opencode_models_verbose(stdout);
+        assert!(!catalog.contains_key("opencode/big-pickle"));
+        assert_eq!(
+            catalog["opencode/claude-fable-5-1"]
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            ["low", "high"]
+        );
+    }
+
+    #[test]
+    fn new_harness_launch_commands() {
+        let primer = Path::new("/x/primer.txt");
+        let goal = Path::new("/x/goal.txt");
+
+        // Cursor: `--model` verbatim (the exact advertised bracket string); a
+        // fresh run takes the goal positionally, falling back to the primer
+        // when there is no goal.
+        let ctx = test_ctx(Some(goal), Some(primer), "grok-4.6[effort=high]", "");
+        assert_eq!(
+            cursor_agent_command("cursor-agent", &ctx, LaunchMode::Fresh),
+            "cursor-agent --model grok-4.6[effort=high] \"$(cat '/x/goal.txt')\""
+        );
+        assert_eq!(
+            cursor_agent_command("cursor agent", &ctx, LaunchMode::Adopt),
+            "cursor agent --continue --model grok-4.6[effort=high]"
+        );
+
+        let oc = test_ctx(None, None, "opencode/gpt-5.4", "");
+        assert_eq!(
+            opencode_command(&oc, LaunchMode::Fresh),
+            "opencode --model opencode/gpt-5.4"
+        );
+        assert_eq!(
+            opencode_command(&oc, LaunchMode::Adopt),
+            "opencode --continue --model opencode/gpt-5.4"
+        );
+    }
+
+    #[test]
+    fn a_builtin_without_an_acp_adapter_cannot_be_forced_to_acp() {
+        let mut terminal_only = meta_for("terminal-only", "terminal", true);
+        terminal_only.supports_acp = false;
+        assert!(resolve_protocol(&terminal_only, Some("acp")).is_err());
+        assert_eq!(
+            resolve_protocol(&terminal_only, Some("terminal")).unwrap(),
+            "terminal"
+        );
+        // The ACP builtins still opt in.
+        assert_eq!(
+            resolve_protocol(&meta_for("opencode", "acp", true), Some("terminal")).unwrap(),
+            "terminal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_file_rejects_directories_and_unset_execute_bits() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(!is_executable_file(&dir.path().join("missing")));
+
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        assert!(!is_executable_file(&subdir));
+
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, "#!/bin/sh\n").unwrap();
+        assert!(!is_executable_file(&plain));
+
+        let script = dir.path().join("script");
+        write_executable(&script, "#!/bin/sh\n");
+        assert!(is_executable_file(&script));
     }
 
     fn custom_agent(name: &str, setup: &str, launch: &str, resume: &str) -> CustomAgent {
@@ -2755,11 +4138,13 @@ mod tests {
             label: kind.to_string(),
             models: Vec::new(),
             efforts: Vec::new(),
+            effort_lookup: false,
             accepts_raw_model: false,
             supports_hooks: false,
             builtin,
             supports_acp: builtin || protocol == "acp",
             protocol: protocol.to_string(),
+            available: None,
         }
     }
 
