@@ -1,6 +1,21 @@
 import { expect, test } from '../fixtures/weaver';
+import type { Locator } from '@playwright/test';
 import { writeFileSync } from 'fs';
 import { join } from 'path';
+
+// The diff view's per-line "add a comment" control is a `+` button that only
+// becomes interactive once its row is hovered (`@git-diff-view/vue` renders
+// it `invisible` until `group-hover`), scoped to one side's table so the old
+// and new gutters never collide.
+async function addWidgetButton(
+  fileArticle: Locator,
+  side: 'old' | 'new',
+  line: number,
+): Promise<Locator> {
+  const row = fileArticle.locator(`table[data-mode="${side}"] tr[data-line="${line}"]`);
+  await row.hover();
+  return row.locator('button.diff-add-widget');
+}
 
 test('preserves Changes drafts through refresh and peer-submit conflicts', async ({
   page,
@@ -14,8 +29,10 @@ test('preserves Changes drafts through refresh and peer-submit conflicts', async
   writeFileSync(changedPath, 'first\nsecond\n');
 
   await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
-  await page.getByRole('button', { name: /review\.txt/ }).click();
-  await page.getByRole('button', { name: /Comment on review\.txt new line 1/ }).click();
+  // Files render expanded by default now, so there's no toggle to click first.
+  const fileToggle = page.getByRole('button', { name: /review\.txt/ });
+  const article = page.locator('article').filter({ has: fileToggle });
+  await (await addWidgetButton(article, 'new', 1)).click();
   const composer = page.getByTestId('change-comment-composer');
   const input = composer.locator('textarea');
   await input.fill('Explain why this line belongs here.');
@@ -42,12 +59,15 @@ test('preserves Changes drafts through refresh and peer-submit conflicts', async
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
   await staleSave;
   await expect(input).toHaveValue('Explain why this line belongs here.');
-  await page.getByRole('button', { name: /Comment on review\.txt new line 2/ }).click();
+  await (await addWidgetButton(article, 'new', 2)).click();
   await expect(input).toHaveValue('Explain why this line belongs here.');
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
 
   const tray = page.getByTestId('review-tray');
   await expect(tray).toContainText('1 pending');
+  // Saving an inline comment must not pop the review tray open on its own.
+  await expect(page.getByTestId('review-tray-toggle')).toHaveAttribute('aria-expanded', 'false');
+  await page.getByTestId('review-tray-toggle').click();
   const overall = page.getByTestId('review-overall-note');
   const initialSave = page.waitForResponse(
     (response) =>
@@ -94,4 +114,100 @@ test('preserves Changes drafts through refresh and peer-submit conflicts', async
   await retrySave;
   await expect(tray).toContainText('0 pending');
   await peer.close();
+});
+
+test('minimizes the review overlay on outside clicks', async ({ page, weaver }) => {
+  const session = await weaver.seedSession({
+    goal: 'overlay dismiss',
+    name: 'changes-overlay-dismiss',
+  });
+  const changedPath = join(session.work_dir, 'review.txt');
+  writeFileSync(changedPath, 'first\nsecond\n');
+
+  await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
+  const toggle = page.getByTestId('review-tray-toggle');
+  await toggle.click();
+  const note = page.getByTestId('review-overall-note');
+  await expect(note).toBeVisible();
+  // Opening the tray puts focus straight into the overall note.
+  await expect(note).toBeFocused();
+  await note.fill('Kept through minimizing.');
+
+  // The textarea is removed before its blur can fire, so the outside click
+  // must flush the dirty note itself.
+  const noteSave = page.waitForResponse(
+    (response) =>
+      response.ok() &&
+      response.request().method() === 'POST' &&
+      ['/api/reviews/create', '/api/reviews/update'].includes(new URL(response.url()).pathname),
+  );
+  await page.getByRole('button', { name: 'Refresh' }).click();
+  await noteSave;
+  await expect(note).toHaveCount(0);
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+
+  await toggle.click();
+  await expect(page.getByTestId('review-overall-note')).toHaveValue('Kept through minimizing.');
+
+  // Escape in the overall note minimizes the tray too, flushing the dirty note.
+  const reopenedNote = page.getByTestId('review-overall-note');
+  await expect(reopenedNote).toBeFocused();
+  await reopenedNote.fill('Kept through Escape.');
+  const escapeSave = page.waitForResponse(
+    (response) =>
+      response.ok() &&
+      response.request().method() === 'POST' &&
+      ['/api/reviews/create', '/api/reviews/update'].includes(
+        new URL(response.url()).pathname,
+      ),
+  );
+  await reopenedNote.press('Escape');
+  await escapeSave;
+  await expect(reopenedNote).toHaveCount(0);
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+
+  await toggle.click();
+  await expect(page.getByTestId('review-overall-note')).toHaveValue('Kept through Escape.');
+});
+
+test('confirm before discarding a typed inline comment', async ({ page, weaver }) => {
+  const session = await weaver.seedSession({
+    goal: 'composer discard confirm',
+    name: 'changes-composer-discard',
+  });
+  const changedPath = join(session.work_dir, 'review.txt');
+  writeFileSync(changedPath, 'first\nsecond\n');
+
+  await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
+  const fileToggle = page.getByRole('button', { name: /review\.txt/ });
+  const article = page.locator('article').filter({ has: fileToggle });
+  const composer = page.getByTestId('change-comment-composer');
+  const confirm = page.getByTestId('change-comment-discard-confirm');
+
+  // Escape with nothing typed closes the composer outright.
+  await (await addWidgetButton(article, 'new', 1)).click();
+  await composer.locator('textarea').press('Escape');
+  await expect(composer).toHaveCount(0);
+
+  // Escape with text typed presents the confirm, focused so Enter discards.
+  await (await addWidgetButton(article, 'new', 1)).click();
+  const input = composer.locator('textarea');
+  await input.fill('Do not keep this.');
+  await input.press('Escape');
+  await expect(confirm).toBeVisible();
+  const discard = composer.getByRole('button', { name: 'Discard comment' });
+  await expect(discard).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(composer).toHaveCount(0);
+
+  // Escape from the confirm returns to editing without discarding.
+  await (await addWidgetButton(article, 'new', 1)).click();
+  await input.fill('Keep me.');
+  await input.press('Escape');
+  await expect(confirm).toBeVisible();
+  await expect(composer.getByRole('button', { name: 'Discard comment' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(confirm).toHaveCount(0);
+  await expect(input).toBeFocused();
+  await expect(input).toHaveValue('Keep me.');
 });

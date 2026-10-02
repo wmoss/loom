@@ -59,7 +59,7 @@ const error = ref('');
 // Conversation and demotes the worktree shells to a slim Shells tab. `defaultTab`
 // resolves whichever leads when the user hasn't picked one.
 type LocalTab = 'terminal' | 'conversation' | 'shells';
-type WorkTab = LocalTab | 'review';
+type WorkTab = LocalTab | 'artifacts' | 'changes';
 const isAcp = computed(() => ws.value?.protocol === 'acp');
 const defaultTab = computed<LocalTab>(() => (isAcp.value ? 'conversation' : 'terminal'));
 
@@ -97,7 +97,9 @@ function activeArtifactsPanel(): InstanceType<typeof ArtifactsPanel> | null {
 
 // The pane the work area shows: the artifacts panel when docked, else the
 // effective local tab (so a popped-out artifact leaves the work pane in place).
-const workTab = computed<WorkTab>(() => (reviewDocked.value ? 'review' : effectiveLocalTab.value));
+const workTab = computed<WorkTab>(() =>
+  artifactsDocked.value ? 'artifacts' : changesActive.value ? 'changes' : effectiveLocalTab.value,
+);
 
 // Lazy-mount panes on first visit, then keep them (v-show) so re-selecting is
 // instant. The terminal is always mounted; the rest start cold so a session-open
@@ -147,12 +149,11 @@ async function guardedArtifactLayout(change: () => void | Promise<void>): Promis
 }
 
 async function selectTab(t: WorkTab) {
-  if (t === 'review') {
-    // Review owns the deep-linked Artifacts / Changes choice. Reopening it
-    // preserves the current choice and otherwise defaults to Artifacts.
+  if (t === 'artifacts' || t === 'changes') {
+    const active = t === 'artifacts' ? artifactsActive.value : changesActive.value;
     await guardedArtifactLayout(async () => {
       poppedOut.value = false;
-      if (!reviewActive.value) await router.push(`/s/${props.id}/artifacts`);
+      if (!active) await router.push(`/s/${props.id}/${t}`);
     });
     return;
   }
@@ -219,12 +220,14 @@ const workTabs = computed<{ key: WorkTab; label: string }[]>(() =>
     ? [
         { key: 'conversation', label: 'Conversation' },
         { key: 'shells', label: 'Shells' },
-        { key: 'review', label: 'Review' },
+        { key: 'artifacts', label: 'Artifacts' },
+        { key: 'changes', label: 'Code Review' },
       ]
     : [
         { key: 'terminal', label: 'Agent' },
         { key: 'conversation', label: 'Conversation' },
-        { key: 'review', label: 'Review' },
+        { key: 'artifacts', label: 'Artifacts' },
+        { key: 'changes', label: 'Code Review' },
       ],
 );
 async function moveWorkTab(direction: -1 | 1) {
@@ -260,30 +263,6 @@ const sessionCommands = computed<Command[]>(() => [
     hint: true,
     run: () => moveWorkTab(1),
   },
-  ...(reviewActive.value
-    ? [
-        {
-          id: 'session.review.artifacts',
-          label: 'Open Artifacts',
-          keys: ['a'],
-          run: async () => {
-            await guardedArtifactLayout(async () => {
-              await router.push(`/s/${props.id}/artifacts`);
-            });
-          },
-        },
-        {
-          id: 'session.review.changes',
-          label: 'Open Changes',
-          keys: ['c'],
-          run: async () => {
-            await guardedArtifactLayout(async () => {
-              await router.push(`/s/${props.id}/changes`);
-            });
-          },
-        },
-      ]
-    : []),
   ...(isAcp.value && workTab.value === 'shells'
     ? [
         {
@@ -565,6 +544,7 @@ onUnmounted(() => {
       <SessionTabs
         class="hidden sm:flex"
         :tab="workTab"
+        :id="props.id"
         :artifacts-popped="railOpen"
         :protocol="ws.protocol"
         @select="selectTab"
@@ -600,32 +580,14 @@ onUnmounted(() => {
           <SessionConversation :session="ws" />
         </div>
 
-        <!-- Review is the one route owner for the kept-alive Artifacts and
-             Changes renderers. Existing artifact deep links stay canonical. -->
+        <!-- Artifacts and Changes are top-level tabs now (see SessionTabs); this
+             is just the kept-alive host for whichever is docked. Existing
+             artifact deep links stay canonical. -->
         <div
           v-if="(mounted.artifacts || mounted.changes) && !railOpen"
           v-show="reviewDocked"
           class="flex h-full min-h-0 flex-col"
         >
-          <nav
-            class="hidden shrink-0 gap-1 border-b border-line px-2 text-xs sm:flex"
-            aria-label="Review"
-          >
-            <router-link
-              :to="`/s/${props.id}/artifacts`"
-              class="border-b-2 px-2 py-1.5"
-              :class="artifactsActive ? 'border-accent text-fg' : 'border-transparent text-muted'"
-            >
-              Artifacts
-            </router-link>
-            <router-link
-              :to="`/s/${props.id}/changes`"
-              class="border-b-2 px-2 py-1.5"
-              :class="changesActive ? 'border-accent text-fg' : 'border-transparent text-muted'"
-            >
-              Changes
-            </router-link>
-          </nav>
           <div v-if="mounted.artifacts" v-show="artifactsDocked" class="min-h-0 flex-1">
             <ArtifactsPanel
               ref="dockedArtifactsRef"
