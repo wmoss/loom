@@ -1941,6 +1941,9 @@ pub struct SessionCommitDto {
     pub authored_at: String,
     /// First line of the commit message.
     pub subject: String,
+    /// The commit message below its subject, when there is one.
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]

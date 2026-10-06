@@ -19,12 +19,15 @@ use crate::changes::{
 pub const MAX_COMMITS: usize = 200;
 /// Per-field ceiling (subject, author), mirroring the changes line bound.
 const MAX_FIELD_BYTES: usize = 2_048;
+/// Per-commit ceiling for the message body, which keeps its paragraph breaks.
+const MAX_BODY_BYTES: usize = 4_096;
 /// Cap on the raw `git log` capture before parsing.
 const MAX_LOG_BYTES: usize = 512 * 1024;
 
 /// Field separator `\x1f` between one commit's fields, record separator `\x1e`
-/// between commits; git's placeholders never emit either byte.
-const LOG_FORMAT: &str = "%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e";
+/// between commits; git's placeholders never emit either byte. `%b` is the
+/// message body below the subject.
+const LOG_FORMAT: &str = "%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1e";
 
 /// Read one session worktree's own commits without fetching or changing Git
 /// state. An unresolvable base is reported, not guessed — an empty list would
@@ -67,6 +70,33 @@ pub async fn load(work_dir: &Path, base_reference: &str) -> Result<SessionCommit
     })
 }
 
+/// The message body keeps its paragraph structure — newlines survive, other
+/// control bytes are repaired — and clips to its bound with a marker.
+pub(crate) fn body_text(value: &str, limit: usize) -> Option<String> {
+    let trimmed = value.trim_matches(|ch: char| ch == '\n' || ch == '\r');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cleaned: String = trimmed
+        .chars()
+        .map(|ch| {
+            if ch == '\n' || ch == '\t' || !ch.is_control() {
+                ch
+            } else {
+                '\u{fffd}'
+            }
+        })
+        .collect();
+    if cleaned.len() <= limit {
+        return Some(cleaned);
+    }
+    let mut end = limit;
+    while !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!("{}\u{2026}", &cleaned[..end]))
+}
+
 fn unavailable(
     reference: &str,
     reason: ChangeBaseUnavailableReasonDto,
@@ -103,7 +133,7 @@ pub(crate) fn parse_log(raw: &str, limit: usize) -> (Vec<SessionCommitDto>, bool
         // Fewer fields than the format writes means the capture bound cut
         // this record mid-commit; the remnant is dropped, and the caller's
         // capture flags mark the listing truncated.
-        if fields.len() < 5 {
+        if fields.len() < 6 {
             continue;
         }
         if commits.len() == limit {
@@ -117,6 +147,7 @@ pub(crate) fn parse_log(raw: &str, limit: usize) -> (Vec<SessionCommitDto>, bool
             author_email: clip(fields[2]),
             authored_at: clip(fields[3]),
             subject: clip(fields[4]),
+            body: body_text(fields[5], MAX_BODY_BYTES),
         });
     }
     (commits, truncated)
@@ -130,7 +161,11 @@ mod tests {
     const REC: char = '\x1e';
 
     fn record(oid: &str, subject: &str) -> String {
-        format!("{oid}{SEP}Ada Lovelace{SEP}ada@example.test{SEP}2026-10-05T10:00:00+00:00{SEP}{subject}{REC}")
+        record_with_body(oid, subject, "")
+    }
+
+    fn record_with_body(oid: &str, subject: &str, body: &str) -> String {
+        format!("{oid}{SEP}Ada Lovelace{SEP}ada@example.test{SEP}2026-10-05T10:00:00+00:00{SEP}{subject}{SEP}{body}{REC}")
     }
 
     fn parse(raw: &str) -> (Vec<SessionCommitDto>, bool) {
@@ -168,6 +203,31 @@ mod tests {
     }
 
     #[test]
+    fn a_body_keeps_paragraph_breaks_and_omits_when_empty() {
+        let raw = format!(
+            "{}{}",
+            record_with_body("a", "First", "why this exists\n\nand what it costs"),
+            record("b", "Second")
+        );
+        let (commits, _) = parse(&raw);
+        assert_eq!(
+            commits[0].body.as_deref(),
+            Some("why this exists\n\nand what it costs")
+        );
+        assert_eq!(commits[1].body, None);
+    }
+
+    #[test]
+    fn an_overlong_body_clips_to_its_bound() {
+        let long = "x".repeat(MAX_BODY_BYTES + 10);
+        let raw = record_with_body("a", "First", &long);
+        let (commits, _) = parse(&raw);
+        let body = commits[0].body.clone().unwrap();
+        assert_eq!(body.chars().count(), MAX_BODY_BYTES + 1);
+        assert!(body.ends_with('\u{2026}'));
+    }
+
+    #[test]
     fn a_record_cut_off_mid_capture_is_dropped() {
         let raw = format!("{}abc\x1fpartial", record("a", "First"));
         let (commits, truncated) = parse(&raw);
@@ -179,7 +239,7 @@ mod tests {
     #[test]
     fn overlong_fields_are_clipped() {
         let long = "x".repeat(MAX_FIELD_BYTES + 10);
-        let raw = format!("a{SEP}{long}{SEP}e{SEP}2026{SEP}s{REC}");
+        let raw = format!("a{SEP}{long}{SEP}e{SEP}2026{SEP}s{SEP}body{REC}");
         let (commits, _) = parse(&raw);
         // The clip keeps the bound's worth of content plus its ellipsis marker.
         assert_eq!(commits[0].author_name.chars().count(), MAX_FIELD_BYTES + 1);
@@ -217,6 +277,7 @@ mod tests {
         assert_eq!(reference, "main");
         assert_eq!(commits.commits.len(), 1);
         assert_eq!(commits.commits[0].subject, "branch commit");
+        assert_eq!(commits.commits[0].body, None);
         assert!(!commits.truncated);
         assert!(commits.head_oid.is_some());
     }
