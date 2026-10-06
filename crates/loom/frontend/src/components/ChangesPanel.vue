@@ -770,6 +770,16 @@ function reviewAllFromPicker() {
     data-testid="changes-panel"
   >
     <header class="flex flex-wrap items-center gap-2 border-b border-line px-3 py-2">
+      <button
+        type="button"
+        class="btn-secondary px-2 py-1 text-xs"
+        data-testid="changes-aside-toggle"
+        :aria-pressed="asideOpen"
+        title="Expand file tree"
+        @click="asideOpen = !asideOpen"
+      >
+        {{ asideOpen ? '✕' : '◫' }}
+      </button>
       <div class="relative min-w-0 flex-1">
         <h2 class="text-sm font-semibold text-fg">Changes</h2>
         <div class="flex items-center gap-2">
@@ -869,16 +879,6 @@ function reviewAllFromPicker() {
           changes.totals.deletions
         }}
       </span>
-      <button
-        type="button"
-        class="btn-secondary px-2 py-1 text-xs"
-        data-testid="changes-aside-toggle"
-        :aria-pressed="asideOpen"
-        title="Compose aside — the file rail"
-        @click="asideOpen = !asideOpen"
-      >
-        {{ asideOpen ? '✕' : '◫' }}
-      </button>
       <button type="button" class="btn-secondary px-2 py-1 text-xs" @click="load">Refresh</button>
     </header>
     <p
