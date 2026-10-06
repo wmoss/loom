@@ -19,7 +19,11 @@ test("the Commits tab lists the branch commits over its base", async ({
   git(["commit", "-m", "Add the feature file"]);
   writeFileSync(join(session.work_dir, "feature.txt"), "two\n");
   git(["add", "-A"]);
-  git(["commit", "-m", "Extend the feature file"]);
+  git([
+    "commit",
+    "-m",
+    "Extend the feature file\n\nExplains why the second write happened.",
+  ]);
 
   // Deep link opens the tab directly, newest commit first.
   await page.goto(`${weaver.baseUrl}/s/${session.id}/commits`);
@@ -34,6 +38,17 @@ test("the Commits tab lists the branch commits over its base", async ({
   );
   await expect(panel).toContainText("Add the feature file");
   await expect(panel).toContainText("Loom E2E");
+
+  // The full message unfolds on request and re-folds; the row click still
+  // opens the review.
+  const bodyToggle = page.locator("[data-commit-body-toggle]").first();
+  await expect(bodyToggle).toBeVisible();
+  await bodyToggle.click();
+  await expect(page.locator("[data-commit-body]")).toContainText(
+    "Explains why the second write happened.",
+  );
+  await bodyToggle.click();
+  await expect(page.locator("[data-commit-body]")).toHaveCount(0);
 
   // The tab also opens from a plain session page, and back again.
   await page.goto(`${weaver.baseUrl}/s/${session.id}`);
