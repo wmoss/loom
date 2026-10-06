@@ -50,6 +50,12 @@ test("the Commits tab lists the branch commits over its base", async ({
   await bodyToggle.click();
   await expect(page.locator("[data-commit-body]")).toHaveCount(0);
 
+  // Clicking the commit line itself unfolds and re-folds the message too.
+  await page.locator("[data-commit]").first().click();
+  await expect(page.locator("[data-commit-body]")).toHaveCount(1);
+  await page.locator("[data-commit]").first().click();
+  await expect(page.locator("[data-commit-body]")).toHaveCount(0);
+
   // The tab also opens from a plain session page, and back again.
   await page.goto(`${weaver.baseUrl}/s/${session.id}`);
   await page.locator('[data-tab="commits"]').click();
@@ -87,9 +93,9 @@ test("clicking a commit reviews its own diff, with expand and the compose aside"
   git(["add", "-A"]);
   git(["commit", "-m", "touch the middle line"]);
 
-  // Clicking the newest commit opens Code Review scoped to its own changes.
+  // The newest commit's Review button opens Code Review scoped to its changes.
   await page.goto(`${weaver.baseUrl}/s/${session.id}/commits`);
-  await page.locator("[data-commit]").first().click();
+  await page.getByTestId("commit-review-button").first().click();
   await expect(page).toHaveURL(
     new RegExp(`/s/${session.id}/changes\\?rev=[0-9a-f]{40}$`),
   );
@@ -153,6 +159,29 @@ test("clicking a commit reviews its own diff, with expand and the compose aside"
     .click();
   await expect(page).toHaveURL(new RegExp(`/s/${session.id}/changes$`));
   await expect(page.getByTestId("changes-commit-scope")).toHaveCount(0);
+
+  // The header picker re-scopes the review from within Code Review itself.
+  const scopeButton = page.getByTestId("changes-commit-scope-button");
+  await expect(scopeButton).toContainText("All commits");
+  await scopeButton.click();
+  const picker = page.getByTestId("changes-commit-picker");
+  await expect(picker).toContainText("Review all commits");
+  await expect(picker).toContainText("Select a commit to review");
+  await picker.getByTestId("commit-review-button").first().click();
+  await expect(page).toHaveURL(
+    new RegExp(`/s/${session.id}/changes\\?rev=[0-9a-f]{40}$`),
+  );
+  await expect(page.getByTestId("changes-commit-scope")).toContainText(
+    "Reviewing commit",
+  );
+  await expect(scopeButton).toContainText("Commit ");
+
+  // "Review all commits" from the picker returns to the whole branch state.
+  await scopeButton.click();
+  await picker.getByTestId("changes-review-all").click();
+  await expect(page).toHaveURL(new RegExp(`/s/${session.id}/changes$`));
+  await expect(page.getByTestId("changes-commit-scope")).toHaveCount(0);
+  await expect(scopeButton).toContainText("All commits");
 });
 
 test("a branch with no own commits says so instead of an empty list", async ({
