@@ -37,6 +37,13 @@ const MAX_PATCH_BYTES: usize = 2 * 1024 * 1024;
 const MAX_UNTRACKED_RENDER_BYTES: u64 = 512 * 1024;
 const MAX_IDENTITY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXCLUDE_BYTES: u64 = 256 * 1024;
+/// Per-file ceiling for the full pre/post-change text the browser needs to
+/// enable hunk expansion; a larger file gets no expand controls rather than
+/// expansion that would reveal wrong lines.
+const MAX_CONTENT_BYTES: usize = 64 * 1024;
+/// Response-wide ceiling for expansion content; files past it degrade the
+/// same way per-file oversize does.
+const MAX_TOTAL_CONTENT_BYTES: usize = 256 * 1024;
 const MAX_SAFE_CONFIG_BYTES: usize = 4 * 1024;
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -55,6 +62,10 @@ struct RawFile {
     path: Vec<u8>,
     old_path: Option<Vec<u8>>,
     gitlink: bool,
+    /// Pre/post-change blob hashes from `--raw --full-index`; used to read
+    /// full file contents for hunk expansion.
+    old_blob: Option<Vec<u8>>,
+    new_blob: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -576,6 +587,12 @@ fn parse_raw_files(bytes: &[u8]) -> Vec<RawFile> {
             continue;
         };
         let letter = code.first().copied().unwrap_or(b'M');
+        // `:old-mode new-mode old-blob new-blob status` — the blobs back
+        // full-content reads; absent formats degrade to `None`.
+        let fields: Vec<&[u8]> = header.splitn(6, |byte| *byte == b' ').collect();
+        let blob = |index: usize| fields.get(index).map(|b| b.to_vec());
+        let old_blob = blob(2);
+        let new_blob = blob(3);
         let Some(first_path) = records.next() else {
             break;
         };
@@ -604,6 +621,8 @@ fn parse_raw_files(bytes: &[u8]) -> Vec<RawFile> {
             path,
             old_path,
             gitlink,
+            old_blob,
+            new_blob,
         });
     }
     files
@@ -854,11 +873,60 @@ async fn hash_path(
     }
 }
 
+/// Reads one blob's full text for hunk expansion — `None` unless the whole
+/// blob fits the per-file bound, so expansion never works from partial text.
+async fn read_blob_text(boundary: &GitBoundary, blob: &Option<Vec<u8>>) -> Result<Option<String>> {
+    let Some(blob) = blob else {
+        return Ok(None);
+    };
+    if blob.is_empty() {
+        return Ok(None);
+    }
+    let spec = String::from_utf8_lossy(blob).to_string();
+    let (capture, ok) = capture_git_status(
+        boundary.command(),
+        &["cat-file", "blob", &spec],
+        MAX_CONTENT_BYTES + 1,
+    )
+    .await?;
+    // A missing blob (added or deleted sides read as the all-zero hash) or a
+    // capture that did not come back whole leaves that side non-expandable.
+    if !ok || capture.truncated || capture.timed_out {
+        return Ok(None);
+    }
+    // Whole-file text, not patch lines: keep the line structure the renderer
+    // splits on, repairing only invalid UTF-8.
+    Ok(Some(String::from_utf8_lossy(&capture.bytes).into_owned()))
+}
+
+/// Full pre/post-change text for one file, from its `--raw` blob hashes. Both
+/// sides are read first and only then committed against the remaining budget,
+/// so a file never shows one expandable side and one that cannot expand.
+async fn attach_contents(
+    boundary: &GitBoundary,
+    raw: &RawFile,
+    budget: &mut usize,
+) -> Result<(Option<String>, Option<String>)> {
+    if raw.gitlink {
+        return Ok((None, None));
+    }
+    let old = read_blob_text(boundary, &raw.old_blob).await?;
+    let new = read_blob_text(boundary, &raw.new_blob).await?;
+    let cost = old.as_ref().map_or(0, |text: &String| text.len())
+        + new.as_ref().map_or(0, |text: &String| text.len());
+    if cost > *budget {
+        return Ok((None, None));
+    }
+    *budget -= cost;
+    Ok((old, new))
+}
+
 async fn untracked_file(
     work_dir: &Path,
     raw: &[u8],
     sources: Vec<ChangeSourceDto>,
     remaining_total: &mut usize,
+    content_budget: &mut usize,
 ) -> Result<ChangeFileDto> {
     let mut file = ChangeFileDto {
         status: ChangeFileStatusDto::Untracked,
@@ -870,6 +938,8 @@ async fn untracked_file(
         content: ChangeContentDto::Unsupported,
         hunks: Vec::new(),
         truncated: false,
+        old_content: None,
+        new_content: None,
     };
     let (handle, metadata) = match safe_file(work_dir, raw)? {
         Some(file) => file,
@@ -897,6 +967,7 @@ async fn untracked_file(
     }
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
+    let line_count = lines.len();
     file.additions = Some(lines.len().min(u32::MAX as usize) as u32);
     let mut rendered = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -917,10 +988,17 @@ async fn untracked_file(
     file.content = ChangeContentDto::Text;
     if !rendered.is_empty() {
         file.hunks.push(ChangeHunkDto {
-            header: format!("@@ -0,0 +1,{} @@", lines.len()),
+            header: format!("@@ -0,0 +1,{} @@", line_count),
             lines: rendered,
             truncated: file.truncated,
         });
+    }
+    // The whole file is already in hand; hand it to the renderer for hunk
+    // expansion when it fits the same bounds tracked files obey.
+    let text_len = text.len();
+    if !file.truncated && text_len <= MAX_CONTENT_BYTES && text_len <= *content_budget {
+        *content_budget -= text_len;
+        file.new_content = Some(text.into_owned());
     }
     Ok(file)
 }
@@ -1250,11 +1328,14 @@ async fn load_once(boundary: &GitBoundary, base_reference: &str) -> Result<(Chan
                 path: path.clone(),
                 old_path: None,
                 gitlink: false,
+                old_blob: None,
+                new_blob: None,
             });
         }
     }
     let total_files = raw_files.len().min(u32::MAX as usize) as u32;
     let mut remaining_total = MAX_TOTAL_LINES;
+    let mut remaining_content = MAX_TOTAL_CONTENT_BYTES;
     let mut files = Vec::new();
     for raw in raw_files.iter().take(MAX_FILES) {
         let mut sources = Vec::new();
@@ -1271,12 +1352,26 @@ async fn load_once(boundary: &GitBoundary, base_reference: &str) -> Result<(Chan
             sources.push(ChangeSourceDto::Untracked);
         }
         if raw.status == ChangeFileStatusDto::Untracked {
-            files.push(untracked_file(work_dir, &raw.path, sources, &mut remaining_total).await?);
+            files.push(
+                untracked_file(
+                    work_dir,
+                    &raw.path,
+                    sources,
+                    &mut remaining_total,
+                    &mut remaining_content,
+                )
+                .await?,
+            );
             continue;
         }
         let section = sections.pop_front().unwrap_or_default();
         let (content, hunks, section_truncated) = parse_hunks(section, &mut remaining_total);
         let stat = stats.get(&raw.path).copied().unwrap_or_default();
+        let (old_content, new_content) = if content == ChangeContentDto::Text {
+            attach_contents(boundary, raw, &mut remaining_content).await?
+        } else {
+            (None, None)
+        };
         files.push(ChangeFileDto {
             status: raw.status,
             path: path_dto(&raw.path),
@@ -1287,6 +1382,8 @@ async fn load_once(boundary: &GitBoundary, base_reference: &str) -> Result<(Chan
             content,
             hunks,
             truncated: section_truncated || (patch.truncated && sections.is_empty()),
+            old_content,
+            new_content,
         });
     }
     let totals = ChangeTotalsDto {
@@ -1354,6 +1451,145 @@ pub async fn load(work_dir: &Path, base_reference: &str) -> Result<ChangeSetDto>
         }
     }
     unreachable!("bounded change read always returns or retries once")
+}
+
+/// The snapshot for a review target: the whole worktree state, or the diff one
+/// commit introduces.
+pub async fn load_for_review(
+    work_dir: &Path,
+    base_reference: &str,
+    rev: Option<&str>,
+) -> Result<ChangeSetDto> {
+    match rev {
+        None => load(work_dir, base_reference).await,
+        Some(rev) => load_commit(work_dir, rev).await,
+    }
+}
+
+/// The diff one commit introduces (`parent..rev`), as a bounded snapshot the
+/// review surface renders exactly like the worktree state. A commit and its
+/// parent are immutable, so there is no stability re-read to race.
+pub async fn load_commit(work_dir: &Path, rev: &str) -> Result<ChangeSetDto> {
+    let oid = bootstrap_text(
+        work_dir,
+        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("revision {rev} does not resolve to a commit"))?;
+    let parent = bootstrap_text(work_dir, &["rev-parse", "--verify", &format!("{oid}^")])
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("commit {oid} is a root commit with no parent to diff against")
+        })?;
+    let boundary = GitBoundary::load(work_dir).await?;
+    let (raw, _) = capture_git_status(
+        boundary.command(),
+        &[
+            "diff-tree",
+            "--raw",
+            "--full-index",
+            "--find-renames",
+            "-r",
+            "-z",
+            &parent,
+            &oid,
+            "--",
+        ],
+        MAX_INVENTORY_BYTES,
+    )
+    .await?;
+    let (numstat, patch) = tokio::try_join!(
+        async {
+            capture_diff(
+                &boundary,
+                &["--numstat", "--find-renames", "-z", &parent, &oid, "--"],
+                MAX_INVENTORY_BYTES,
+            )
+            .await
+        },
+        async {
+            capture_diff(
+                &boundary,
+                &[
+                    "--patch",
+                    "--find-renames",
+                    "--unified=3",
+                    &parent,
+                    &oid,
+                    "--",
+                ],
+                MAX_PATCH_BYTES,
+            )
+            .await
+        },
+    )?;
+    let mut raw_files = parse_raw_files(&raw.bytes);
+    let mut sections = patch_sections(&patch.bytes);
+    let stats = parse_numstat(&numstat.bytes);
+    // A commit's changes are committed by definition, and nothing in a commit
+    // view is staged, unstaged, or untracked.
+    let sources = vec![ChangeSourceDto::Committed];
+    let total_files = raw_files.len().min(u32::MAX as usize) as u32;
+    let mut remaining_total = MAX_TOTAL_LINES;
+    let mut remaining_content = MAX_TOTAL_CONTENT_BYTES;
+    let mut files = Vec::new();
+    for raw in raw_files.iter().take(MAX_FILES) {
+        let section = sections.pop_front().unwrap_or_default();
+        let (content, hunks, section_truncated) = parse_hunks(section, &mut remaining_total);
+        let stat = stats.get(&raw.path).copied().unwrap_or_default();
+        let (old_content, new_content) = if content == ChangeContentDto::Text {
+            attach_contents(&boundary, raw, &mut remaining_content).await?
+        } else {
+            (None, None)
+        };
+        files.push(ChangeFileDto {
+            status: raw.status,
+            path: path_dto(&raw.path),
+            old_path: raw.old_path.as_deref().map(path_dto),
+            sources: sources.clone(),
+            additions: stat.additions,
+            deletions: stat.deletions,
+            content,
+            hunks,
+            truncated: section_truncated || (patch.truncated && sections.is_empty()),
+            old_content,
+            new_content,
+        });
+    }
+    raw_files.truncate(MAX_FILES);
+    let short = oid[..oid.len().min(10)].to_string();
+    let mut changes = ChangeSetDto {
+        version: None,
+        base: ChangeBaseDto::Available {
+            reference: format!("commit {short}"),
+            oid: parent.clone(),
+        },
+        head_oid: Some(oid.clone()),
+        totals: ChangeTotalsDto {
+            files: total_files,
+            additions: stats.values().filter_map(|stat| stat.additions).sum(),
+            deletions: stats.values().filter_map(|stat| stat.deletions).sum(),
+            truncated: patch.truncated || raw.truncated || numstat.truncated,
+        },
+        files,
+        truncated: patch.truncated
+            || raw.truncated
+            || numstat.truncated
+            || raw_files.len() > MAX_FILES
+            || remaining_total == 0,
+        limits: limits(),
+    };
+    if patch.timed_out || raw.timed_out || numstat.timed_out {
+        return Ok(changes);
+    }
+    let rendered = serde_json::to_vec(&changes).context("serializing commit change response")?;
+    let mut hasher = Sha256::new();
+    hash_record(&mut hasher, b"schema", b"changes-commit-v1");
+    hash_record(&mut hasher, b"parent-oid", parent.as_bytes());
+    hash_record(&mut hasher, b"commit-oid", oid.as_bytes());
+    hash_record(&mut hasher, b"rendered-response", &rendered);
+    changes.version = Some(format!("changes-v1:{}", hex::encode(hasher.finalize())));
+    Ok(changes)
 }
 
 /// Validate a mutable comment anchor against the exact snapshot on screen.
@@ -1428,6 +1664,67 @@ fn line_number(line: &ChangeLineDto, side: ChangeSideDto) -> Option<u32> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_commit_snapshot_scopes_to_that_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.path().to_str().unwrap()])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-b", "main"]).status.success());
+        assert!(git(&["config", "user.name", "E2E"]).status.success());
+        assert!(git(&["config", "user.email", "e2e@weaver.test"])
+            .status
+            .success());
+        std::fs::write(dir.path().join("a"), "one\ntwo\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "base"]).status.success());
+        assert!(git(&["switch", "-c", "feature"]).status.success());
+        std::fs::write(dir.path().join("a"), "one\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(dir.path().join("b"), "brand new\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "extend and add"]).status.success());
+
+        let changes = load_commit(dir.path(), "HEAD").await.unwrap();
+        assert!(changes
+            .version
+            .as_deref()
+            .is_some_and(|v| v.starts_with("changes-v1:")));
+        let reference = match &changes.base {
+            ChangeBaseDto::Available { reference, oid: _ } => reference.clone(),
+            other => panic!("unexpected base: {other:?}"),
+        };
+        assert!(reference.starts_with("commit "));
+        assert_eq!(changes.head_oid.as_deref().map(str::len), Some(40));
+        assert_eq!(changes.totals.files, 2);
+        let by_path: std::collections::BTreeMap<String, &ChangeFileDto> = changes
+            .files
+            .iter()
+            .map(|file| (file.path.display.clone(), file))
+            .collect();
+        let a = by_path.get("a").unwrap();
+        assert_eq!(a.sources, vec![ChangeSourceDto::Committed]);
+        assert_eq!(a.hunks.len(), 1);
+        assert_eq!(
+            a.old_content.as_deref().map(|text| text.lines().count()),
+            Some(2)
+        );
+        assert_eq!(
+            a.new_content.as_deref().map(|text| text.lines().count()),
+            Some(4)
+        );
+        let b = by_path.get("b").unwrap();
+        assert_eq!(b.status, ChangeFileStatusDto::Added);
+        assert_eq!(b.old_content, None);
+        assert_eq!(b.new_content.as_deref(), Some("brand new\n"));
+        assert!(!changes.truncated);
+    }
+
     #[test]
     fn parses_typed_hunks_and_enforces_side_ranges() {
         let patch = b"diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -2,2 +2,3 @@ fn main() {\n same\n-old\n+new\n+next\n";
@@ -1458,6 +1755,8 @@ mod tests {
                 content,
                 hunks,
                 truncated: false,
+                old_content: None,
+                new_content: None,
             }],
             truncated: false,
             limits: limits(),

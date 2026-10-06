@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import type { ComponentPublicInstance } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { DiffModeEnum, DiffViewWithMultiSelect, SplitSide } from '@git-diff-view/vue';
 import type { LineRange } from '@git-diff-view/vue';
 import '@git-diff-view/vue/styles/diff-view-pure.css';
@@ -34,6 +35,10 @@ import ReviewCommentCard from './ReviewCommentCard.vue';
 import ReviewTray from './ReviewTray.vue';
 
 const props = defineProps<{ id: string }>();
+const route = useRoute();
+const router = useRouter();
+/** `?rev=<oid>` scopes the snapshot to one commit's own changes. */
+const rev = computed(() => (typeof route.query.rev === 'string' ? route.query.rev : null));
 const changes = ref<ChangeSet | null>(null);
 const reviews = ref<Review[]>([]);
 const loading = ref(false);
@@ -48,6 +53,9 @@ const commentErrors = reactive<Record<number, string>>({});
 const deliveryErrors = reactive<Record<number, string>>({});
 const trayOpen = ref(false);
 const trayError = ref('');
+// The compose aside: a file rail beside the diff, off until asked for.
+const asideOpen = ref(false);
+const asideFilter = ref('');
 const overallNote = ref('');
 const summaryDirty = ref(false);
 const summarySaving = ref(false);
@@ -168,7 +176,7 @@ async function load() {
   loading.value = true;
   try {
     const [nextChanges, nextReviews] = await Promise.all([
-      getChanges(props.id),
+      getChanges(props.id, rev.value ?? undefined),
       listChangesReviews(props.id),
     ]);
     const nextDraft = nextReviews.find((review) => review.status === 'draft') ?? null;
@@ -552,7 +560,41 @@ function navigate(direction: number) {
   focusComment(comments[(current + direction + comments.length) % comments.length].id);
 }
 
+watch(rev, () => void load());
 onMounted(load);
+
+/** The aside's filtered file list, plus this file's pending-comment count. */
+const asideFiles = computed(() => {
+  const needle = asideFilter.value.trim().toLowerCase();
+  const files = changes.value?.files ?? [];
+  const matched = needle
+    ? files.filter((file) => file.path.display.toLowerCase().includes(needle))
+    : files;
+  return matched.map((file) => {
+    const key = file.path.bytes;
+    const pending =
+      draft.value?.comments.filter(
+        (comment) =>
+          comment.anchor_kind === 'change' && (comment.anchor as ChangeAnchor).path.bytes === key,
+      ).length ?? 0;
+    return { file, pending };
+  });
+});
+
+/** Reveals and scrolls to a file's diff from the aside. */
+function jumpTo(file: ChangeFile) {
+  const key = fileKey(file);
+  collapsed.delete(key);
+  mounted.add(key);
+  void nextTick(() =>
+    document.querySelector(`article [data-file-key="${key}"]`)?.scrollIntoView({ block: 'start' }),
+  );
+}
+
+/** Drops the `?rev` scoping and returns to the whole branch state. */
+function reviewAllChanges() {
+  void router.push(`/s/${props.id}/changes`);
+}
 </script>
 
 <template>
@@ -600,8 +642,29 @@ onMounted(load);
           changes.totals.deletions
         }}
       </span>
+      <button
+        type="button"
+        class="btn-secondary px-2 py-1 text-xs"
+        data-testid="changes-aside-toggle"
+        :aria-pressed="asideOpen"
+        title="Compose aside — the file rail"
+        @click="asideOpen = !asideOpen"
+      >
+        {{ asideOpen ? '✕' : '◫' }}
+      </button>
       <button type="button" class="btn-secondary px-2 py-1 text-xs" @click="load">Refresh</button>
     </header>
+    <p
+      v-if="rev && changes"
+      class="flex flex-wrap items-center gap-2 border-b border-line bg-subtle/50 px-3 py-1.5 text-xs text-muted"
+      data-testid="changes-commit-scope"
+    >
+      Reviewing commit <code class="font-mono text-fg">{{ rev.slice(0, 10) }}</code> — its own
+      changes only.
+      <button type="button" class="btn-secondary px-2 py-0.5 text-2xs" @click="reviewAllChanges">
+        All changes
+      </button>
+    </p>
 
     <p v-if="error" class="m-3 rounded bg-block-soft p-2 text-xs text-block" role="alert">
       {{ error }}
@@ -612,204 +675,249 @@ onMounted(load);
     >
       {{ baseProblem }}
     </p>
-    <div v-else class="min-h-0 flex-1 overflow-auto">
-      <p v-if="loading && !changes" class="p-3 text-sm text-muted">Loading changes…</p>
-      <p v-else-if="changes && !changes.files.length" class="p-3 text-sm text-muted">
-        No branch or worktree changes.
-      </p>
-      <p v-if="changes?.truncated" class="m-3 rounded bg-block-soft p-2 text-xs text-block">
-        This response reached its explicit display bounds. Refresh after narrowing the change set;
-        the version still covers all final bytes when available.
-      </p>
-
-      <article v-for="file in changes?.files" :key="file.path.bytes" class="border-b border-line">
-        <button
-          type="button"
-          class="sticky top-0 z-10 flex w-full items-center gap-2 border-b border-line bg-surface px-3 py-2 text-left hover:bg-subtle"
-          :aria-expanded="isExpanded(file)"
-          @click="toggleFile(file)"
-        >
-          <span class="w-4 text-faint">{{ isExpanded(file) ? '▾' : '▸' }}</span>
-          <span class="rounded bg-subtle px-1.5 py-0.5 text-2xs uppercase text-muted">
-            {{ file.status }}
-          </span>
-          <code class="min-w-0 flex-1 truncate text-xs">{{ file.path.display }}</code>
-          <span class="text-2xs text-faint">{{ file.sources.join(' · ') }}</span>
-          <span class="font-mono text-2xs text-muted"
-            >+{{ file.additions ?? '–' }} −{{ file.deletions ?? '–' }}</span
-          >
-        </button>
-
-        <div v-if="isExpanded(file)" class="overflow-x-auto bg-code text-xs">
-          <p v-if="file.content !== 'text'" class="px-4 py-3 font-mono text-muted">
-            {{ file.content }} content is not rendered.
-          </p>
-          <div v-else :ref="(el) => observeFile(el, file)" :data-file-key="fileKey(file)">
-            <DiffViewWithMultiSelect
-              v-if="mounted.has(fileKey(file)) && gitDiffData(file)"
-              :key="`${fileKey(file)}:${changes?.version}`"
-              :data="gitDiffData(file)!"
-              :diff-view-mode="DiffModeEnum.Split"
-              :diff-view-theme="theme"
-              :diff-view-highlight="true"
-              :diff-view-add-widget="true"
-              :extend-data="extendDataFor(file)"
-              :initial-widget-state="widgetStateFor(file)"
-              :scope-multi-select-to-hunk="scopeToHunk(file)"
-              @on-add-widget-click="(payload) => onAddWidgetClick(file, payload)"
-            >
-              <template #widget="{ onClose }">
-                <form
-                  v-if="pending && pending.fileKey === fileKey(file)"
-                  class="m-2 rounded border border-accent bg-surface p-2 text-xs shadow-xl"
-                  data-testid="change-comment-composer"
-                  @submit.prevent="confirmPending(onClose)"
-                >
-                  <template v-if="pending.reanchorId != null">
-                    <p class="mb-2 text-2xs text-muted">
-                      Move comment #{{ pending.reanchorId }} to {{ pending.anchor.path.display }} ·
-                      {{ pending.anchor.side }} {{ pending.anchor.start_line }}–{{
-                        pending.anchor.end_line
-                      }}?
-                    </p>
-                    <div class="flex justify-end gap-2">
-                      <button
-                        type="button"
-                        class="btn-secondary px-2 py-1 text-xs"
-                        @click="cancelPending(onClose)"
-                      >
-                        Cancel
-                      </button>
-                      <button type="submit" class="btn-primary px-2 py-1 text-xs">
-                        Move comment here
-                      </button>
-                    </div>
-                  </template>
-                  <template v-else-if="confirmDiscard">
-                    <p
-                      class="mb-2 text-2xs text-block"
-                      data-testid="change-comment-discard-confirm"
-                    >
-                      Discard this pending comment?
-                    </p>
-                    <div class="flex justify-end gap-2" @keydown.esc.stop.prevent="keepEditing">
-                      <button
-                        type="button"
-                        class="btn-secondary px-2 py-1 text-xs"
-                        @click="keepEditing"
-                      >
-                        Keep editing
-                      </button>
-                      <button
-                        :ref="setDiscardButton"
-                        type="button"
-                        class="rounded bg-block px-2 py-1 text-xs text-white"
-                        @click="cancelPending(onClose)"
-                      >
-                        Discard comment
-                      </button>
-                    </div>
-                  </template>
-                  <template v-else>
-                    <p class="mb-1 text-2xs font-semibold uppercase text-accent">
-                      {{ pending.anchor.path.display }} · {{ pending.anchor.side }}
-                      {{ pending.anchor.start_line }}–{{ pending.anchor.end_line }}
-                    </p>
-                    <textarea
-                      :ref="setComposerInput"
-                      v-model="pending.body"
-                      rows="3"
-                      class="w-full rounded border border-line bg-input p-2 text-xs"
-                      @keydown.ctrl.enter.prevent="confirmPending(onClose)"
-                      @keydown.meta.enter.prevent="confirmPending(onClose)"
-                      @keydown.esc.prevent="requestCancel(onClose)"
-                    ></textarea>
-                    <div class="mt-2 flex justify-end gap-2">
-                      <button
-                        type="button"
-                        class="btn-secondary px-2 py-1 text-xs"
-                        @click="requestCancel(onClose)"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="submit"
-                        class="btn-primary px-2 py-1 text-xs"
-                        :disabled="!pending.body.trim() || savingComment"
-                      >
-                        {{ savingComment ? 'Saving…' : 'Add pending comment' }}
-                      </button>
-                    </div>
-                  </template>
-                </form>
-              </template>
-              <template #extend="{ data }">
-                <div class="space-y-1 bg-surface p-2">
-                  <ReviewCommentCard
-                    v-for="comment in data as ReviewComment[]"
-                    :key="comment.id"
-                    :review="draft!"
-                    :comment="comment"
-                    :active="activeComment === comment.id"
-                    :reanchoring="reanchorComment === comment.id"
-                    :error="commentErrors[comment.id] ?? ''"
-                    :delete-action="removeComment"
-                    @focus="activeComment = $event"
-                    @close="activeComment = null"
-                    @edit="editComment"
-                    @reanchor="reanchorComment = $event"
-                    @cancel-reanchor="reanchorComment = null"
-                  />
-                </div>
-              </template>
-            </DiffViewWithMultiSelect>
-            <p
-              v-else-if="!mounted.has(fileKey(file))"
-              class="px-4 py-8 text-center text-2xs text-faint"
-            >
-              Loading diff…
-            </p>
-            <p v-else class="px-4 py-8 text-center text-2xs text-faint">No renderable diff.</p>
-          </div>
-        </div>
-      </article>
-
-      <section
-        v-if="orphanedComments.length"
-        class="border-b border-line"
-        aria-label="Comments on files outside this change set"
-      >
-        <p class="px-3 py-2 text-2xs text-faint">
-          Pending comments on files no longer part of this change set — they still submit with the
-          review, and can be re-anchored onto a current line.
+    <div v-else class="flex min-h-0 flex-1">
+      <div class="min-h-0 min-w-0 flex-1 overflow-auto">
+        <p v-if="loading && !changes" class="p-3 text-sm text-muted">Loading changes…</p>
+        <p v-else-if="changes && !changes.files.length" class="p-3 text-sm text-muted">
+          No branch or worktree changes.
         </p>
-        <div
-          v-for="comment in orphanedComments"
-          :key="comment.id"
-          class="border-t border-line bg-code p-2"
+        <p v-if="changes?.truncated" class="m-3 rounded bg-block-soft p-2 text-xs text-block">
+          This response reached its explicit display bounds. Refresh after narrowing the change set;
+          the version still covers all final bytes when available.
+        </p>
+
+        <article v-for="file in changes?.files" :key="file.path.bytes" class="border-b border-line">
+          <button
+            type="button"
+            class="sticky top-0 z-10 flex w-full items-center gap-2 border-b border-line bg-surface px-3 py-2 text-left hover:bg-subtle"
+            :aria-expanded="isExpanded(file)"
+            @click="toggleFile(file)"
+          >
+            <span class="w-4 text-faint">{{ isExpanded(file) ? '▾' : '▸' }}</span>
+            <span class="rounded bg-subtle px-1.5 py-0.5 text-2xs uppercase text-muted">
+              {{ file.status }}
+            </span>
+            <code class="min-w-0 flex-1 truncate text-xs">{{ file.path.display }}</code>
+            <span class="text-2xs text-faint">{{ file.sources.join(' · ') }}</span>
+            <span class="font-mono text-2xs text-muted"
+              >+{{ file.additions ?? '–' }} −{{ file.deletions ?? '–' }}</span
+            >
+          </button>
+
+          <div v-if="isExpanded(file)" class="overflow-x-auto bg-code text-xs">
+            <p v-if="file.content !== 'text'" class="px-4 py-3 font-mono text-muted">
+              {{ file.content }} content is not rendered.
+            </p>
+            <div v-else :ref="(el) => observeFile(el, file)" :data-file-key="fileKey(file)">
+              <DiffViewWithMultiSelect
+                v-if="mounted.has(fileKey(file)) && gitDiffData(file)"
+                :key="`${fileKey(file)}:${changes?.version}`"
+                :data="gitDiffData(file)!"
+                :diff-view-mode="DiffModeEnum.Split"
+                :diff-view-theme="theme"
+                :diff-view-highlight="true"
+                :diff-view-add-widget="true"
+                :extend-data="extendDataFor(file)"
+                :initial-widget-state="widgetStateFor(file)"
+                :scope-multi-select-to-hunk="scopeToHunk(file)"
+                @on-add-widget-click="(payload) => onAddWidgetClick(file, payload)"
+              >
+                <template #widget="{ onClose }">
+                  <form
+                    v-if="pending && pending.fileKey === fileKey(file)"
+                    class="m-2 rounded border border-accent bg-surface p-2 text-xs shadow-xl"
+                    data-testid="change-comment-composer"
+                    @submit.prevent="confirmPending(onClose)"
+                  >
+                    <template v-if="pending.reanchorId != null">
+                      <p class="mb-2 text-2xs text-muted">
+                        Move comment #{{ pending.reanchorId }} to
+                        {{ pending.anchor.path.display }} · {{ pending.anchor.side }}
+                        {{ pending.anchor.start_line }}–{{ pending.anchor.end_line }}?
+                      </p>
+                      <div class="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          class="btn-secondary px-2 py-1 text-xs"
+                          @click="cancelPending(onClose)"
+                        >
+                          Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-2 py-1 text-xs">
+                          Move comment here
+                        </button>
+                      </div>
+                    </template>
+                    <template v-else-if="confirmDiscard">
+                      <p
+                        class="mb-2 text-2xs text-block"
+                        data-testid="change-comment-discard-confirm"
+                      >
+                        Discard this pending comment?
+                      </p>
+                      <div class="flex justify-end gap-2" @keydown.esc.stop.prevent="keepEditing">
+                        <button
+                          type="button"
+                          class="btn-secondary px-2 py-1 text-xs"
+                          @click="keepEditing"
+                        >
+                          Keep editing
+                        </button>
+                        <button
+                          :ref="setDiscardButton"
+                          type="button"
+                          class="rounded bg-block px-2 py-1 text-xs text-white"
+                          @click="cancelPending(onClose)"
+                        >
+                          Discard comment
+                        </button>
+                      </div>
+                    </template>
+                    <template v-else>
+                      <p class="mb-1 text-2xs font-semibold uppercase text-accent">
+                        {{ pending.anchor.path.display }} · {{ pending.anchor.side }}
+                        {{ pending.anchor.start_line }}–{{ pending.anchor.end_line }}
+                      </p>
+                      <textarea
+                        :ref="setComposerInput"
+                        v-model="pending.body"
+                        rows="3"
+                        class="w-full rounded border border-line bg-input p-2 text-xs"
+                        @keydown.ctrl.enter.prevent="confirmPending(onClose)"
+                        @keydown.meta.enter.prevent="confirmPending(onClose)"
+                        @keydown.esc.prevent="requestCancel(onClose)"
+                      ></textarea>
+                      <div class="mt-2 flex justify-end gap-2">
+                        <button
+                          type="button"
+                          class="btn-secondary px-2 py-1 text-xs"
+                          @click="requestCancel(onClose)"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          class="btn-primary px-2 py-1 text-xs"
+                          :disabled="!pending.body.trim() || savingComment"
+                        >
+                          {{ savingComment ? 'Saving…' : 'Add pending comment' }}
+                        </button>
+                      </div>
+                    </template>
+                  </form>
+                </template>
+                <template #extend="{ data }">
+                  <div class="space-y-1 bg-surface p-2">
+                    <ReviewCommentCard
+                      v-for="comment in data as ReviewComment[]"
+                      :key="comment.id"
+                      :review="draft!"
+                      :comment="comment"
+                      :active="activeComment === comment.id"
+                      :reanchoring="reanchorComment === comment.id"
+                      :error="commentErrors[comment.id] ?? ''"
+                      :delete-action="removeComment"
+                      @focus="activeComment = $event"
+                      @close="activeComment = null"
+                      @edit="editComment"
+                      @reanchor="reanchorComment = $event"
+                      @cancel-reanchor="reanchorComment = null"
+                    />
+                  </div>
+                </template>
+              </DiffViewWithMultiSelect>
+              <p
+                v-else-if="!mounted.has(fileKey(file))"
+                class="px-4 py-8 text-center text-2xs text-faint"
+              >
+                Loading diff…
+              </p>
+              <p v-else class="px-4 py-8 text-center text-2xs text-faint">No renderable diff.</p>
+            </div>
+          </div>
+        </article>
+
+        <section
+          v-if="orphanedComments.length"
+          class="border-b border-line"
+          aria-label="Comments on files outside this change set"
         >
-          <p class="mb-1 truncate font-mono text-2xs text-faint">
-            {{ (comment.anchor as ChangeAnchor).path.display }} ·
-            {{ (comment.anchor as ChangeAnchor).side }}
-            {{ (comment.anchor as ChangeAnchor).start_line }}–{{
-              (comment.anchor as ChangeAnchor).end_line
-            }}
+          <p class="px-3 py-2 text-2xs text-faint">
+            Pending comments on files no longer part of this change set — they still submit with the
+            review, and can be re-anchored onto a current line.
           </p>
-          <ReviewCommentCard
-            :review="draft!"
-            :comment="comment"
-            :active="activeComment === comment.id"
-            :reanchoring="reanchorComment === comment.id"
-            :error="commentErrors[comment.id] ?? ''"
-            :delete-action="removeComment"
-            @focus="activeComment = $event"
-            @close="activeComment = null"
-            @edit="editComment"
-            @reanchor="reanchorComment = $event"
-            @cancel-reanchor="reanchorComment = null"
+          <div
+            v-for="comment in orphanedComments"
+            :key="comment.id"
+            class="border-t border-line bg-code p-2"
+          >
+            <p class="mb-1 truncate font-mono text-2xs text-faint">
+              {{ (comment.anchor as ChangeAnchor).path.display }} ·
+              {{ (comment.anchor as ChangeAnchor).side }}
+              {{ (comment.anchor as ChangeAnchor).start_line }}–{{
+                (comment.anchor as ChangeAnchor).end_line
+              }}
+            </p>
+            <ReviewCommentCard
+              :review="draft!"
+              :comment="comment"
+              :active="activeComment === comment.id"
+              :reanchoring="reanchorComment === comment.id"
+              :error="commentErrors[comment.id] ?? ''"
+              :delete-action="removeComment"
+              @focus="activeComment = $event"
+              @close="activeComment = null"
+              @edit="editComment"
+              @reanchor="reanchorComment = $event"
+              @cancel-reanchor="reanchorComment = null"
+            />
+          </div>
+        </section>
+      </div>
+      <aside
+        v-if="asideOpen"
+        class="w-64 shrink-0 overflow-auto border-l border-line"
+        aria-label="Change files"
+        data-testid="changes-aside"
+      >
+        <div class="sticky top-0 z-10 border-b border-line bg-surface p-2">
+          <input
+            v-model="asideFilter"
+            type="search"
+            placeholder="Filter files…"
+            class="w-full rounded border border-line bg-input px-2 py-1 text-xs text-fg outline-none focus:border-accent"
+            data-testid="changes-aside-filter"
           />
         </div>
-      </section>
+        <button
+          v-for="entry in asideFiles"
+          :key="fileKey(entry.file)"
+          type="button"
+          class="flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-subtle"
+          :data-aside-file="entry.file.path.display"
+          @click="jumpTo(entry.file)"
+        >
+          <span
+            class="shrink-0 rounded bg-subtle px-1 text-2xs uppercase text-muted"
+            :title="entry.file.status"
+          >
+            {{ entry.file.status.slice(0, 1) }}
+          </span>
+          <code class="min-w-0 flex-1 truncate text-2xs text-fg">{{
+            entry.file.path.display
+          }}</code>
+          <span
+            v-if="entry.pending"
+            class="shrink-0 rounded-full bg-accent/20 px-1.5 text-2xs text-accent"
+          >
+            {{ entry.pending }}
+          </span>
+          <span class="shrink-0 font-mono text-2xs text-muted"
+            >+{{ entry.file.additions ?? '–' }} −{{ entry.file.deletions ?? '–' }}</span
+          >
+        </button>
+        <p v-if="!asideFiles.length" class="p-3 text-center text-2xs text-faint">No files match.</p>
+      </aside>
     </div>
 
     <p v-if="notice" class="absolute bottom-1 left-3 text-2xs text-accent" role="status">
