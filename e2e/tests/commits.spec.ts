@@ -1,6 +1,6 @@
 import { expect, test } from "../fixtures/weaver";
 import { execFileSync } from "child_process";
-import { writeFileSync } from "fs";
+import { mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 
 test("the Commits tab lists the branch commits over its base", async ({
@@ -82,6 +82,8 @@ test("clicking a commit reviews its own diff, with expand and the compose aside"
   const v2 = ten("v1").split("\n");
   v2[4] = "v2 5";
   writeFileSync(join(session.work_dir, "feature.txt"), v2.join("\n"));
+  mkdirSync(join(session.work_dir, "src/nested"), { recursive: true });
+  writeFileSync(join(session.work_dir, "src/nested/feature.txt"), "nested\n");
   git(["add", "-A"]);
   git(["commit", "-m", "touch the middle line"]);
 
@@ -101,21 +103,46 @@ test("clicking a commit reviews its own diff, with expand and the compose aside"
   await expect(panel).toContainText("v2 5");
   await expect(panel).toContainText("modified");
 
-  // The compose aside lists the files; the filter narrows, the entry jumps.
+  // The compose aside shows the change set as a collapsible file tree.
   await page.getByTestId("changes-aside-toggle").click();
   const aside = page.getByTestId("changes-aside");
-  await expect(aside).toContainText("feature.txt");
+  await expect(aside.locator("[data-aside-file]")).toHaveCount(2);
+  await expect(aside.locator('[data-aside-folder="src"]')).toBeVisible();
+  await expect(aside.locator('[data-aside-folder="src/nested"]')).toBeVisible();
   await page.getByTestId("changes-aside-filter").fill("nope");
   await expect(aside).toContainText("No files match.");
-  await page.getByTestId("changes-aside-filter").fill("feature");
+  await page.getByTestId("changes-aside-filter").fill("nested");
   await expect(aside.locator("[data-aside-file]")).toHaveCount(1);
-  await aside.locator("[data-aside-file]").click();
+
+  // Collapsing a folder hides its files; the filter view re-expands everything.
+  await page.getByTestId("changes-aside-filter").fill("");
+  await aside.locator('[data-aside-folder="src"]').click();
+  await expect(aside.locator("[data-aside-file]")).toHaveCount(1);
+  await aside.locator('[data-aside-folder="src"]').click();
+  await expect(aside.locator("[data-aside-file]")).toHaveCount(2);
+
+  // Dragging the divider resizes the rail, and a file entry still jumps.
+  const before = await aside.boundingBox();
+  const handle = page.getByTestId("changes-aside-resize");
+  const handleBox = (await handle.boundingBox())!;
+  await page.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + 50);
+  await page.mouse.down();
+  await page.mouse.move(handleBox.x - 100, handleBox.y + 50, { steps: 5 });
+  await page.mouse.up();
+  const after = await aside.boundingBox();
+  expect(after!.width).toBeLessThan(before!.width);
+  await aside.locator("[data-aside-file]").first().click();
 
   // Content-backed hunks expose expand controls that reveal real file lines:
-  // line 1 sits outside the 3-line context until expanded upward.
-  const firstLine = panel.locator('tr[data-line="1"]').first();
+  // line 1 sits outside the 3-line context until expanded upward. Scope to the
+  // modified file's article — the whole-file addition also owns a line 1.
+  const featureArticle = page
+    .locator("article")
+    .filter({ has: page.locator("code", { hasText: /^feature\.txt$/ }) })
+    .first();
+  const firstLine = featureArticle.locator('tr[data-line="1"]').first();
   await expect(firstLine).toBeHidden();
-  await panel.locator('button[title="Expand Up"]').click();
+  await featureArticle.locator('button[title="Expand Up"]').click();
   await expect(firstLine).toBeVisible();
   await expect(firstLine).toContainText("v1 1");
 
