@@ -53,9 +53,50 @@ const commentErrors = reactive<Record<number, string>>({});
 const deliveryErrors = reactive<Record<number, string>>({});
 const trayOpen = ref(false);
 const trayError = ref('');
-// The compose aside: a file rail beside the diff, off until asked for.
+// The compose aside: a hierarchical, resizable file rail on the diff's left,
+// off until asked for.
 const asideOpen = ref(false);
 const asideFilter = ref('');
+// Folders default expanded; membership tracks the collapsed ones.
+const collapsedFolders = reactive(new Set<string>());
+const MIN_ASIDE_WIDTH = 180;
+const MAX_ASIDE_WIDTH = 720;
+const ASIDE_WIDTH_KEY = 'loom.changesAsideWidth';
+const asideEl = ref<HTMLElement | null>(null);
+const asideWidth = ref(loadAsideWidth());
+
+function loadAsideWidth(): number {
+  const v = Number(localStorage.getItem(ASIDE_WIDTH_KEY));
+  return Number.isFinite(v) && v >= MIN_ASIDE_WIDTH ? v : 288;
+}
+
+let asideDragging = false;
+function onAsideDrag(event: MouseEvent) {
+  if (!asideDragging || !asideEl.value) return;
+  const left = asideEl.value.getBoundingClientRect().left;
+  asideWidth.value = Math.min(Math.max(event.clientX - left, MIN_ASIDE_WIDTH), MAX_ASIDE_WIDTH);
+}
+function stopAsideDrag() {
+  if (!asideDragging) return;
+  asideDragging = false;
+  localStorage.setItem(ASIDE_WIDTH_KEY, String(Math.round(asideWidth.value)));
+  document.removeEventListener('mousemove', onAsideDrag);
+  document.removeEventListener('mouseup', stopAsideDrag);
+  document.body.style.userSelect = '';
+}
+function startAsideDrag(event: MouseEvent) {
+  asideDragging = true;
+  event.preventDefault();
+  document.addEventListener('mousemove', onAsideDrag);
+  document.addEventListener('mouseup', stopAsideDrag);
+  // Suppress text selection while dragging the divider.
+  document.body.style.userSelect = 'none';
+}
+
+function toggleFolder(path: string) {
+  if (collapsedFolders.has(path)) collapsedFolders.delete(path);
+  else collapsedFolders.add(path);
+}
 const overallNote = ref('');
 const summaryDirty = ref(false);
 const summarySaving = ref(false);
@@ -563,22 +604,98 @@ function navigate(direction: number) {
 watch(rev, () => void load());
 onMounted(load);
 
-/** The aside's filtered file list, plus this file's pending-comment count. */
-const asideFiles = computed(() => {
+/** This file's pending-comment count. */
+function pendingFor(file: ChangeFile): number {
+  const key = file.path.bytes;
+  return (
+    draft.value?.comments.filter(
+      (comment) =>
+        comment.anchor_kind === 'change' && (comment.anchor as ChangeAnchor).path.bytes === key,
+    ).length ?? 0
+  );
+}
+
+interface AsideNode {
+  name: string;
+  /** The full path: the segment chain down to this node. */
+  path: string;
+  folder?: AsideNode[];
+  file?: { entry: ChangeFile; pending: number };
+  /** Folder rollups: total descendant files and their pending comments. */
+  count?: number;
+  pending?: number;
+}
+
+/** The change set folded into a directory tree, folders before files. */
+const asideTree = computed<AsideNode[]>(() => {
+  const root: AsideNode[] = [];
+  const folders = new Map<string, AsideNode>();
+  for (const file of changes.value?.files ?? []) {
+    const parts = file.path.display.split('/').filter(Boolean);
+    const name = parts.pop() ?? file.path.display;
+    let children = root;
+    let prefix = '';
+    for (const part of parts) {
+      prefix = prefix ? `${prefix}/${part}` : part;
+      let node = folders.get(prefix);
+      if (!node) {
+        node = { name: part, path: prefix, folder: [] };
+        folders.set(prefix, node);
+        children.push(node);
+      }
+      children = node.folder!;
+    }
+    children.push({
+      name,
+      path: file.path.display,
+      file: { entry: file, pending: pendingFor(file) },
+    });
+  }
+  const sortLevel = (nodes: AsideNode[]) => {
+    nodes.sort((a, b) =>
+      Boolean(a.folder) === Boolean(b.folder) ? a.name.localeCompare(b.name) : a.folder ? -1 : 1,
+    );
+    for (const node of nodes) {
+      if (!node.folder) continue;
+      sortLevel(node.folder);
+      node.count = node.folder.reduce(
+        (sum, child) => sum + (child.folder ? (child.count ?? 0) : 1),
+        0,
+      );
+      node.pending = node.folder.reduce((sum, child) => sum + (child.pending ?? 0), 0);
+    }
+  };
+  sortLevel(root);
+  return root;
+});
+
+interface AsideRow {
+  depth: number;
+  node: AsideNode;
+}
+
+/** The tree flattened for rendering: filter-narrowed, and collapsed folders
+ * hide their children (filtering forces everything matched open). */
+const asideRows = computed<AsideRow[]>(() => {
   const needle = asideFilter.value.trim().toLowerCase();
-  const files = changes.value?.files ?? [];
-  const matched = needle
-    ? files.filter((file) => file.path.display.toLowerCase().includes(needle))
-    : files;
-  return matched.map((file) => {
-    const key = file.path.bytes;
-    const pending =
-      draft.value?.comments.filter(
-        (comment) =>
-          comment.anchor_kind === 'change' && (comment.anchor as ChangeAnchor).path.bytes === key,
-      ).length ?? 0;
-    return { file, pending };
-  });
+  const matches = (node: AsideNode) =>
+    !needle || node.name.toLowerCase().includes(needle) || node.path.toLowerCase().includes(needle);
+  const walk = (nodes: AsideNode[], depth: number): AsideRow[] => {
+    const rows: AsideRow[] = [];
+    for (const node of nodes) {
+      if (node.file) {
+        if (matches(node)) rows.push({ depth, node });
+      } else {
+        const children = walk(node.folder!, depth + 1);
+        if (!children.length) continue;
+        rows.push({ depth, node });
+        if (!needle && collapsedFolders.has(node.path)) continue;
+        rows.push(...children);
+      }
+    }
+    return rows;
+  };
+  return walk(asideTree.value, 0);
 });
 
 /** Reveals and scrolls to a file's diff from the aside. */
@@ -676,6 +793,70 @@ function reviewAllChanges() {
       {{ baseProblem }}
     </p>
     <div v-else class="flex min-h-0 flex-1">
+      <aside
+        v-if="asideOpen"
+        ref="asideEl"
+        class="shrink-0 overflow-y-auto border-r border-line"
+        :style="{ width: `${asideWidth}px` }"
+        aria-label="Change files"
+        data-testid="changes-aside"
+      >
+        <div class="sticky top-0 z-10 border-b border-line bg-surface p-2">
+          <input
+            v-model="asideFilter"
+            type="search"
+            placeholder="Filter files…"
+            class="w-full rounded border border-line bg-input px-2 py-1 text-xs text-fg outline-none focus:border-accent"
+            data-testid="changes-aside-filter"
+          />
+        </div>
+        <button
+          v-for="row in asideRows"
+          :key="row.node.path"
+          type="button"
+          class="flex w-full items-center gap-1.5 py-1 pr-2 text-left text-2xs hover:bg-subtle"
+          :style="{ paddingLeft: `${row.depth * 12 + 8}px` }"
+          :data-aside-folder="row.node.folder ? row.node.path : undefined"
+          :data-aside-file="row.node.file ? row.node.file.entry.path.display : undefined"
+          :title="row.node.path"
+          @click="row.node.folder ? toggleFolder(row.node.path) : jumpTo(row.node.file!.entry)"
+        >
+          <span v-if="row.node.folder" class="w-3 shrink-0 text-faint" aria-hidden="true">
+            {{ collapsedFolders.has(row.node.path) && !asideFilter.trim() ? '▸' : '▾' }}
+          </span>
+          <span
+            v-else
+            class="shrink-0 rounded bg-subtle px-1 uppercase text-muted"
+            :title="row.node.file!.entry.status"
+          >
+            {{ row.node.file!.entry.status.slice(0, 1) }}
+          </span>
+          <span class="min-w-0 flex-1 truncate" :class="row.node.folder ? 'text-muted' : 'text-fg'">
+            {{ row.node.name }}
+          </span>
+          <span
+            v-if="row.node.pending"
+            class="shrink-0 rounded-full bg-accent/20 px-1.5 text-2xs text-accent"
+            title="Pending comments"
+          >
+            {{ row.node.pending }}
+          </span>
+          <span v-if="row.node.file" class="shrink-0 font-mono text-2xs text-muted"
+            >+{{ row.node.file.entry.additions ?? '–' }} −{{
+              row.node.file.entry.deletions ?? '–'
+            }}</span
+          >
+          <span v-else class="shrink-0 text-2xs text-faint">{{ row.node.count }}</span>
+        </button>
+        <p v-if="!asideRows.length" class="p-3 text-center text-2xs text-faint">No files match.</p>
+      </aside>
+      <div
+        v-if="asideOpen"
+        class="w-1 shrink-0 cursor-col-resize bg-line hover:bg-accent"
+        title="Drag to resize the file rail"
+        data-testid="changes-aside-resize"
+        @mousedown="startAsideDrag"
+      ></div>
       <div class="min-h-0 min-w-0 flex-1 overflow-auto">
         <p v-if="loading && !changes" class="p-3 text-sm text-muted">Loading changes…</p>
         <p v-else-if="changes && !changes.files.length" class="p-3 text-sm text-muted">
@@ -874,50 +1055,6 @@ function reviewAllChanges() {
           </div>
         </section>
       </div>
-      <aside
-        v-if="asideOpen"
-        class="w-64 shrink-0 overflow-auto border-l border-line"
-        aria-label="Change files"
-        data-testid="changes-aside"
-      >
-        <div class="sticky top-0 z-10 border-b border-line bg-surface p-2">
-          <input
-            v-model="asideFilter"
-            type="search"
-            placeholder="Filter files…"
-            class="w-full rounded border border-line bg-input px-2 py-1 text-xs text-fg outline-none focus:border-accent"
-            data-testid="changes-aside-filter"
-          />
-        </div>
-        <button
-          v-for="entry in asideFiles"
-          :key="fileKey(entry.file)"
-          type="button"
-          class="flex w-full items-center gap-2 px-2 py-1.5 text-left hover:bg-subtle"
-          :data-aside-file="entry.file.path.display"
-          @click="jumpTo(entry.file)"
-        >
-          <span
-            class="shrink-0 rounded bg-subtle px-1 text-2xs uppercase text-muted"
-            :title="entry.file.status"
-          >
-            {{ entry.file.status.slice(0, 1) }}
-          </span>
-          <code class="min-w-0 flex-1 truncate text-2xs text-fg">{{
-            entry.file.path.display
-          }}</code>
-          <span
-            v-if="entry.pending"
-            class="shrink-0 rounded-full bg-accent/20 px-1.5 text-2xs text-accent"
-          >
-            {{ entry.pending }}
-          </span>
-          <span class="shrink-0 font-mono text-2xs text-muted"
-            >+{{ entry.file.additions ?? '–' }} −{{ entry.file.deletions ?? '–' }}</span
-          >
-        </button>
-        <p v-if="!asideFiles.length" class="p-3 text-center text-2xs text-faint">No files match.</p>
-      </aside>
     </div>
 
     <p v-if="notice" class="absolute bottom-1 left-3 text-2xs text-accent" role="status">
