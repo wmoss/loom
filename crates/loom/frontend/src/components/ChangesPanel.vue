@@ -701,13 +701,18 @@ const asideRows = computed<AsideRow[]>(() => {
   return walk(asideTree.value, 0);
 });
 
-/** Reveals and scrolls to a file's diff from the aside. */
+/** Reveals and scrolls to a file's diff from the aside. The scroll targets
+ * the file's header, not its diff body: the sticky filename bar would cover
+ * the body's first lines otherwise. */
 function jumpTo(file: ChangeFile) {
   const key = fileKey(file);
   collapsed.delete(key);
   mounted.add(key);
   void nextTick(() =>
-    document.querySelector(`article [data-file-key="${key}"]`)?.scrollIntoView({ block: 'start' }),
+    document
+      .querySelector(`[data-file-key="${key}"]`)
+      ?.closest('article')
+      ?.scrollIntoView({ block: 'start' }),
   );
 }
 
