@@ -1859,6 +1859,15 @@ pub struct ChangeFileDto {
     pub content: ChangeContentDto,
     pub hunks: Vec<ChangeHunkDto>,
     pub truncated: bool,
+    /// The full pre-change file text when it fits the content budget — the
+    /// browser feeds it to the diff renderer so hunk expansion has real lines
+    /// to reveal. Absent when the file is binary, oversized, or the budget
+    /// ran out.
+    #[serde(default)]
+    pub old_content: Option<String>,
+    /// The full post-change file text, same bounds as `old_content`.
+    #[serde(default)]
+    pub new_content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

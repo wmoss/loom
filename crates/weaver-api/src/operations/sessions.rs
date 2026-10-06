@@ -40,10 +40,14 @@ pub mod archive {
 pub mod changes {
     use super::prelude::*;
 
-    /// The session's uncommitted worktree changes against its base branch.
+    /// The session's uncommitted worktree changes against its base branch, or —
+    /// with `rev` — the diff that one commit introduces.
     #[operation(id = "sessions.changes", actor = SessionSelf, scope = Session, risk = Read,
                 grants = ["loom/sessions/read@v1"], cli = "sessions changes")]
     pub struct Input {
+        /// Which commit to review: the snapshot becomes `rev^..rev`, that
+        /// commit's own changes. Omitted means the whole branch state.
+        pub rev: Option<String>,
         #[operand(context)]
         pub session: String,
     }

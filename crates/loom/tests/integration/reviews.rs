@@ -517,6 +517,7 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
         .client
         .invoke::<sessions::changes::Op>(&sessions::changes::Input {
             session: session.id.to_string(),
+            rev: None,
         })
         .await
         .unwrap();

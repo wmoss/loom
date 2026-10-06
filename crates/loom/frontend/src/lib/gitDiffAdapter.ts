@@ -34,8 +34,8 @@ function hunkToPatchText(hunk: ChangeHunk): string | null {
 }
 
 export interface GitDiffViewData {
-  oldFile?: { fileName: string };
-  newFile?: { fileName: string };
+  oldFile?: { fileName: string; content?: string };
+  newFile?: { fileName: string; content?: string };
   hunks: string[];
 }
 
@@ -57,9 +57,15 @@ export function toGitDiffViewData(file: ChangeFile): GitDiffViewData | null {
   const oldName = oldPath ? oldPath.display : '/dev/null';
   const newName = newPath ? newPath.display : '/dev/null';
   const header = `--- ${oldPath ? `a/${oldName}` : oldName}\n+++ ${newPath ? `b/${newName}` : newName}`;
+  // The server attaches whole-file content when it fits its bounds; that is
+  // what lets the renderer show real lines behind its hunk expand controls.
   return {
-    oldFile: oldPath ? { fileName: oldName } : undefined,
-    newFile: newPath ? { fileName: newName } : undefined,
+    oldFile: oldPath
+      ? { fileName: oldName, ...(file.old_content ? { content: file.old_content } : {}) }
+      : undefined,
+    newFile: newPath
+      ? { fileName: newName, ...(file.new_content ? { content: file.new_content } : {}) }
+      : undefined,
     hunks: [`${header}\n${bodies.join('\n')}`],
   };
 }

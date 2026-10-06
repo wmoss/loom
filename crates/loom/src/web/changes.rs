@@ -16,5 +16,10 @@ async fn op_changes(
     input: ops::changes::Input,
 ) -> ApiResult<ChangeSetDto> {
     let (session, branch) = require_session(&context.state.db, &input.session).await?;
-    Ok(crate::changes::load(FsPath::new(&session.work_dir), &branch.base_branch).await?)
+    Ok(crate::changes::load_for_review(
+        FsPath::new(&session.work_dir),
+        &branch.base_branch,
+        input.rev.as_deref(),
+    )
+    .await?)
 }

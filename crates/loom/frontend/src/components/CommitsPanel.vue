@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
+import { useRouter } from 'vue-router';
 import { getSessionCommits } from '../api';
 import type { SessionCommits } from '../types';
 import { timeAgo } from '../lib/time';
 
 const props = defineProps<{ id: string }>();
+const router = useRouter();
 const commits = ref<SessionCommits | null>(null);
 const loading = ref(false);
 const error = ref('');
@@ -33,6 +35,11 @@ async function load() {
 }
 
 onMounted(load);
+
+/** Opens the code review scoped to this commit's own changes. */
+function reviewCommit(oid: string) {
+  void router.push(`/s/${props.id}/changes?rev=${oid}`);
+}
 </script>
 
 <template>
@@ -75,19 +82,23 @@ onMounted(load);
       </p>
 
       <ul>
-        <li
-          v-for="commit in commits?.commits"
-          :key="commit.oid"
-          class="flex items-baseline gap-3 border-b border-line px-3 py-2 hover:bg-subtle"
-          :data-commit="commit.oid.slice(0, 10)"
-        >
-          <code class="shrink-0 font-mono text-2xs text-faint">{{ commit.oid.slice(0, 8) }}</code>
-          <span class="min-w-0 flex-1 truncate text-xs text-fg" :title="commit.subject">{{
-            commit.subject
-          }}</span>
-          <span class="shrink-0 text-2xs text-muted" :title="commit.author_email">
-            {{ commit.author_name }} · {{ timeAgo(commit.authored_at) }}
-          </span>
+        <li v-for="commit in commits?.commits" :key="commit.oid">
+          <button
+            type="button"
+            class="flex w-full items-baseline gap-3 border-b border-line px-3 py-2 text-left hover:bg-subtle"
+            :data-commit="commit.oid.slice(0, 10)"
+            :data-commit-oid="commit.oid"
+            :title="`Review commit ${commit.oid.slice(0, 10)} in Code Review`"
+            @click="reviewCommit(commit.oid)"
+          >
+            <code class="shrink-0 font-mono text-2xs text-faint">{{ commit.oid.slice(0, 8) }}</code>
+            <span class="min-w-0 flex-1 truncate text-xs text-fg" :title="commit.subject">{{
+              commit.subject
+            }}</span>
+            <span class="shrink-0 text-2xs text-muted" :title="commit.author_email">
+              {{ commit.author_name }} · {{ timeAgo(commit.authored_at) }}
+            </span>
+          </button>
         </li>
       </ul>
     </div>
