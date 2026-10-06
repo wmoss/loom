@@ -11,6 +11,7 @@ import {
   deleteReviewComment,
   discardReview,
   getChanges,
+  getSessionCommits,
   listChangesReviews,
   retryReviewDelivery,
   retargetReviewToCurrent,
@@ -27,10 +28,12 @@ import type {
   ChangeSide,
   Review,
   ReviewComment,
+  SessionCommit,
 } from '../types';
 import { ReviewDraftController } from '../lib/reviewDraftController';
 import { toGitDiffViewData, type GitDiffViewData } from '../lib/gitDiffAdapter';
 import { theme } from '../theme';
+import CommitList from './CommitList.vue';
 import ReviewCommentCard from './ReviewCommentCard.vue';
 import ReviewTray from './ReviewTray.vue';
 
@@ -712,6 +715,53 @@ function jumpTo(file: ChangeFile) {
 function reviewAllChanges() {
   void router.push(`/s/${props.id}/changes`);
 }
+
+// --- The commit picker: scope the review to one commit from the header -----
+const pickerOpen = ref(false);
+const pickerCommits = ref<SessionCommit[] | null>(null);
+const pickerLoading = ref(false);
+const pickerError = ref('');
+const pickerEl = ref<HTMLElement | null>(null);
+const pickerToggleEl = ref<HTMLButtonElement | null>(null);
+
+async function loadPicker() {
+  pickerLoading.value = true;
+  try {
+    pickerCommits.value = (await getSessionCommits(props.id)).commits;
+    pickerError.value = '';
+  } catch (cause) {
+    pickerError.value = (cause as Error).message;
+  } finally {
+    pickerLoading.value = false;
+  }
+}
+
+// The overlay sits over page content, so a pointerdown outside it (and
+// outside its own toggle) minimizes it back away.
+function onPickerDocPointerDown(event: PointerEvent) {
+  const target = event.target as Node;
+  if (pickerEl.value?.contains(target) || pickerToggleEl.value?.contains(target)) return;
+  pickerOpen.value = false;
+}
+
+watch(pickerOpen, (open) => {
+  document.removeEventListener('pointerdown', onPickerDocPointerDown);
+  if (open) {
+    document.addEventListener('pointerdown', onPickerDocPointerDown);
+    void loadPicker();
+  }
+});
+onBeforeUnmount(() => document.removeEventListener('pointerdown', onPickerDocPointerDown));
+
+function reviewFromPicker(oid: string) {
+  pickerOpen.value = false;
+  void router.push(`/s/${props.id}/changes?rev=${oid}`);
+}
+
+function reviewAllFromPicker() {
+  pickerOpen.value = false;
+  reviewAllChanges();
+}
 </script>
 
 <template>
@@ -720,14 +770,74 @@ function reviewAllChanges() {
     data-testid="changes-panel"
   >
     <header class="flex flex-wrap items-center gap-2 border-b border-line px-3 py-2">
-      <div class="min-w-0 flex-1">
+      <div class="relative min-w-0 flex-1">
         <h2 class="text-sm font-semibold text-fg">Changes</h2>
-        <p
-          v-if="changes?.base.state === 'available'"
-          class="truncate font-mono text-2xs text-faint"
+        <div class="flex items-center gap-2">
+          <p
+            v-if="changes?.base.state === 'available'"
+            class="truncate font-mono text-2xs text-faint"
+          >
+            {{ changes.base.reference }} · {{ changes.base.oid.slice(0, 10) }}
+          </p>
+          <button
+            v-if="changes"
+            ref="pickerToggleEl"
+            type="button"
+            class="btn-secondary px-2 py-0.5 text-2xs"
+            data-testid="changes-commit-scope-button"
+            title="Pick which commit the review covers"
+            @click="pickerOpen = !pickerOpen"
+          >
+            {{ rev ? `Commit ${rev.slice(0, 10)}` : 'All commits' }}
+          </button>
+        </div>
+
+        <!-- The commit picker: scope the review to one commit's own changes.
+             -->
+        <div
+          v-if="pickerOpen"
+          ref="pickerEl"
+          class="absolute left-0 top-full z-30 mt-1 w-[min(28rem,calc(100vw-1.5rem))] rounded-lg border border-line bg-surface shadow-xl"
+          data-testid="changes-commit-picker"
         >
-          {{ changes.base.reference }} · {{ changes.base.oid.slice(0, 10) }}
-        </p>
+          <div class="flex items-center justify-between border-b border-line px-3 py-2">
+            <button
+              type="button"
+              class="btn-primary px-2.5 py-1 text-xs"
+              data-testid="changes-review-all"
+              @click="reviewAllFromPicker"
+            >
+              Review all commits
+            </button>
+            <button
+              type="button"
+              class="btn-secondary px-2 py-1 text-xs"
+              aria-label="Close the commit picker"
+              @click="pickerOpen = false"
+            >
+              ✕
+            </button>
+          </div>
+          <p class="border-b border-line px-3 py-2 text-xs font-semibold text-fg">
+            Select a commit to review
+          </p>
+          <div class="max-h-[min(50vh,26rem)] overflow-y-auto">
+            <p v-if="pickerLoading" class="p-3 text-sm text-muted">Loading commits…</p>
+            <p
+              v-else-if="pickerError"
+              class="m-3 rounded bg-block-soft p-2 text-xs text-block"
+              role="alert"
+            >
+              {{ pickerError }}
+            </p>
+            <CommitList
+              v-else-if="pickerCommits?.length"
+              :commits="pickerCommits"
+              @review="reviewFromPicker"
+            />
+            <p v-else class="p-3 text-sm text-muted">No commits on this branch beyond its base.</p>
+          </div>
+        </div>
       </div>
       <ReviewTray
         :floating="false"

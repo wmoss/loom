@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { getSessionCommits } from '../api';
 import type { SessionCommits } from '../types';
-import { timeAgo } from '../lib/time';
+import CommitList from './CommitList.vue';
 
 const props = defineProps<{ id: string }>();
 const router = useRouter();
@@ -39,14 +39,6 @@ onMounted(load);
 /** Opens the code review scoped to this commit's own changes. */
 function reviewCommit(oid: string) {
   void router.push(`/s/${props.id}/changes?rev=${oid}`);
-}
-
-// Rows whose full message body is unfolded; only commits carrying a body can
-// join, and the row click itself still goes to the review.
-const expanded = reactive(new Set<string>());
-function toggleBody(oid: string) {
-  if (expanded.has(oid)) expanded.delete(oid);
-  else expanded.add(oid);
 }
 </script>
 
@@ -89,46 +81,11 @@ function toggleBody(oid: string) {
         This branch holds more commits than the listing bound. Narrow the branch to see the rest.
       </p>
 
-      <ul>
-        <li v-for="commit in commits?.commits" :key="commit.oid" class="border-b border-line">
-          <div class="flex items-stretch">
-            <button
-              type="button"
-              class="flex min-w-0 flex-1 items-baseline gap-3 px-3 py-2 text-left hover:bg-subtle"
-              :data-commit="commit.oid.slice(0, 10)"
-              :data-commit-oid="commit.oid"
-              :title="`Review commit ${commit.oid.slice(0, 10)} in Code Review`"
-              @click="reviewCommit(commit.oid)"
-            >
-              <code class="shrink-0 font-mono text-2xs text-faint">{{
-                commit.oid.slice(0, 8)
-              }}</code>
-              <span class="min-w-0 flex-1 truncate text-xs text-fg" :title="commit.subject">{{
-                commit.subject
-              }}</span>
-              <span class="shrink-0 text-2xs text-muted" :title="commit.author_email">
-                {{ commit.author_name }} · {{ timeAgo(commit.authored_at) }}
-              </span>
-            </button>
-            <button
-              v-if="commit.body"
-              type="button"
-              class="shrink-0 self-stretch px-2 text-2xs text-faint hover:bg-subtle hover:text-fg"
-              :aria-expanded="expanded.has(commit.oid)"
-              :data-commit-body-toggle="commit.oid.slice(0, 10)"
-              :title="expanded.has(commit.oid) ? 'Hide the full message' : 'Show the full message'"
-              @click="toggleBody(commit.oid)"
-            >
-              {{ expanded.has(commit.oid) ? '▾' : '▸' }}
-            </button>
-          </div>
-          <pre
-            v-if="commit.body && expanded.has(commit.oid)"
-            class="whitespace-pre-wrap border-t border-line bg-code px-3 py-2 text-2xs text-code-fg"
-            :data-commit-body="commit.oid.slice(0, 10)"
-            >{{ commit.body }}</pre>
-        </li>
-      </ul>
+      <CommitList
+        v-if="commits?.commits.length"
+        :commits="commits.commits"
+        @review="reviewCommit"
+      />
     </div>
   </section>
 </template>
