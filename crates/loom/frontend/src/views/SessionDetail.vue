@@ -21,6 +21,7 @@ import SessionTabs from '../components/SessionTabs.vue';
 import SessionConversation from '../components/SessionConversation.vue';
 import ArtifactsPanel from '../components/ArtifactsPanel.vue';
 import ChangesPanel from '../components/ChangesPanel.vue';
+import CommitsPanel from '../components/CommitsPanel.vue';
 import { cancelSessionBacktrack, completeSessionOpen } from '../lib/workbenchMetrics';
 import { openSessionEvents, type SessionEventsHandle } from '../lib/sessionEvents';
 import { useCommandScope, type Command } from '../lib/commands';
@@ -59,7 +60,7 @@ const error = ref('');
 // Conversation and demotes the worktree shells to a slim Shells tab. `defaultTab`
 // resolves whichever leads when the user hasn't picked one.
 type LocalTab = 'terminal' | 'conversation' | 'shells';
-type WorkTab = LocalTab | 'artifacts' | 'changes';
+type WorkTab = LocalTab | 'artifacts' | 'commits' | 'changes';
 const isAcp = computed(() => ws.value?.protocol === 'acp');
 const defaultTab = computed<LocalTab>(() => (isAcp.value ? 'conversation' : 'terminal'));
 
@@ -77,13 +78,18 @@ const effectiveLocalTab = computed<LocalTab>(() => localTab.value ?? defaultTab.
 // The artifacts surface is open whenever the path is under `…/artifacts`.
 const artifactsActive = computed(() => route.path.startsWith(`/s/${props.id}/artifacts`));
 const changesActive = computed(() => route.path === `/s/${props.id}/changes`);
-const reviewActive = computed(() => artifactsActive.value || changesActive.value);
+const commitsActive = computed(() => route.path === `/s/${props.id}/commits`);
+const reviewActive = computed(
+  () => artifactsActive.value || commitsActive.value || changesActive.value,
+);
 
 // Popped out into the rail beside the work area vs docked as the work-area tab.
 // Transient (defaults docked on a fresh open); only the rail *width* persists.
 const poppedOut = ref(false);
 const artifactsDocked = computed(() => artifactsActive.value && !poppedOut.value);
-const reviewDocked = computed(() => artifactsDocked.value || changesActive.value);
+const reviewDocked = computed(
+  () => artifactsDocked.value || commitsActive.value || changesActive.value,
+);
 const railOpen = computed(() => artifactsActive.value && poppedOut.value);
 const dockedArtifactsRef = ref<InstanceType<typeof ArtifactsPanel> | null>(null);
 const railArtifactsRef = ref<InstanceType<typeof ArtifactsPanel> | null>(null);
@@ -98,7 +104,13 @@ function activeArtifactsPanel(): InstanceType<typeof ArtifactsPanel> | null {
 // The pane the work area shows: the artifacts panel when docked, else the
 // effective local tab (so a popped-out artifact leaves the work pane in place).
 const workTab = computed<WorkTab>(() =>
-  artifactsDocked.value ? 'artifacts' : changesActive.value ? 'changes' : effectiveLocalTab.value,
+  artifactsDocked.value
+    ? 'artifacts'
+    : changesActive.value
+      ? 'changes'
+      : commitsActive.value
+        ? 'commits'
+        : effectiveLocalTab.value,
 );
 
 // Lazy-mount panes on first visit, then keep them (v-show) so re-selecting is
@@ -110,6 +122,7 @@ const mounted = reactive({
   conversation: false,
   shells: false,
   artifacts: artifactsActive.value,
+  commits: commitsActive.value,
   changes: changesActive.value,
 });
 watch(
@@ -133,6 +146,13 @@ watch(
   },
   { immediate: true },
 );
+watch(
+  commitsActive,
+  (on) => {
+    if (on) mounted.commits = true;
+  },
+  { immediate: true },
+);
 
 async function guardedArtifactLayout(change: () => void | Promise<void>): Promise<boolean> {
   const panel = activeArtifactsPanel();
@@ -149,8 +169,13 @@ async function guardedArtifactLayout(change: () => void | Promise<void>): Promis
 }
 
 async function selectTab(t: WorkTab) {
-  if (t === 'artifacts' || t === 'changes') {
-    const active = t === 'artifacts' ? artifactsActive.value : changesActive.value;
+  if (t === 'artifacts' || t === 'commits' || t === 'changes') {
+    const active =
+      t === 'artifacts'
+        ? artifactsActive.value
+        : t === 'changes'
+          ? changesActive.value
+          : commitsActive.value;
     await guardedArtifactLayout(async () => {
       poppedOut.value = false;
       if (!active) await router.push(`/s/${props.id}/${t}`);
@@ -176,14 +201,15 @@ async function selectTab(t: WorkTab) {
 let pageActive = false;
 function activeMobileSurface(): MobileSessionSurface {
   if (changesActive.value) return 'changes';
+  if (commitsActive.value) return 'commits';
   if (artifactsActive.value) return 'artifacts';
   return effectiveLocalTab.value;
 }
 async function selectMobileSurface(surface: MobileSessionSurface) {
-  if (surface === 'artifacts' || surface === 'changes') {
+  if (surface === 'artifacts' || surface === 'commits' || surface === 'changes') {
     await guardedArtifactLayout(async () => {
       poppedOut.value = false;
-      const path = surface === 'artifacts' ? 'artifacts' : 'changes';
+      const path = surface;
       if (!route.path.startsWith(`/s/${props.id}/${path}`)) {
         await router.push(`/s/${props.id}/${path}`);
       }
@@ -202,7 +228,10 @@ function publishMobileNavigation() {
     openDetails: () => headerRef.value?.openDetails(),
   });
 }
-watch([ws, effectiveLocalTab, artifactsActive, changesActive], publishMobileNavigation);
+watch(
+  [ws, effectiveLocalTab, artifactsActive, commitsActive, changesActive],
+  publishMobileNavigation,
+);
 
 function defaultToMobileConversation() {
   if (
@@ -221,12 +250,14 @@ const workTabs = computed<{ key: WorkTab; label: string }[]>(() =>
         { key: 'conversation', label: 'Conversation' },
         { key: 'shells', label: 'Shells' },
         { key: 'artifacts', label: 'Artifacts' },
+        { key: 'commits', label: 'Commits' },
         { key: 'changes', label: 'Code Review' },
       ]
     : [
         { key: 'terminal', label: 'Agent' },
         { key: 'conversation', label: 'Conversation' },
         { key: 'artifacts', label: 'Artifacts' },
+        { key: 'commits', label: 'Commits' },
         { key: 'changes', label: 'Code Review' },
       ],
 );
@@ -584,7 +615,7 @@ onUnmounted(() => {
              is just the kept-alive host for whichever is docked. Existing
              artifact deep links stay canonical. -->
         <div
-          v-if="(mounted.artifacts || mounted.changes) && !railOpen"
+          v-if="(mounted.artifacts || mounted.commits || mounted.changes) && !railOpen"
           v-show="reviewDocked"
           class="flex h-full min-h-0 flex-col"
         >
@@ -596,6 +627,9 @@ onUnmounted(() => {
               :active="artifactsActive"
               @toggle-pop="togglePop"
             />
+          </div>
+          <div v-if="mounted.commits" v-show="commitsActive" class="min-h-0 flex-1">
+            <CommitsPanel :id="props.id" />
           </div>
           <div v-if="mounted.changes" v-show="changesActive" class="min-h-0 flex-1">
             <ChangesPanel :id="props.id" />

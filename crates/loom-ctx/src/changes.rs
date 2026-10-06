@@ -43,10 +43,10 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const GIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
-struct Capture {
-    bytes: Vec<u8>,
-    truncated: bool,
-    timed_out: bool,
+pub(crate) struct Capture {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
+    pub(crate) timed_out: bool,
 }
 
 #[derive(Debug)]
@@ -127,7 +127,7 @@ impl Drop for GitProcessGroup {
     }
 }
 
-fn hardened_git(work_dir: &Path) -> Command {
+pub(crate) fn hardened_git(work_dir: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -189,7 +189,7 @@ impl GitBoundary {
     }
 }
 
-async fn capture_git_status(
+pub(crate) async fn capture_git_status(
     mut command: Command,
     args: &[&str],
     retain: usize,
@@ -273,7 +273,7 @@ async fn capture_diff(boundary: &GitBoundary, args: &[&str], retain: usize) -> R
     capture_git(boundary, &full, retain).await
 }
 
-async fn bootstrap_text(work_dir: &Path, args: &[&str]) -> Result<Option<String>> {
+pub(crate) async fn bootstrap_text(work_dir: &Path, args: &[&str]) -> Result<Option<String>> {
     let (capture, success) = capture_git_status(hardened_git(work_dir), args, 4 * 1024).await?;
     if capture.timed_out {
         bail!("git {} exceeded its deadline", args.join(" "));
@@ -642,7 +642,7 @@ fn source_paths(bytes: &[u8]) -> BTreeSet<Vec<u8>> {
     nul_records(bytes).map(ToOwned::to_owned).collect()
 }
 
-fn sanitize_text(value: &str, limit: usize) -> (String, bool) {
+pub(crate) fn sanitize_text(value: &str, limit: usize) -> (String, bool) {
     let cleaned: String = value
         .chars()
         .map(|ch| {
@@ -1120,13 +1120,13 @@ fn short_ref(reference: &str) -> String {
 /// The fork point a change set is taken from, plus the ref state it was derived
 /// from so a concurrent ref move is caught by the stability re-read.
 #[derive(Debug, PartialEq, Eq)]
-struct ResolvedBase {
+pub(crate) struct ResolvedBase {
     /// Display form of the ref the merge-base came from.
-    reference: String,
+    pub(crate) reference: String,
     /// Every candidate ref that resolved, with its tip.
-    tips: Vec<(String, String)>,
+    pub(crate) tips: Vec<(String, String)>,
     /// Merge-base of `HEAD` with the chosen ref.
-    oid: String,
+    pub(crate) oid: String,
 }
 
 /// Does `ancestor` reach `descendant`? (`--is-ancestor` answers by exit status.)
@@ -1150,7 +1150,7 @@ async fn is_ancestor(work_dir: &Path, ancestor: &str, descendant: &str) -> Resul
 /// then usually rebased onto the remote one, so the local ref goes stale as soon
 /// as nobody checks it out to pull; diffing from the stale ref would replay every
 /// intervening upstream commit as this branch's own work.
-async fn resolve_base(
+pub(crate) async fn resolve_base(
     work_dir: &Path,
     base_reference: &str,
     head_oid: &str,

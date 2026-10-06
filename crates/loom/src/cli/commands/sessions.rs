@@ -111,6 +111,11 @@ pub enum SessionCmd {
         /// Session key: id, branch id, branch name, or `repo:branch`.
         session: String,
     },
+    /// Print the branch's own commits since the fork point with its base.
+    Commits {
+        /// Session key: id, branch id, branch name, or `repo:branch`.
+        session: String,
+    },
     /// Read, set, or remove free-form session tags.
     Tags {
         #[command(subcommand)]
@@ -341,6 +346,15 @@ pub async fn run_session(cmd: SessionCmd) -> Result<()> {
                 })
                 .await?;
             println!("{}", serde_json::to_string_pretty(&changes)?);
+            Ok(())
+        }
+        SessionCmd::Commits { session } => {
+            let commits = client::default()?
+                .invoke::<sessions::commits::Op>(&sessions::commits::Input {
+                    session: session.to_string(),
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&commits)?);
             Ok(())
         }
         SessionCmd::Tags { cmd } => {

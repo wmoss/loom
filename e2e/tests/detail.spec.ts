@@ -62,6 +62,9 @@ test.describe('session detail view', () => {
     await expect(page.locator('[data-tab="artifacts"]')).toHaveAttribute('aria-selected', 'true');
     await expect(page).toHaveURL(new RegExp(`/s/${s.id}/artifacts(?:/|$)`));
     await page.keyboard.press('4');
+    await expect(page.locator('[data-tab="commits"]')).toHaveAttribute('aria-selected', 'true');
+    await expect(page).toHaveURL(`${weaver.baseUrl}/s/${s.id}/commits`);
+    await page.keyboard.press('5');
     await expect(page.locator('[data-tab="changes"]')).toHaveAttribute('aria-selected', 'true');
     await expect(page).toHaveURL(`${weaver.baseUrl}/s/${s.id}/changes`);
     await page.keyboard.press('3');

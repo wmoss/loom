@@ -1918,6 +1918,35 @@ pub struct ChangeSetDto {
     pub limits: ChangeLimitsDto,
 }
 
+// ---------------------------------------------------------------------------
+// Commits — the session branch's own commits since its fork point.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCommitDto {
+    pub oid: String,
+    pub author_name: String,
+    pub author_email: String,
+    /// Authoring time, RFC 3339.
+    pub authored_at: String,
+    /// First line of the commit message.
+    pub subject: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCommitsDto {
+    /// The same fork-point resolution the Changes surface diffs against, so
+    /// the two never disagree about where the branch's own work starts.
+    pub base: ChangeBaseDto,
+    pub head_oid: Option<String>,
+    /// Newest first.
+    pub commits: Vec<SessionCommitDto>,
+    /// The branch holds more commits than the listing bound.
+    pub truncated: bool,
+}
+
 /// One watch, as the API exposes it. The JSON-bearing columns (`trigger`,
 /// `scope`, `params`) are returned as **parsed** structured JSON so a UI never
 /// re-parses strings; `capabilities` is a real array.
