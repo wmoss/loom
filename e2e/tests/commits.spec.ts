@@ -139,6 +139,24 @@ test("clicking a commit reviews its own diff, with expand and the compose aside"
   expect(after!.width).toBeLessThan(before!.width);
   await aside.locator("[data-aside-file]").first().click();
 
+  // The jump lands the file's header at the top — the diff body must sit
+  // below the sticky filename bar, not clipped underneath it.
+  const jumped = page
+    .locator("article")
+    .filter({
+      has: page.locator("code", { hasText: /^src\/nested\/feature\.txt$/ }),
+    })
+    .first();
+  await expect
+    .poll(async () => {
+      const header = await jumped.locator("button").first().boundingBox();
+      // Body rows carry data-state; a bare `tr` would hit the hidden thead.
+      const row = await jumped.locator("tr[data-state]").first().boundingBox();
+      if (!header || !row) return Number.NEGATIVE_INFINITY;
+      return row.y - (header.y + header.height);
+    })
+    .toBeGreaterThanOrEqual(-1);
+
   // Content-backed hunks expose expand controls that reveal real file lines:
   // line 1 sits outside the 3-line context until expanded upward. Scope to the
   // modified file's article — the whole-file addition also owns a line 1.
