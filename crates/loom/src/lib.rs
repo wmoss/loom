@@ -20,7 +20,7 @@ pub use loom_agent::{acp, agent, custom_agents, mcp};
 pub use loom_core::{launch, session_manager, shell};
 pub use loom_ctx::Ctx;
 pub use loom_ctx::{
-    agent_kind, backend, changes, client_context, ctx, envfile, launch_gate, links, logs,
+    agent_kind, backend, changes, client_context, commits, ctx, envfile, launch_gate, links, logs,
     loom_config, paths, runner, scratch,
 };
 pub use loom_deliver::{review_delivery, slack};

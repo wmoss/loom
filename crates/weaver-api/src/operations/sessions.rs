@@ -51,6 +51,21 @@ pub mod changes {
     pub type Output = ChangeSetDto;
 }
 
+pub mod commits {
+    use super::prelude::*;
+
+    /// The session branch's own commits, from the fork point with its base
+    /// branch, newest first.
+    #[operation(id = "sessions.commits", actor = SessionSelf, scope = Session, risk = Read,
+                grants = ["loom/sessions/read@v1"], cli = "sessions commits")]
+    pub struct Input {
+        #[operand(context)]
+        pub session: String,
+    }
+
+    pub type Output = SessionCommitsDto;
+}
+
 pub mod chat {
     use super::prelude::*;
 
@@ -1411,6 +1426,7 @@ static OPERATIONS: &[&OperationSpec] = &[
     handoff::SPEC,
     handoff::resolve::SPEC,
     changes::SPEC,
+    commits::SPEC,
     chat::SPEC,
     conversation::SPEC,
     conversation::block::SPEC,

@@ -80,6 +80,7 @@ mod automation;
 mod branches;
 mod changes;
 mod channels;
+mod commits;
 mod deployment;
 mod diagnostics;
 mod discussion;

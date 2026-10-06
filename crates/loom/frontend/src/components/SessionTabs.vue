@@ -17,7 +17,7 @@ import { computed } from 'vue';
 // Overview was a duplicate of these operational surfaces and is deliberately
 // absent.
 type LocalTab = 'terminal' | 'conversation' | 'shells';
-type Tab = LocalTab | 'artifacts' | 'changes';
+type Tab = LocalTab | 'artifacts' | 'commits' | 'changes';
 
 const props = defineProps<{
   tab: Tab;
@@ -32,7 +32,7 @@ const emit = defineEmits<{ select: [Tab] }>();
 
 /** Only a plain left-click takes the guarded in-app path; everything else
  * (modifier combos, middle click) keeps the raw href. */
-function onRouteTabClick(event: MouseEvent, tab: 'artifacts' | 'changes') {
+function onRouteTabClick(event: MouseEvent, tab: 'artifacts' | 'commits' | 'changes') {
   if (event.button !== 0 || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) {
     return;
   }
@@ -88,6 +88,17 @@ const tabClass = (active: boolean) =>
       <!-- When popped out, the Artifacts surface lives in the rail, not here —
            a small glyph marks it open without claiming the work area. -->
       <span v-if="artifactsPopped" class="ml-1 text-faint" title="Open in the split panel">⤢</span>
+    </a>
+    <a
+      :href="`/s/${id}/commits`"
+      role="tab"
+      data-tab="commits"
+      :aria-selected="tab === 'commits'"
+      class="-mb-px shrink-0 border-b-2 px-1.5 py-1 sm:px-2"
+      :class="tabClass(tab === 'commits')"
+      @click="onRouteTabClick($event, 'commits')"
+    >
+      Commits
     </a>
     <a
       :href="`/s/${id}/changes`"
