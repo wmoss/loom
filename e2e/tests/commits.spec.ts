@@ -109,10 +109,15 @@ test("clicking a commit reviews its own diff, with expand and the compose aside"
   await expect(panel).toContainText("v2 5");
   await expect(panel).toContainText("modified");
 
-  // The compose aside shows the change set as a collapsible file tree.
+  // The compose aside shows the change set as a collapsible file tree — and
+  // opening it must not shift the header row beside the toggle.
+  const heading = panel.getByRole("heading", { name: "Changes" });
+  const headingBefore = await heading.boundingBox();
   await page.getByTestId("changes-aside-toggle").click();
   const aside = page.getByTestId("changes-aside");
   await expect(aside.locator("[data-aside-file]")).toHaveCount(2);
+  const headingAfter = await heading.boundingBox();
+  expect(headingAfter!.x).toBe(headingBefore!.x);
   await expect(aside.locator('[data-aside-folder="src"]')).toBeVisible();
   await expect(aside.locator('[data-aside-folder="src/nested"]')).toBeVisible();
   await page.getByTestId("changes-aside-filter").fill("nope");

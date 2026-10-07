@@ -775,9 +775,10 @@ function reviewAllFromPicker() {
     data-testid="changes-panel"
   >
     <header class="flex flex-wrap items-center gap-2 border-b border-line px-3 py-2">
+      <!-- A fixed width keeps the row from shifting when the glyph swaps. -->
       <button
         type="button"
-        class="btn-secondary px-2 py-1 text-xs"
+        class="btn-secondary w-8 px-0 py-1 text-xs"
         data-testid="changes-aside-toggle"
         :aria-pressed="asideOpen"
         title="Expand file tree"
