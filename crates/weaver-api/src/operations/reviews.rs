@@ -217,9 +217,10 @@ pub mod list {
     ///
     /// Reachable by both the reviewed session's own credential and a human
     /// operator: sessions may see submitted feedback on their own work, but not
-    /// draft reviews from other operators.
+    /// draft reviews from other operators. The delivered review prompt is
+    /// compact; this is where the reviewed session reads the full anchors.
     #[operation(id = "reviews.list", actor = SessionSelf, scope = Session, risk = Read,
-                grants = ["loom/artifacts/read@v1"], default = custom)]
+                grants = ["loom/reviews/read@v1"], default = custom)]
     pub struct Input {
         pub subject_kind: ReviewSubjectKindDto,
         /// The artifact name for `subject_kind = "artifact"`, or `"changes"` for

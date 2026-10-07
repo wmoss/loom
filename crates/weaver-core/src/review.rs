@@ -1164,6 +1164,12 @@ pub async fn retry_delivery(db: &Db, review_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// The prompt pasted into the reviewed session's conversation.
+///
+/// Deliberately compact: each comment contributes only its one-line location,
+/// not its full anchor. The durable review — complete anchors and context
+/// excerpts included — stays reachable through `reviews.list`, which the
+/// reviewed session's own credential may call.
 pub fn structured_message(review: &Review) -> String {
     let subject = if review.subject_kind == "changes" {
         format!(
@@ -1182,14 +1188,11 @@ pub fn structured_message(review: &Review) -> String {
         message.push_str(review.summary.trim());
     }
     for (index, comment) in review.comments.iter().enumerate() {
-        let anchor = comment.anchor();
-        let anchor_json = anchor.json().unwrap_or_else(|_| "{}".to_string());
         message.push_str(&format!(
-            "\n\n{}. Revision {}, {} anchor {}:\n",
+            "\n\n{}. {} (revision {}):\n",
             index + 1,
-            comment.subject_version,
-            comment.anchor_kind,
-            anchor_json
+            comment_location(comment),
+            comment.subject_version
         ));
         message.push_str(&comment.body);
     }
@@ -1198,6 +1201,25 @@ pub fn structured_message(review: &Review) -> String {
         review.id, review.delivery_key
     ));
     message
+}
+
+/// A comment's one-line location: just enough for the reviewed agent to find
+/// the spot in its own checkout. The anchor's context excerpts stay in the
+/// durable review and out of the pasted prompt.
+fn comment_location(comment: &ReviewComment) -> String {
+    match comment.anchor() {
+        ReviewAnchor::Text(anchor) => {
+            let block = anchor
+                .block_index
+                .map(|index| format!(", block {index}"))
+                .unwrap_or_default();
+            format!("\"{}\"{block}", anchor.quote)
+        }
+        ReviewAnchor::Change(anchor) => format!(
+            "{} · {} lines {}-{}",
+            anchor.path_display, anchor.side, anchor.start_line, anchor.end_line
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1274,6 +1296,32 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn review_fixture() -> Review {
+        Review {
+            id: 7,
+            repo_root: "/repo".to_string(),
+            branch_id: "branch".to_string(),
+            session_id: "session-1".to_string(),
+            subject_kind: "artifact".to_string(),
+            subject_id: "1".to_string(),
+            subject_key: "design".to_string(),
+            subject_label: "design".to_string(),
+            subject_version: "1".to_string(),
+            status: "submitted".to_string(),
+            summary: String::new(),
+            draft_revision: 1,
+            created_by: "alice".to_string(),
+            acknowledged_outdated: false,
+            delivery_state: "delivered".to_string(),
+            delivery_error: None,
+            delivery_key: "key-7".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            submitted_at: None,
+            comments: Vec::new(),
+        }
     }
 
     fn comment<'a>(body: &'a str, anchor: &'a ReviewAnchor) -> NewComment<'a> {
@@ -1817,6 +1865,70 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((events, outbox), (1, 1));
+    }
+
+    #[test]
+    fn structured_message_keeps_anchor_context_out_of_the_prompt() {
+        let text = Review {
+            comments: vec![ReviewComment {
+                id: 1,
+                review_id: 7,
+                subject_version: "2".to_string(),
+                anchor_kind: "text".to_string(),
+                anchor_json: serde_json::to_string(&ArtifactTextAnchor {
+                    quote: "beta".to_string(),
+                    prefix: "Alpha ".to_string(),
+                    suffix: " gamma".to_string(),
+                    block_index: Some(1),
+                })
+                .unwrap(),
+                body: "Explain this.".to_string(),
+                status: "submitted".to_string(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            }],
+            subject_kind: "artifact".to_string(),
+            subject_label: "design".to_string(),
+            subject_version: "2".to_string(),
+            ..review_fixture()
+        };
+        let message = structured_message(&text);
+        assert!(message.contains("1. \"beta\", block 1 (revision 2):\nExplain this."));
+        assert!(!message.contains("Alpha "));
+        assert!(!message.contains(" gamma"));
+
+        let change = Review {
+            comments: vec![ReviewComment {
+                id: 2,
+                review_id: 7,
+                subject_version: "3".to_string(),
+                anchor_kind: "change".to_string(),
+                anchor_json: serde_json::to_string(&ChangeLineAnchor {
+                    path_bytes: "crates/foo.rs".to_string(),
+                    path_display: "crates/foo.rs".to_string(),
+                    side: "new".to_string(),
+                    start_line: 10,
+                    end_line: 14,
+                    hunk_header: "@@ -9,7 +9,7 @@".to_string(),
+                    context_before: vec!["fn old() {".to_string()],
+                    selected: vec!["    let x = 1;".to_string()],
+                    context_after: vec!["}".to_string()],
+                })
+                .unwrap(),
+                body: "Tighten this.".to_string(),
+                status: "submitted".to_string(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            }],
+            subject_kind: "changes".to_string(),
+            subject_version: "3".to_string(),
+            ..review_fixture()
+        };
+        let message = structured_message(&change);
+        assert!(message.contains("1. crates/foo.rs · new lines 10-14 (revision 3):"));
+        assert!(!message.contains("fn old()"));
+        assert!(!message.contains("let x = 1;"));
+        assert!(message.contains("[review_id: 7; delivery_key: key-7]"));
     }
 
     #[tokio::test]

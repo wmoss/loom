@@ -199,7 +199,12 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
         .await
         .unwrap();
     assert_eq!(added.comments[0].subject_version, "1");
-    assert!(added.message.contains("\"prefix\":\"Alpha \""));
+    // The delivery prompt is compact: the anchor's location makes the cut,
+    // its surrounding context does not.
+    assert!(added
+        .message
+        .contains("1. \"beta\", block 1 (revision 1):\nExplain why this is safe."));
+    assert!(!added.message.contains("Alpha "));
 
     let session_token = loom::auth::create_session_token(
         &ts.state.db,
@@ -947,4 +952,87 @@ async fn terminal_delivery_queues_offline_recovers_and_reports_real_failure() {
             .delivery_state,
         "failed"
     );
+}
+
+/// Drive Loom's built-in MCP server over stdio with a session credential,
+/// exactly the way the reviewed session's agent runtime does.
+async fn run_mcp_tool_calls(ts: &TestServer, token: &str, calls: &[Value]) -> Vec<Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .args(["mcp", "serve"])
+        .env("WEAVER_API", format!("http://{}", ts.addr))
+        .env("LOOM_TOKEN", token)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for call in calls {
+        stdin
+            .write_all(format!("{call}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    drop(stdin);
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut values = Vec::new();
+    while let Some(line) = lines.next_line().await.unwrap() {
+        values.push(serde_json::from_str(&line).unwrap());
+    }
+    assert!(child.wait().await.unwrap().success());
+    values
+}
+
+/// The delivered prompt is compact — a comment contributes its one-line
+/// location, not its full anchor — while the durable review stays readable
+/// through the reviewed session's own MCP tool, complete anchors included.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_reads_full_review_detail_through_its_mcp_tool() {
+    let ts = TestServer::start().await;
+    let session = insert_api_session(&ts, "mcp-review-detail").await;
+    seed_artifact(&ts, &session).await;
+    let draft = draft_with_comment(&ts, &session, "Explain why this is safe.").await;
+    let submitted = ts
+        .client
+        .invoke::<reviews::submit::Op>(&reviews::submit::Input {
+            id: draft.id,
+            expected_revision: draft.draft_revision,
+            acknowledge_outdated: false,
+        })
+        .await
+        .unwrap();
+
+    assert!(submitted
+        .message
+        .contains("1. \"beta\", block 1 (revision 1):\nExplain why this is safe."));
+    assert!(!submitted.message.contains("Alpha "));
+
+    let token =
+        loom::auth::create_session_token(&ts.state.db, None, &session.id, &session.branch.id)
+            .await
+            .unwrap();
+    let responses = run_mcp_tool_calls(
+        &ts,
+        &token,
+        &[json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "review_list", "arguments": {
+                "subject_kind": "artifact", "subject_key": "design" } }
+        })],
+    )
+    .await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["result"]["isError"], false);
+    let listed = &responses[0]["result"]["structuredContent"]["items"];
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["id"], submitted.id);
+    assert_eq!(listed[0]["message"], submitted.message);
+    let anchor = &listed[0]["comments"][0]["anchor"];
+    assert_eq!(anchor["quote"], "beta");
+    assert_eq!(anchor["prefix"], "Alpha ");
+    assert_eq!(anchor["suffix"], " gamma");
 }
