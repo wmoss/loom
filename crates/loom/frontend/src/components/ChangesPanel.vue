@@ -59,6 +59,9 @@ const trayError = ref('');
 // The compose aside: a hierarchical, resizable file rail on the diff's left,
 // off until asked for.
 const asideOpen = ref(false);
+/** The outdated-comments section starts open so nothing is hidden; it can
+ * be folded away once read. */
+const outdatedOpen = ref(true);
 const asideFilter = ref('');
 // Folders default expanded; membership tracks the collapsed ones.
 const collapsedFolders = reactive(new Set<string>());
@@ -136,16 +139,38 @@ const diffDataCache = new Map<string, GitDiffViewData | null>();
 
 const draft = computed(() => reviews.value.find((review) => review.status === 'draft') ?? null);
 
-/** Draft comments whose file is no longer in the change set — they cannot be
- * placed inline, but they still submit with the review, so they render in a
- * fallback section where they can be edited, re-anchored, or deleted. */
-const orphanedComments = computed(() => {
-  const present = new Set((changes.value?.files ?? []).map((file) => file.path.bytes));
-  return (draft.value?.comments ?? []).filter(
-    (comment) =>
-      comment.anchor_kind === 'change' && !present.has((comment.anchor as ChangeAnchor).path.bytes),
-  );
-});
+/** True when the anchor's side and line range is rendered by some hunk of its
+ * file — the same contiguity the backend's anchor validation requires. */
+function anchorPlaced(anchor: ChangeAnchor): boolean {
+  const file = (changes.value?.files ?? []).find((item) => item.path.bytes === anchor.path.bytes);
+  if (!file) return false;
+  for (const hunk of file.hunks) {
+    const eligible = hunk.lines
+      .map((line) => (anchor.side === 'old' ? line.old_line : line.new_line))
+      .filter((line): line is number => line != null);
+    const first = eligible.indexOf(anchor.start_line);
+    if (first < 0) continue;
+    let resolves = true;
+    for (let offset = 1; offset <= anchor.end_line - anchor.start_line; offset++) {
+      if (eligible[first + offset] !== anchor.start_line + offset) {
+        resolves = false;
+        break;
+      }
+    }
+    if (resolves) return true;
+  }
+  return false;
+}
+
+/** Draft comments that cannot be placed inline in this view — the anchored
+ * file left the change set, or its lines are no longer rendered. They still
+ * submit with the review, so they persist in the outdated section where they
+ * can be edited, re-anchored, or deleted. */
+const outdatedComments = computed(() =>
+  (draft.value?.comments ?? []).filter(
+    (comment) => comment.anchor_kind === 'change' && !anchorPlaced(comment.anchor as ChangeAnchor),
+  ),
+);
 
 const baseProblem = computed(() => {
   const base = changes.value?.base;
@@ -355,7 +380,7 @@ function extendDataFor(file: ChangeFile): {
   for (const comment of draft.value?.comments ?? []) {
     if (comment.anchor_kind !== 'change') continue;
     const anchor = comment.anchor as ChangeAnchor;
-    if (anchor.path.bytes !== file.path.bytes) continue;
+    if (anchor.path.bytes !== file.path.bytes || !anchorPlaced(anchor)) continue;
     const bucket = anchor.side === 'old' ? oldFile : newFile;
     const key = String(anchor.end_line);
     (bucket[key] ??= { data: [] }).data.push(comment);
@@ -579,11 +604,12 @@ async function retryDelivery(item: Review) {
 }
 
 /** Marks a draft comment active and reveals it: expanding and force-mounting
- * its file when needed, then scrolling its card — inline or in the orphan
+ * its file when needed, then scrolling its card — inline or in the outdated
  * section — into view. Shared by the tray's prev/next and direct clicks. */
 function focusComment(commentId: number) {
   const comment = draft.value?.comments.find((item) => item.id === commentId);
   if (!comment) return;
+  if (outdatedComments.value.some((item) => item.id === commentId)) outdatedOpen.value = true;
   if (comment.anchor_kind === 'change') {
     const key = (comment.anchor as ChangeAnchor).path.bytes;
     collapsed.delete(key);
@@ -983,6 +1009,62 @@ function reviewAllFromPicker() {
           the version still covers all final bytes when available.
         </p>
 
+        <section
+          v-if="outdatedComments.length"
+          class="border-b border-line"
+          aria-label="Outdated comments"
+          data-testid="outdated-comments"
+        >
+          <button
+            type="button"
+            class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-subtle"
+            :aria-expanded="outdatedOpen"
+            data-testid="outdated-comments-toggle"
+            @click="outdatedOpen = !outdatedOpen"
+          >
+            <span class="w-4 text-faint" aria-hidden="true">{{ outdatedOpen ? '▾' : '▸' }}</span>
+            <span>Outdated comments</span>
+            <span
+              class="rounded-full bg-accent/20 px-1.5 text-2xs text-accent"
+              title="Outdated comments"
+            >
+              {{ outdatedComments.length }}
+            </span>
+          </button>
+          <template v-if="outdatedOpen">
+            <p class="px-3 pb-2 text-2xs text-faint">
+              These comments anchor to lines this view no longer shows — they still submit with the
+              review, and can be re-anchored onto a current line.
+            </p>
+            <div
+              v-for="comment in outdatedComments"
+              :key="comment.id"
+              class="border-t border-line bg-code p-2"
+            >
+              <p class="mb-1 truncate font-mono text-2xs text-faint">
+                {{ (comment.anchor as ChangeAnchor).path.display }} ·
+                {{ (comment.anchor as ChangeAnchor).side }}
+                {{ (comment.anchor as ChangeAnchor).start_line }}–{{
+                  (comment.anchor as ChangeAnchor).end_line
+                }}
+              </p>
+              <ReviewCommentCard
+                :review="draft!"
+                :comment="comment"
+                :active="activeComment === comment.id"
+                :reanchoring="reanchorComment === comment.id"
+                :error="commentErrors[comment.id] ?? ''"
+                :delete-action="removeComment"
+                @focus="activeComment = $event"
+                @close="activeComment = null"
+                @edit="editComment"
+                @reanchor="reanchorComment = $event"
+                @cancel-reanchor="reanchorComment = null"
+              />
+            </div>
+          </template>
+        </section>
+
         <article v-for="file in changes?.files" :key="file.path.bytes" class="border-b border-line">
           <button
             type="button"
@@ -1133,43 +1215,6 @@ function reviewAllFromPicker() {
             </div>
           </div>
         </article>
-
-        <section
-          v-if="orphanedComments.length"
-          class="border-b border-line"
-          aria-label="Comments on files outside this change set"
-        >
-          <p class="px-3 py-2 text-2xs text-faint">
-            Pending comments on files no longer part of this change set — they still submit with the
-            review, and can be re-anchored onto a current line.
-          </p>
-          <div
-            v-for="comment in orphanedComments"
-            :key="comment.id"
-            class="border-t border-line bg-code p-2"
-          >
-            <p class="mb-1 truncate font-mono text-2xs text-faint">
-              {{ (comment.anchor as ChangeAnchor).path.display }} ·
-              {{ (comment.anchor as ChangeAnchor).side }}
-              {{ (comment.anchor as ChangeAnchor).start_line }}–{{
-                (comment.anchor as ChangeAnchor).end_line
-              }}
-            </p>
-            <ReviewCommentCard
-              :review="draft!"
-              :comment="comment"
-              :active="activeComment === comment.id"
-              :reanchoring="reanchorComment === comment.id"
-              :error="commentErrors[comment.id] ?? ''"
-              :delete-action="removeComment"
-              @focus="activeComment = $event"
-              @close="activeComment = null"
-              @edit="editComment"
-              @reanchor="reanchorComment = $event"
-              @cancel-reanchor="reanchorComment = null"
-            />
-          </div>
-        </section>
       </div>
     </div>
 
