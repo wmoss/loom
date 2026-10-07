@@ -1036,3 +1036,103 @@ async fn a_session_reads_full_review_detail_through_its_mcp_tool() {
     assert_eq!(anchor["prefix"], "Alpha ");
     assert_eq!(anchor["suffix"], " gamma");
 }
+
+/// A review scoped to one commit anchors and submits against that commit's
+/// own snapshot, not the branch's whole change-set.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_scoped_review_anchors_against_its_own_snapshot() {
+    let ts = TestServer::start().await;
+    let session = insert_api_session(&ts, "commit-scoped-review").await;
+    let repo = ts.repo_path();
+    let sh = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    };
+    std::fs::write(repo.join("committed.txt"), "one\ntwo\nthree\n").unwrap();
+    sh(&["add", "-A"]);
+    sh(&["commit", "-m", "seed committed lines"]);
+    std::fs::write(repo.join("committed.txt"), "one\nTWO\nthree\n").unwrap();
+    sh(&["add", "-A"]);
+    sh(&["commit", "-m", "touch the second line"]);
+
+    // The commit-scoped snapshot the Code Review UI renders for this commit.
+    let snapshot = ts
+        .client
+        .invoke::<sessions::changes::Op>(&sessions::changes::Input {
+            session: session.id.clone(),
+            rev: Some("HEAD".to_string()),
+        })
+        .await
+        .unwrap();
+    let version = snapshot.version.clone().unwrap();
+    assert!(
+        version.starts_with("changes-commit-v1:"),
+        "a commit snapshot must carry a commit-scoped version, got {version}"
+    );
+
+    // Drafting against the commit snapshot is the flow that used to 409 with
+    // "change-set version moved" because the backend only knew the branch
+    // change-set.
+    let draft = ts
+        .client
+        .invoke::<reviews::create::Op>(&reviews::create::Input {
+            session: session.id.to_string(),
+            subject_kind: ReviewSubjectKindDto::Changes,
+            subject_key: "changes".to_string(),
+            subject_version: version.clone(),
+        })
+        .await
+        .unwrap();
+    let commented = ts
+        .client
+        .invoke::<reviews::comments::create::Op>(&reviews::comments::create::Input {
+            id: draft.id,
+            expected_revision: draft.draft_revision,
+            subject_version: version.clone(),
+            anchor_kind: ReviewAnchorKindDto::Change,
+            anchor: ReviewAnchorDto::Change(ChangeAnchorDto {
+                path: snapshot.files[0].path.clone(),
+                side: ChangeSideDto::New,
+                start_line: 2,
+                end_line: 2,
+                hunk_header: snapshot.files[0].hunks[0].header.clone(),
+                context_before: Vec::new(),
+                selected: Vec::new(),
+                context_after: Vec::new(),
+            }),
+            body: "Explain the second line.".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(commented.comments.len(), 1);
+    assert_eq!(commented.comments[0].subject_version, version);
+
+    // The pinned commit is immutable, so the review is never outdated and
+    // the list reports it as fresh against its own snapshot.
+    let listed = ts
+        .client
+        .invoke::<reviews::list::Op>(&reviews::list::Input {
+            subject_kind: ReviewSubjectKindDto::Changes,
+            subject_key: "changes".to_string(),
+            session: session.id.to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].outdated);
+    let submitted = ts
+        .client
+        .invoke::<reviews::submit::Op>(&reviews::submit::Input {
+            id: draft.id,
+            expected_revision: commented.draft_revision,
+            acknowledge_outdated: false,
+        })
+        .await
+        .unwrap();
+    assert!(!submitted.acknowledged_outdated);
+}
