@@ -1466,6 +1466,16 @@ pub async fn load_for_review(
     }
 }
 
+/// The commit a change-set version pins, when that version names one commit's
+/// diff rather than the branch's whole change-set.
+pub fn commit_for_version(version: &str) -> Option<&str> {
+    version
+        .strip_prefix("changes-commit-v1:")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(oid, _)| oid)
+        .filter(|oid| !oid.is_empty())
+}
+
 /// The diff one commit introduces (`parent..rev`), as a bounded snapshot the
 /// review surface renders exactly like the worktree state. A commit and its
 /// parent are immutable, so there is no stability re-read to race.
@@ -1588,7 +1598,12 @@ pub async fn load_commit(work_dir: &Path, rev: &str) -> Result<ChangeSetDto> {
     hash_record(&mut hasher, b"parent-oid", parent.as_bytes());
     hash_record(&mut hasher, b"commit-oid", oid.as_bytes());
     hash_record(&mut hasher, b"rendered-response", &rendered);
-    changes.version = Some(format!("changes-v1:{}", hex::encode(hasher.finalize())));
+    // The oid rides in the version string so any later reader can reload this
+    // exact snapshot — the digest alone cannot be reversed into a revision.
+    changes.version = Some(format!(
+        "changes-commit-v1:{oid}:{}",
+        hex::encode(hasher.finalize())
+    ));
     Ok(changes)
 }
 
@@ -1691,10 +1706,14 @@ mod tests {
         assert!(git(&["commit", "-m", "extend and add"]).status.success());
 
         let changes = load_commit(dir.path(), "HEAD").await.unwrap();
-        assert!(changes
-            .version
-            .as_deref()
-            .is_some_and(|v| v.starts_with("changes-v1:")));
+        let version = changes.version.as_deref().unwrap();
+        assert!(version.starts_with("changes-commit-v1:"));
+        assert_eq!(
+            commit_for_version(version),
+            changes.head_oid.as_deref(),
+            "a commit snapshot's version must name the commit it reloads"
+        );
+        assert!(commit_for_version("changes-v1:abc").is_none());
         let reference = match &changes.base {
             ChangeBaseDto::Available { reference, oid: _ } => reference.clone(),
             other => panic!("unexpected base: {other:?}"),

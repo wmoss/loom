@@ -1,7 +1,23 @@
 import { expect, test } from "../fixtures/weaver";
+import type { Locator } from "@playwright/test";
 import { execFileSync } from "child_process";
 import { mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
+
+// The diff view's per-line "+" comment control only becomes interactive once
+// its row is hovered — same shape as changes-review.spec.ts, kept local so
+// each journey spec stays self-contained.
+async function addWidgetButton(
+  fileArticle: Locator,
+  side: "old" | "new",
+  line: number,
+): Promise<Locator> {
+  const row = fileArticle.locator(
+    `table[data-mode="${side}"] tr[data-line="${line}"]`,
+  );
+  await row.hover();
+  return row.locator("button.diff-add-widget");
+}
 
 test("the Commits tab lists the branch commits over its base", async ({
   page,
@@ -108,6 +124,19 @@ test("clicking a commit reviews its own diff, with expand and the compose aside"
   // in branch state this file would read as added, not modified.
   await expect(panel).toContainText("v2 5");
   await expect(panel).toContainText("modified");
+
+  // Drafting while commit-scoped anchors against the commit's own snapshot:
+  // saving must succeed rather than 409 with a moved-version conflict.
+  const reviewFileArticle = page
+    .locator("article")
+    .filter({ has: page.locator("code", { hasText: /^feature\.txt$/ }) })
+    .first();
+  await (await addWidgetButton(reviewFileArticle, "new", 5)).click();
+  const composer = page.getByTestId("change-comment-composer");
+  await composer.locator("textarea").fill("Why did this line change?");
+  await composer.getByRole("button", { name: "Add pending comment" }).click();
+  await expect(page.getByTestId("review-tray")).toContainText("1 pending");
+  await expect(panel).toContainText("Pending comment saved.");
 
   // The compose aside shows the change set as a collapsible file tree — and
   // opening it must not shift the header row beside the toggle.
