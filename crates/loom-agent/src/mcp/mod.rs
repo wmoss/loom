@@ -30,6 +30,7 @@ pub(crate) mod context;
 pub(crate) mod issue;
 pub(crate) mod messaging;
 pub(crate) mod permission;
+pub(crate) mod review;
 
 // These stay hand-written rather than bound via `dispatch::bind` — see each
 // module's own doc comment for exactly which tool and why (a response
@@ -100,6 +101,7 @@ const ADAPTERS: &[&Adapter] = &[
     &session::ADAPTER,
     &messaging::ADAPTER,
     &permission::ADAPTER,
+    &review::ADAPTER,
 ];
 
 fn adapters() -> impl Iterator<Item = &'static Adapter> {
@@ -1210,6 +1212,10 @@ mod tests {
             (
                 "loom/issues/read@v1",
                 "sha256:37e9afd58241a3dc68edde6a4521b02afdd0f445d4eae6910da54fea05763803",
+            ),
+            (
+                "loom/reviews/read@v1",
+                "sha256:94bc671c1def9c4272ebef62049c0f4cf70e1130347bacb32719a989a2a3af49",
             ),
             (
                 "loom/issues/write@v1",
