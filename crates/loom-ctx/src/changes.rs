@@ -899,9 +899,10 @@ async fn read_blob_text(boundary: &GitBoundary, blob: &Option<Vec<u8>>) -> Resul
     Ok(Some(String::from_utf8_lossy(&capture.bytes).into_owned()))
 }
 
-/// Full pre/post-change text for one file, from its `--raw` blob hashes. Both
-/// sides are read first and only then committed against the remaining budget,
-/// so a file never shows one expandable side and one that cannot expand.
+/// Full pre/post-change text for one file, from its `--raw` blob hashes. The
+/// budget is spent on both sides together, so exhaustion never halves a file.
+/// Each side still carries its own blob limit, and an added or deleted file
+/// legitimately has exactly one expandable side.
 async fn attach_contents(
     boundary: &GitBoundary,
     raw: &RawFile,
@@ -1533,7 +1534,7 @@ pub async fn load_commit(work_dir: &Path, rev: &str) -> Result<ChangeSetDto> {
             .await
         },
     )?;
-    let mut raw_files = parse_raw_files(&raw.bytes);
+    let raw_files = parse_raw_files(&raw.bytes);
     let mut sections = patch_sections(&patch.bytes);
     let stats = parse_numstat(&numstat.bytes);
     // A commit's changes are committed by definition, and nothing in a commit
@@ -1566,7 +1567,6 @@ pub async fn load_commit(work_dir: &Path, rev: &str) -> Result<ChangeSetDto> {
             new_content,
         });
     }
-    raw_files.truncate(MAX_FILES);
     let short = oid[..oid.len().min(10)].to_string();
     let mut changes = ChangeSetDto {
         version: None,
@@ -1742,6 +1742,43 @@ mod tests {
         assert_eq!(b.old_content, None);
         assert_eq!(b.new_content.as_deref(), Some("brand new\n"));
         assert!(!changes.truncated);
+    }
+
+    #[tokio::test]
+    async fn a_commit_touching_more_than_max_files_marks_the_snapshot_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.path().to_str().unwrap()])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-b", "main"]).status.success());
+        assert!(git(&["config", "user.name", "E2E"]).status.success());
+        assert!(git(&["config", "user.email", "e2e@weaver.test"])
+            .status
+            .success());
+        std::fs::write(dir.path().join("seed"), "base\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "base"]).status.success());
+        for index in 0..(MAX_FILES + 1) {
+            std::fs::write(dir.path().join(format!("f{index}")), "touched\n").unwrap();
+        }
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "touch a file past the cap"])
+            .status
+            .success());
+
+        let changes = load_commit(dir.path(), "HEAD").await.unwrap();
+        assert!(
+            changes.truncated,
+            "the silent cap is the regression: the file cap must mark the snapshot truncated"
+        );
+        assert_eq!(changes.files.len(), MAX_FILES);
+        assert_eq!(changes.totals.files, (MAX_FILES + 1) as u32);
     }
 
     #[test]
