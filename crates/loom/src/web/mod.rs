@@ -437,6 +437,7 @@ pub(crate) async fn session_view(
         park: legacy_park,
         sort_order: legacy_sort_order,
         protocol: session.protocol.clone(),
+        runner: session.runner.clone(),
         acp_session_id: session.acp_session_id.clone(),
         current_mode: session.current_mode.clone(),
         usage,

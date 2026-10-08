@@ -933,6 +933,8 @@ pub async fn create_warm_session(
             creator_subject: format!("watch:{}", watch.id),
             parent_session_id: None,
             automation_run_id: None,
+            // Engine-owned warm sessions always follow the configured runner.
+            runner: String::new(),
         },
     )
     .await?;
@@ -964,6 +966,7 @@ pub async fn create_warm_session(
                 allowed_tools: &stamped_allowed_tools,
                 mcp_access: &session.policy_mcp_access,
                 custom: custom_agent.as_ref(),
+                local_runner: false,
             },
             agent::AcpOpen::Fresh,
         )
@@ -989,6 +992,7 @@ pub async fn create_warm_session(
                 extra_env: &extra_env,
                 env_clear: launch_profile.env_clear,
                 custom: custom_agent.as_ref(),
+                local_runner: false,
             },
             agent::LaunchMode::Fresh,
         )
@@ -1301,6 +1305,7 @@ pub async fn adopt_terminal_into_acp(
             allowed_tools: &session.policy_allowed_tools,
             mcp_access: &session.policy_mcp_access,
             custom: None,
+            local_runner: session.runner_is_local(),
         },
         open,
     )
@@ -1430,6 +1435,7 @@ pub async fn adopt_acp(
                 allowed_tools: &session.policy_allowed_tools,
                 mcp_access: &session.policy_mcp_access,
                 custom: custom_agent,
+                local_runner: session.runner_is_local(),
             },
             open,
         )
@@ -1687,6 +1693,7 @@ pub async fn resume_agent(
             extra_env: &extra_env,
             env_clear: session.policy_env_clear,
             custom: custom_agent,
+            local_runner: session.runner_is_local(),
         },
         agent::LaunchMode::Adopt,
     )

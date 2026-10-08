@@ -1230,6 +1230,82 @@ async fn session_records_its_launcher_as_tree_parent() {
         .unwrap();
 }
 
+/// The `runner` launch override is stamped on the session row and echoed in
+/// its view; an unknown value is rejected before anything is provisioned.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_runner_override_is_stamped_and_validated() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let local = client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "review the diff",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": "local-review",
+                "runner": "local",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        local["runner"], "local",
+        "the view echoes the placement override"
+    );
+    let local_id = local["id"].as_str().unwrap().to_string();
+    let row = loom::session::get(&ts.state.db, &local_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.runner_is_local(),
+        "the row carries the durable override"
+    );
+    assert!(
+        loom::backend::has_session(&row.term_session).await,
+        "the locally placed session is live"
+    );
+
+    let configured = client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "configured placement",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": "configured-placement",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        configured["runner"], "",
+        "an absent runner means the deployment's configured placement"
+    );
+
+    let rejected = client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "bad runner",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "runner": "docker",
+            }),
+        )
+        .await;
+    let error = rejected
+        .expect_err("an unknown runner is rejected")
+        .to_string();
+    assert!(
+        error.contains("unknown runner") && error.contains("400"),
+        "the refusal is a validation 400: {error}"
+    );
+}
+
 /// `sessions.url` — the link an agent hands a human. It resolves by any
 /// session key (id or branch id, the `$WEAVER_BRANCH` the agent carries), and
 /// honours the operator's public origin so the URL works off-box.

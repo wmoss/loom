@@ -511,6 +511,7 @@ mod tests {
             park: None,
             sort_order: None,
             protocol: "terminal".to_string(),
+            runner: String::new(),
             acp_session_id: None,
             acp_ack_seq: 0,
             acp_driver_epoch: 0,

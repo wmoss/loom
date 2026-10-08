@@ -482,6 +482,19 @@ async fn create_inner(
     // touching a repository, worktree, branch, work-item claim, or session row.
     let prepared_scratch = prepare_initial_scratch(&req.scratch)?;
     let selection = create_selection(&req)?;
+    // Placement input is validated before touching a repository so an unknown
+    // runner never leaves a half-provisioned worktree behind.
+    let runner = req
+        .runner
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    if !runner.is_empty() && runner != "local" {
+        return Err(ProvisionError::invalid(format!(
+            "unknown runner '{runner}' (expected 'local')"
+        )));
+    }
     let selected_profile_name = match selection.profile.trim() {
         "" => crate::profile::DEFAULT_PROFILE,
         name => name,
@@ -762,6 +775,7 @@ async fn create_inner(
                 allowed_tools: &stamped_allowed_tools,
                 mcp_access: &stamped_mcp_access,
                 custom: None,
+                local_runner: runner == "local",
             },
             agent::AcpOpen::Fresh,
         )
@@ -1076,6 +1090,7 @@ async fn create_inner(
         creator_subject,
         parent_session_id,
         automation_run_id: actor.automation_run_id().map(str::to_string),
+        runner: runner.to_string(),
     };
 
     // Keep an explicit claimed/imported work item attached for compatibility.
@@ -1337,6 +1352,7 @@ async fn create_inner(
                 allowed_tools: &stamped_allowed_tools,
                 mcp_access: &launch_policy.mcp_access,
                 custom: custom_agent.as_ref(),
+                local_runner: runner == "local",
             },
             agent::AcpOpen::Fresh,
         )
@@ -1422,6 +1438,7 @@ async fn create_inner(
                 extra_env: &extra_env,
                 env_clear: launch_profile.env_clear,
                 custom: custom_agent.as_ref(),
+                local_runner: runner == "local",
             },
             agent::LaunchMode::Fresh,
         )

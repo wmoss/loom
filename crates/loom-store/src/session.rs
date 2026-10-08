@@ -65,6 +65,12 @@ pub struct Session {
     /// as terminal.
     #[serde(default = "default_protocol")]
     pub protocol: String,
+    /// Runtime placement override stamped once at create: blank uses the
+    /// deployment's configured runner; `"local"` runs this session's supervisor
+    /// directly beside the loom server process instead. See
+    /// [`Session::runner_is_local`].
+    #[serde(default)]
+    pub runner: String,
     /// The agent's own on-disk ACP session id, or `None` for a terminal session
     /// (or an ACP session before setup completes).
     pub acp_session_id: Option<String>,
@@ -154,7 +160,7 @@ const SESSION_COLUMNS: &str = "\
     lifecycle_transition, lifecycle_step, lifecycle_transition_started_at, \
     lifecycle_transition_owner_pid, github_repo, \
     last_activity_at, created_at, parent_branch_id, managed_by, created_by, park, sort_order, \
-    protocol, acp_session_id, acp_ack_seq, acp_driver_epoch, acp_inflight, current_mode, \
+    protocol, runner, acp_session_id, acp_ack_seq, acp_driver_epoch, acp_inflight, current_mode, \
     pending_prompt, origin, \
     class, turn_count, tracking_issue_id, profile, launch_mode, profile_revision, \
     profile_lifetime, policy_strict, policy_env_clear, policy_ambient_allowlist, \
@@ -184,6 +190,14 @@ pub const STATUSES: &[&str] = &[
 
 pub fn is_terminal(status: &str) -> bool {
     matches!(status, "done" | "error" | "archived")
+}
+
+impl Session {
+    /// Whether this session's supervisor is placed directly beside the loom
+    /// server process, bypassing the deployment's configured runner.
+    pub fn runner_is_local(&self) -> bool {
+        self.runner.trim() == "local"
+    }
 }
 
 pub struct NewSession {
@@ -240,6 +254,10 @@ pub struct SessionLaunchPolicy {
     pub creator_subject: String,
     pub parent_session_id: Option<String>,
     pub automation_run_id: Option<String>,
+    /// Runtime placement override stamped onto the row: blank uses the
+    /// deployment's configured runner; `"local"` places this session's
+    /// supervisor directly beside the loom server process.
+    pub runner: String,
 }
 
 /// Resolved profile/security metadata replaced during an ACP handoff. Creator
@@ -297,6 +315,7 @@ impl SessionLaunchPolicy {
             creator_subject: s.created_by.clone().unwrap_or_else(|| s.origin.clone()),
             parent_session_id: None,
             automation_run_id: None,
+            runner: String::new(),
         }
     }
 }
@@ -560,15 +579,15 @@ pub(crate) async fn insert_with_layout_revision(
     sqlx::query(
         "INSERT INTO sessions
          (id, branch_id, work_dir, term_session, agent_kind, model, effort, status,
-          github_repo, parent_branch_id, managed_by, created_by, protocol,
+          github_repo, parent_branch_id, managed_by, created_by, protocol, runner,
           origin, class, tracking_issue_id, last_activity_at, created_at,
           profile, launch_mode, profile_revision, profile_lifetime, policy_strict,
           policy_env_clear,
           policy_ambient_allowlist, policy_idle_archive_secs, policy_turn_budget,
           policy_prelude, policy_restricted, policy_github_repositories, policy_allowed_tools, policy_mcp_access,
           launch_snapshot, creator_kind, creator_subject, parent_session_id, automation_run_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&s.id)
     .bind(&s.branch_id)
@@ -583,6 +602,7 @@ pub(crate) async fn insert_with_layout_revision(
     .bind(&s.managed_by)
     .bind(&s.created_by)
     .bind(protocol)
+    .bind(policy.runner.trim())
     .bind(&s.origin)
     .bind(&s.class)
     .bind(s.tracking_issue_id)
@@ -2218,6 +2238,40 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(taken.as_deref(), Some("send after stop"));
+    }
+
+    #[tokio::test]
+    async fn launch_policy_runner_is_stamped_and_read_back() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let mut policy = SessionLaunchPolicy::compatible(&new_session(
+            "configured",
+            &branch_id(&db, "weaver/configured").await,
+            None,
+        ));
+        policy.runner = "local".to_string();
+        let local_branch = branch_id(&db, "weaver/local").await;
+        let local = new_session("local", &local_branch, None);
+        insert_with_policy(&db, &local, &policy).await.unwrap();
+
+        let configured_branch = branch_id(&db, "weaver/configured").await;
+        let configured = new_session("configured", &configured_branch, None);
+        insert_with_policy(
+            &db,
+            &configured,
+            &SessionLaunchPolicy::compatible(&configured),
+        )
+        .await
+        .unwrap();
+
+        let local = get(&db, "local").await.unwrap().unwrap();
+        assert_eq!(local.runner, "local");
+        assert!(local.runner_is_local());
+        let configured = get(&db, "configured").await.unwrap().unwrap();
+        assert_eq!(
+            configured.runner, "",
+            "the compatible default follows the configured runner"
+        );
+        assert!(!configured.runner_is_local());
     }
 
     async fn insert_child_of(
