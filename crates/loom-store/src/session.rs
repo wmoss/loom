@@ -653,6 +653,19 @@ pub async fn active_for_branch(db: &Db, branch_id: &str) -> Result<Option<Sessio
     Ok(row)
 }
 
+/// The un-archived child sessions launched by `parent_session_id`, oldest
+/// first. Ancestry is a tree — a session is only ever born with its parent, so
+/// one level is exact; whole-subtree walks go through each child recursively.
+pub async fn list_children(db: &Db, parent_session_id: &str) -> Result<Vec<Session>> {
+    let query =
+        select_sessions("WHERE parent_session_id = ? AND status != 'archived' ORDER BY created_at");
+    let rows = sqlx::query_as::<_, Session>(&query)
+        .bind(parent_session_id)
+        .fetch_all(db)
+        .await?;
+    Ok(rows)
+}
+
 /// Every session, ordered newest-first — managed (warm) sessions included. The
 /// internal view: the monitor's liveness walk, the adopt reconcile, and any
 /// engine bookkeeping use this so a managed session is never dropped from
@@ -2205,5 +2218,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(taken.as_deref(), Some("send after stop"));
+    }
+
+    async fn insert_child_of(
+        db: &Db,
+        id: &str,
+        branch_id: &str,
+        parent_session_id: &str,
+        status: &str,
+    ) {
+        let mut child = new_session(id, branch_id, None);
+        child.origin = "agent".to_string();
+        let mut policy = SessionLaunchPolicy::compatible(&child);
+        policy.parent_session_id = Some(parent_session_id.to_string());
+        let inserted = insert_with_policy(db, &child, &policy).await.unwrap();
+        if inserted.status != status {
+            set_status(db, id, status).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_children_returns_only_the_unarchived_descendants_of_one_launcher() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let launcher_branch = branch_id(&db, "weaver/launcher").await;
+        insert(&db, &new_session("launcher", &launcher_branch, None))
+            .await
+            .unwrap();
+
+        insert_child_of(
+            &db,
+            "first",
+            &branch_id(&db, "weaver/first").await,
+            "launcher",
+            "done",
+        )
+        .await;
+        insert_child_of(
+            &db,
+            "second",
+            &branch_id(&db, "weaver/second").await,
+            "launcher",
+            "running",
+        )
+        .await;
+        // A grandchild belongs to its own launcher, not the top-level one.
+        insert_child_of(
+            &db,
+            "grandchild",
+            &branch_id(&db, "weaver/grand").await,
+            "first",
+            "done",
+        )
+        .await;
+        // An already-archived child has nothing left to cascade.
+        insert_child_of(
+            &db,
+            "gone",
+            &branch_id(&db, "weaver/gone").await,
+            "launcher",
+            "archived",
+        )
+        .await;
+
+        let children = list_children(&db, "launcher").await.unwrap();
+        let ids: Vec<&str> = children.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["first", "second"],
+            "one launcher's un-archived children, oldest first — no grandchildren, no archived rows"
+        );
+        assert_eq!(children[0].status, "done");
+        assert_eq!(children[1].status, "running");
+        assert!(
+            list_children(&db, "stranger").await.unwrap().is_empty(),
+            "a launcher with no children lists nothing"
+        );
     }
 }

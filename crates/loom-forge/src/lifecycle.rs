@@ -431,6 +431,9 @@ pub async fn archive_locked(
         )
         .await
         .ok();
+        // The launcher going away takes its finished delegates with it. Every
+        // child that outlives the archive is reported, never hidden.
+        warnings.extend(archive_children(st, &session.id).await);
         if warnings.is_empty() {
             tracing::info!(session = %session.id, branch = %branch.id, "session archived");
         } else {
@@ -455,6 +458,100 @@ pub async fn archive_locked(
         }
     }
     result
+}
+
+/// A child session that may still be doing work: its agent is starting up
+/// (`created`) or has checked in (`running`). `orphaned` is deliberately
+/// excluded — the supervisor is gone, so the child cannot make progress and
+/// only its cleanup remains.
+fn child_is_live(session: &Session) -> bool {
+    matches!(session.status.as_str(), "created" | "running")
+}
+
+/// Archive the finished child sessions of a just-archived launcher, reporting
+/// each child that outlives it instead. Runs under the caller's lifecycle
+/// lock: every child goes through [`archive_locked`], so its own finished
+/// children cascade the same way and a completed subtree is torn down
+/// together. A failure or refusal on one child never undoes the parent's
+/// archive — it becomes a warning the caller surfaces.
+async fn archive_children(st: &AppState, parent_session_id: &str) -> Vec<String> {
+    let children = match session_mod::list_children(&st.db, parent_session_id).await {
+        Ok(children) => children,
+        Err(error) => {
+            tracing::warn!(
+                parent = %parent_session_id,
+                %error,
+                "could not list child sessions while cascading archive"
+            );
+            return vec![format!("could not list child sessions: {error}")];
+        }
+    };
+    let mut warnings = Vec::new();
+    for child in children {
+        if child_is_live(&child) {
+            warnings.push(format!(
+                "child session {} is {} — left it alone; archive it separately",
+                child.id, child.status
+            ));
+            continue;
+        }
+        let Some(branch) = (match branch_mod::get(&st.db, &child.branch_id).await {
+            Ok(branch) => branch,
+            Err(error) => {
+                warnings.push(format!(
+                    "could not archive child session {}: {error}",
+                    child.id
+                ));
+                continue;
+            }
+        }) else {
+            tracing::warn!(
+                session = %child.id,
+                "child session had no branch while cascading archive"
+            );
+            continue;
+        };
+        // The cascade is an automatic archive from the child's point of view,
+        // so its own opt-out still applies; manual archive remains available.
+        match tags::auto_archive_disabled(&st.db, &branch.id).await {
+            Ok(true) => {
+                warnings.push(format!(
+                    "child session {} opted out of automatic archive — left it alone; archive it separately",
+                    child.id
+                ));
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warnings.push(format!(
+                    "could not archive child session {}: {error}",
+                    child.id
+                ));
+                continue;
+            }
+        }
+        // Boxed: archive_children recurses back through archive_locked for a
+        // child's own children, and the indirection bounds the future's size.
+        match Box::pin(archive_locked(st, &child, &branch)).await {
+            Ok(child_warnings) => warnings.extend(
+                child_warnings
+                    .into_iter()
+                    .map(|warning| format!("child session {}: {warning}", child.id)),
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    session = %child.id,
+                    %error,
+                    "could not archive child session while cascading"
+                );
+                warnings.push(format!(
+                    "could not archive child session {}: {error}",
+                    child.id
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 /// Finish every lifecycle transition whose owner can no longer finish it.

@@ -1,6 +1,8 @@
 //! Archiving a session tears down its terminal session and worktree but — unlike
 //! delete — keeps the session row (marked `archived`), the git branch, and the
-//! weaver history, and clears the attention tag.
+//! weaver history, and clears the attention tag. The teardown cascades to the
+//! launcher's finished child sessions; a child that is still running (or that
+//! opted out of automatic archive) survives and is reported as a warning.
 
 use std::path::Path;
 use std::time::Duration;
@@ -308,4 +310,163 @@ async fn archive_keeps_branch_and_history() {
         .post("/api/sessions/delete", json!({ "session": arch_id }))
         .await
         .unwrap();
+}
+
+/// Archiving a launcher cascades to the children it delegated to: finished,
+/// failed, and orphaned children are torn down with it — and a finished
+/// child's own finished children follow — while a child that is still running,
+/// and one carrying the automatic-archive opt-out, survive and are reported
+/// as warnings instead.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_cascades_to_finished_children_and_warns_about_the_survivors() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let parent = client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "delegate the work",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": "launcher",
+            }),
+        )
+        .await
+        .unwrap();
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    let parent_branch = parent["branch"]["id"].as_str().unwrap().to_string();
+
+    let launch_child = |name: &str, parent_branch: &str| {
+        let goal = format!("delegated {name} work");
+        client.post(
+            "/api/sessions/launch",
+            json!({
+                "goal": goal,
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": name,
+                "parent_branch": parent_branch,
+            }),
+        )
+    };
+
+    let finished = launch_child("finished", &parent_branch).await.unwrap();
+    let finished_id = finished["id"].as_str().unwrap().to_string();
+    let finished_branch = finished["branch"]["id"].as_str().unwrap().to_string();
+
+    // Launched while its parent branch is still active, so the grandchild's
+    // provenance points at the finished child's session.
+    let grandchild = launch_child("grandchild", &finished_branch).await.unwrap();
+    let grandchild_id = grandchild["id"].as_str().unwrap().to_string();
+
+    let failed = launch_child("failed", &parent_branch).await.unwrap();
+    let failed_id = failed["id"].as_str().unwrap().to_string();
+    let lost = launch_child("lost", &parent_branch).await.unwrap();
+    let lost_id = lost["id"].as_str().unwrap().to_string();
+    let busy = launch_child("busy", &parent_branch).await.unwrap();
+    let busy_id = busy["id"].as_str().unwrap().to_string();
+    let optout = launch_child("optout", &parent_branch).await.unwrap();
+    let optout_id = optout["id"].as_str().unwrap().to_string();
+
+    for (id, status) in [
+        (&finished_id, "done"),
+        (&grandchild_id, "done"),
+        (&failed_id, "error"),
+        (&lost_id, "orphaned"),
+        (&busy_id, "running"),
+        (&optout_id, "done"),
+    ] {
+        loom::session::set_status(&ts.state.db, id, status)
+            .await
+            .unwrap();
+    }
+
+    // The per-session opt-out must keep an automatic cascade away from the
+    // tagged child; archiving it by hand remains available.
+    client
+        .post(
+            "/api/sessions/tags/set",
+            json!({
+                "key": "auto-archive",
+                "value": "disabled",
+                "by": "manual",
+                "session": optout_id,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let res = client
+        .post("/api/sessions/archive", json!({ "session": parent_id }))
+        .await
+        .unwrap();
+    assert_eq!(res["archived"], true);
+
+    let warnings: Vec<String> = res["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains(&busy_id) && w.contains("is running")),
+        "a running child is reported, not archived: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains(&optout_id) && w.contains("opted out")),
+        "the auto-archive opt-out child is reported, not archived: {warnings:?}"
+    );
+    for archived_id in [&finished_id, &grandchild_id, &failed_id, &lost_id] {
+        assert!(
+            warnings.iter().all(|w| !w.contains(archived_id.as_str())),
+            "an archived child ({archived_id}) must not be reported as a survivor: {warnings:?}"
+        );
+    }
+
+    for id in [&finished_id, &grandchild_id, &failed_id, &lost_id] {
+        let row = loom::session::get(&ts.state.db, id).await.unwrap().unwrap();
+        assert_eq!(
+            row.status, "archived",
+            "child {id} cascaded with its launcher"
+        );
+        assert!(
+            !Path::new(&row.work_dir).exists(),
+            "child {id} had its worktree removed"
+        );
+    }
+    let busy_row = loom::session::get(&ts.state.db, &busy_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(busy_row.status, "running", "a running child keeps running");
+    assert!(
+        Path::new(&busy_row.work_dir).exists(),
+        "a running child keeps its worktree"
+    );
+    let optout_row = loom::session::get(&ts.state.db, &optout_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        optout_row.status, "done",
+        "the opted-out child is untouched by the cascade"
+    );
+    assert!(
+        Path::new(&optout_row.work_dir).exists(),
+        "the opted-out child keeps its worktree"
+    );
+    let optout_view = client
+        .post("/api/sessions/get", json!({ "session": optout_id }))
+        .await
+        .unwrap();
+    assert!(
+        branch_tag(&optout_view, "auto-archive").is_some(),
+        "the surviving child keeps its opt-out tag"
+    );
 }
