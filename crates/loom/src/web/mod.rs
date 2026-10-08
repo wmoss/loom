@@ -498,6 +498,7 @@ pub(crate) async fn session_summary_view(
         created_by: session.created_by.clone(),
         origin: session.origin.clone(),
         class: session.class.clone(),
+        runner: session.runner.clone(),
         tracking_issue: session.tracking_issue_id,
         profile: session.profile.clone(),
         usage,

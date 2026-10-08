@@ -495,6 +495,15 @@ async fn create_inner(
             "unknown runner '{runner}' (expected 'local')"
         )));
     }
+    // Local placement runs the session beside the loom server with no isolation
+    // — the operator trusts a deployment's launchers with that access by
+    // opting in, mirroring how the operator scratch shell is admin-only.
+    if runner == "local" && !config::get_bool(&st.db, "session.local_runner", false).await {
+        return Err(ProvisionError::invalid(
+            "runner 'local' requires the `session.local_runner` setting — it runs the \
+             session beside the loom server with no container isolation",
+        ));
+    }
     let selected_profile_name = match selection.profile.trim() {
         "" => crate::profile::DEFAULT_PROFILE,
         name => name,

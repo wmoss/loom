@@ -142,9 +142,14 @@ pub async fn auto_archive(
         );
         return Ok(None);
     }
-    archive_locked(st, &current_session, &current_branch)
-        .await
-        .map(Some)
+    archive_locked(
+        st,
+        &current_session,
+        &current_branch,
+        std::time::Instant::now() + CASCADE_DEADLINE,
+    )
+    .await
+    .map(Some)
 }
 
 /// Manual archive entry point. Refresh after acquiring the lifecycle lock so a
@@ -164,7 +169,13 @@ pub async fn archive(st: &AppState, session: &Session, _branch: &Branch) -> Resu
             else {
                 return Err(anyhow!("session not found"));
             };
-            archive_locked(&st, &current_session, &current_branch).await
+            archive_locked(
+                &st,
+                &current_session,
+                &current_branch,
+                std::time::Instant::now() + CASCADE_DEADLINE,
+            )
+            .await
         }
         .await;
         let _ = result_tx.send(result);
@@ -365,6 +376,7 @@ pub async fn archive_locked(
     st: &AppState,
     session: &Session,
     branch: &Branch,
+    cascade_deadline: std::time::Instant,
 ) -> Result<Vec<String>> {
     tracing::info!(session = %session.id, branch = %branch.id, "archiving session");
     // A person archiving a session is asking for it to go away; an abandoned
@@ -433,7 +445,7 @@ pub async fn archive_locked(
         .ok();
         // The launcher going away takes its finished delegates with it. Every
         // child that outlives the archive is reported, never hidden.
-        warnings.extend(archive_children(st, &session.id).await);
+        warnings.extend(archive_children(st, &session.id, cascade_deadline).await);
         if warnings.is_empty() {
             tracing::info!(session = %session.id, branch = %branch.id, "session archived");
         } else {
@@ -468,13 +480,27 @@ fn child_is_live(session: &Session) -> bool {
     matches!(session.status.as_str(), "created" | "running")
 }
 
+/// One teardown budget for a whole archive cascade, shared across every
+/// descendant. The caller holds the process-global lifecycle lock, and each
+/// child alone can consume [`TEARDOWN_DEADLINE`], so without a shared bound a
+/// launcher with many finished children would serialize every adopt, resume,
+/// and archive fleet-wide. The budget is only checked between children, so a
+/// child is never cancelled mid-teardown.
+const CASCADE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Archive the finished child sessions of a just-archived launcher, reporting
 /// each child that outlives it instead. Runs under the caller's lifecycle
 /// lock: every child goes through [`archive_locked`], so its own finished
 /// children cascade the same way and a completed subtree is torn down
-/// together. A failure or refusal on one child never undoes the parent's
-/// archive — it becomes a warning the caller surfaces.
-async fn archive_children(st: &AppState, parent_session_id: &str) -> Vec<String> {
+/// together — including the descendants of a child archived earlier, whose
+/// link is walked through rather than re-archived. A failure or refusal on
+/// one child never undoes the parent's archive — it becomes a warning the
+/// caller surfaces.
+async fn archive_children(
+    st: &AppState,
+    parent_session_id: &str,
+    cascade_deadline: std::time::Instant,
+) -> Vec<String> {
     let children = match session_mod::list_children(&st.db, parent_session_id).await {
         Ok(children) => children,
         Err(error) => {
@@ -487,8 +513,22 @@ async fn archive_children(st: &AppState, parent_session_id: &str) -> Vec<String>
         }
     };
     let mut warnings = Vec::new();
-    for child in children {
-        if child_is_live(&child) {
+    for (index, child) in children.iter().enumerate() {
+        if std::time::Instant::now() >= cascade_deadline {
+            warnings.push(format!(
+                "cascade exceeded {}s with {} child session(s) left unexamined — archive them separately",
+                CASCADE_DEADLINE.as_secs(),
+                children.len() - index
+            ));
+            break;
+        }
+        if child.status == "archived" {
+            // Already torn down, but its own descendants were never reached
+            // through it; walk through the link without re-archiving.
+            warnings.extend(Box::pin(archive_children(st, &child.id, cascade_deadline)).await);
+            continue;
+        }
+        if child_is_live(child) {
             warnings.push(format!(
                 "child session {} is {} — left it alone; archive it separately",
                 child.id, child.status
@@ -509,6 +549,10 @@ async fn archive_children(st: &AppState, parent_session_id: &str) -> Vec<String>
                 session = %child.id,
                 "child session had no branch while cascading archive"
             );
+            warnings.push(format!(
+                "child session {} has no branch — left it alone; archive or remove it separately",
+                child.id
+            ));
             continue;
         };
         // The cascade is an automatic archive from the child's point of view,
@@ -532,7 +576,7 @@ async fn archive_children(st: &AppState, parent_session_id: &str) -> Vec<String>
         }
         // Boxed: archive_children recurses back through archive_locked for a
         // child's own children, and the indirection bounds the future's size.
-        match Box::pin(archive_locked(st, &child, &branch)).await {
+        match Box::pin(archive_locked(st, child, &branch, cascade_deadline)).await {
             Ok(child_warnings) => warnings.extend(
                 child_warnings
                     .into_iter()

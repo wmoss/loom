@@ -316,7 +316,8 @@ pub struct LaunchOpts {
     /// Run this session's supervisor directly beside the loom server process
     /// instead of the deployment's configured runner — no container isolation
     /// and no memory cgroup, so only for a session you trust (a code-review
-    /// subagent). Omit to use the configured runner.
+    /// subagent). Requires the `session.local_runner` setting. Omit to use
+    /// the configured runner.
     #[arg(long)]
     runner: Option<String>,
 }

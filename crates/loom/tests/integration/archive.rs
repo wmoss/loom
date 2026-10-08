@@ -370,6 +370,14 @@ async fn archive_cascades_to_finished_children_and_warns_about_the_survivors() {
     let optout = launch_child("optout", &parent_branch).await.unwrap();
     let optout_id = optout["id"].as_str().unwrap().to_string();
 
+    // An already-archived mid-link: archiving the launcher must still walk
+    // through it to reach the finished child it left behind.
+    let midlink = launch_child("midlink", &parent_branch).await.unwrap();
+    let midlink_id = midlink["id"].as_str().unwrap().to_string();
+    let midlink_branch = midlink["branch"]["id"].as_str().unwrap().to_string();
+    let under_mid = launch_child("under-mid", &midlink_branch).await.unwrap();
+    let under_mid_id = under_mid["id"].as_str().unwrap().to_string();
+
     for (id, status) in [
         (&finished_id, "done"),
         (&grandchild_id, "done"),
@@ -377,6 +385,8 @@ async fn archive_cascades_to_finished_children_and_warns_about_the_survivors() {
         (&lost_id, "orphaned"),
         (&busy_id, "running"),
         (&optout_id, "done"),
+        (&under_mid_id, "done"),
+        (&midlink_id, "archived"),
     ] {
         loom::session::set_status(&ts.state.db, id, status)
             .await
@@ -422,14 +432,26 @@ async fn archive_cascades_to_finished_children_and_warns_about_the_survivors() {
             .any(|w| w.contains(&optout_id) && w.contains("opted out")),
         "the auto-archive opt-out child is reported, not archived: {warnings:?}"
     );
-    for archived_id in [&finished_id, &grandchild_id, &failed_id, &lost_id] {
+    for archived_id in [
+        &finished_id,
+        &grandchild_id,
+        &failed_id,
+        &lost_id,
+        &under_mid_id,
+    ] {
         assert!(
             warnings.iter().all(|w| !w.contains(archived_id.as_str())),
             "an archived child ({archived_id}) must not be reported as a survivor: {warnings:?}"
         );
     }
 
-    for id in [&finished_id, &grandchild_id, &failed_id, &lost_id] {
+    for id in [
+        &finished_id,
+        &grandchild_id,
+        &failed_id,
+        &lost_id,
+        &under_mid_id,
+    ] {
         let row = loom::session::get(&ts.state.db, id).await.unwrap().unwrap();
         assert_eq!(
             row.status, "archived",

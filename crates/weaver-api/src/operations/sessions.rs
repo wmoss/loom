@@ -601,8 +601,9 @@ pub mod launch {
         /// directly beside the loom server process — no container isolation and
         /// no memory cgroup — instead of the deployment's configured runner.
         /// The cheap placement for a trusted helper such as a code-review
-        /// subagent. Blank/absent uses the configured runner (anything other
-        /// than `"local"` is rejected).
+        /// subagent. Requires the `session.local_runner` setting; blank/absent
+        /// uses the configured runner (anything other than `"local"` is
+        /// rejected).
         pub runner: Option<String>,
         /// Named launch profile; blank selects `default`.
         pub profile: Option<String>,

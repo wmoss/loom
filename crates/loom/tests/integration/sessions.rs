@@ -1230,13 +1230,44 @@ async fn session_records_its_launcher_as_tree_parent() {
         .unwrap();
 }
 
-/// The `runner` launch override is stamped on the session row and echoed in
-/// its view; an unknown value is rejected before anything is provisioned.
+/// The `runner` launch override is stamped on the session row and echoed in its
+/// view and the fleet summary; it requires the operator's `session.local_runner`
+/// opt-in, and an unknown value is rejected before anything is provisioned.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launch_runner_override_is_stamped_and_validated() {
     let ts = TestServer::start().await;
     let client = &ts.client;
+
+    // Off by default: local placement runs beside the loom server with no
+    // isolation, so it is refused until the operator opts the deployment in.
+    let gated = client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "too soon",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": "too-soon",
+                "runner": "local",
+            }),
+        )
+        .await;
+    let error = gated
+        .expect_err("runner local is refused without the operator opt-in")
+        .to_string();
+    assert!(
+        error.contains("session.local_runner") && error.contains("400"),
+        "the refusal names the setting: {error}"
+    );
+
+    client
+        .post(
+            "/api/settings/patch",
+            json!({ "changes": { "session.local_runner": "true" } }),
+        )
+        .await
+        .unwrap();
 
     let local = client
         .post(
@@ -1267,6 +1298,18 @@ async fn launch_runner_override_is_stamped_and_validated() {
     assert!(
         loom::backend::has_session(&row.term_session).await,
         "the locally placed session is live"
+    );
+    let summary = client
+        .post("/api/sessions/summary/list", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        summary
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == local_id.as_str() && s["runner"] == "local"),
+        "the fleet summary exposes the placement override"
     );
 
     let configured = client

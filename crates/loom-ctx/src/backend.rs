@@ -287,6 +287,52 @@ pub async fn new_relay_session(
     cwd: &std::path::Path,
     memory_max_gb: u64,
 ) -> Result<()> {
+    new_relay_session_placed(
+        name,
+        script,
+        env,
+        env_clear,
+        cwd,
+        memory_max_gb,
+        SessionPlacement::Configured,
+    )
+    .await
+}
+
+/// Create a detached relay session directly beside the Loom server process —
+/// the [`new_relay_session`] placement analogue of [`new_session_local`], for a
+/// `runner: "local"` ACP session.
+pub async fn new_relay_session_local(
+    name: &str,
+    script: &str,
+    env: &[(&str, &str)],
+    env_clear: bool,
+    cwd: &std::path::Path,
+) -> Result<()> {
+    new_relay_session_placed(
+        name,
+        script,
+        env,
+        env_clear,
+        cwd,
+        0,
+        SessionPlacement::Local,
+    )
+    .await
+}
+
+/// The one relay spawn body, placed by the caller: the configured runner honors
+/// the per-session memory ceiling, while the host-side placements ignore it
+/// (no cgroup) exactly as the PTY path does.
+async fn new_relay_session_placed(
+    name: &str,
+    script: &str,
+    env: &[(&str, &str)],
+    env_clear: bool,
+    cwd: &std::path::Path,
+    memory_max_gb: u64,
+    placement: SessionPlacement,
+) -> Result<()> {
     tracing::info!(session = %name, cwd = %cwd.display(), memory_max_gb, "spawning relay session");
     let supervisor_bin = tapestry_bin();
     let options = tapestry::LaunchOptions {
@@ -301,44 +347,13 @@ pub async fn new_relay_session(
         segment_max_bytes: None,
         supervisor_bin: supervisor_bin.as_deref(),
     };
-    let result = runner::spawn(&options, memory_max_gb).await;
+    let result = match placement {
+        SessionPlacement::Configured => runner::spawn(&options, memory_max_gb).await,
+        SessionPlacement::Host | SessionPlacement::Local => runner::spawn_on_host(&options).await,
+    };
     match &result {
         Ok(()) => tracing::info!(session = %name, "relay session spawned"),
         Err(e) => tracing::warn!(session = %name, error = %e, "failed to spawn relay session"),
-    }
-    result
-}
-
-/// Create a detached relay session directly beside the Loom server process —
-/// the [`new_relay_session`] placement analogue of [`new_session_local`], for a
-/// `runner: "local"` ACP session.
-pub async fn new_relay_session_local(
-    name: &str,
-    script: &str,
-    env: &[(&str, &str)],
-    env_clear: bool,
-    cwd: &std::path::Path,
-) -> Result<()> {
-    tracing::info!(session = %name, cwd = %cwd.display(), "spawning local relay session");
-    let supervisor_bin = tapestry_bin();
-    let options = tapestry::LaunchOptions {
-        name,
-        cwd,
-        script,
-        env,
-        env_clear,
-        cols: 80,
-        rows: 24,
-        mode: tapestry::Mode::Relay,
-        segment_max_bytes: None,
-        supervisor_bin: supervisor_bin.as_deref(),
-    };
-    let result = runner::spawn_on_host(&options).await;
-    match &result {
-        Ok(()) => tracing::info!(session = %name, "local relay session spawned"),
-        Err(e) => {
-            tracing::warn!(session = %name, error = %e, "failed to spawn local relay session")
-        }
     }
     result
 }

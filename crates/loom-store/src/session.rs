@@ -673,12 +673,13 @@ pub async fn active_for_branch(db: &Db, branch_id: &str) -> Result<Option<Sessio
     Ok(row)
 }
 
-/// The un-archived child sessions launched by `parent_session_id`, oldest
-/// first. Ancestry is a tree — a session is only ever born with its parent, so
-/// one level is exact; whole-subtree walks go through each child recursively.
+/// The child sessions launched by `parent_session_id`, oldest first — archived
+/// rows included, so a subtree walk can traverse an already-archived link to
+/// reach descendants it never cascaded to. Ancestry is a tree — a session is
+/// only ever born with its parent, never re-parented — so one level is exact;
+/// whole-subtree walks go through each child recursively.
 pub async fn list_children(db: &Db, parent_session_id: &str) -> Result<Vec<Session>> {
-    let query =
-        select_sessions("WHERE parent_session_id = ? AND status != 'archived' ORDER BY created_at");
+    let query = select_sessions("WHERE parent_session_id = ? ORDER BY created_at");
     let rows = sqlx::query_as::<_, Session>(&query)
         .bind(parent_session_id)
         .fetch_all(db)
@@ -2292,7 +2293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_children_returns_only_the_unarchived_descendants_of_one_launcher() {
+    async fn list_children_returns_one_launchers_children_archived_links_included() {
         let db = crate::db::connect_in_memory().await.unwrap();
         let launcher_branch = branch_id(&db, "weaver/launcher").await;
         insert(&db, &new_session("launcher", &launcher_branch, None))
@@ -2324,7 +2325,8 @@ mod tests {
             "done",
         )
         .await;
-        // An already-archived child has nothing left to cascade.
+        // An already-archived child stays listed: a subtree walk traverses the
+        // link to reach descendants it never cascaded to.
         insert_child_of(
             &db,
             "gone",
@@ -2338,11 +2340,12 @@ mod tests {
         let ids: Vec<&str> = children.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["first", "second"],
-            "one launcher's un-archived children, oldest first — no grandchildren, no archived rows"
+            vec!["first", "second", "gone"],
+            "one launcher's children oldest first — no grandchildren, archived links included"
         );
         assert_eq!(children[0].status, "done");
         assert_eq!(children[1].status, "running");
+        assert_eq!(children[2].status, "archived");
         assert!(
             list_children(&db, "stranger").await.unwrap().is_empty(),
             "a launcher with no children lists nothing"

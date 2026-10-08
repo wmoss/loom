@@ -621,6 +621,22 @@ pub const REGISTRY: &[SettingSpec] = &[
         options: &[],
     },
     SettingSpec {
+        key: "session.local_runner",
+        label: "Allow local session placement",
+        description: "When enabled, `loom sessions launch --runner local` may \
+            run a session's supervisor directly beside the loom server process \
+            instead of the configured runner — no container isolation and no \
+            memory cgroup, so the session must be trusted (a code-review \
+            subagent). Off by default: a locally placed session shares the \
+            control plane's filesystem, including the shared database and \
+            session credentials. Enabling is the operator's decision to trust \
+            every launcher on this deployment with that access.",
+        kind: SettingKind::Bool,
+        default: "false",
+        group: "Sessions",
+        options: &[],
+    },
+    SettingSpec {
         key: "metadata.title_generation",
         label: "Generate task labels",
         description: "Asynchronously replace eligible deterministic task labels through a \
