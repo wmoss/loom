@@ -1444,6 +1444,56 @@ pub async fn take_pending_prompt(db: &Db, id: &str) -> Result<Option<String>> {
     Ok(Some(pending))
 }
 
+/// Remove `paragraph` from the durable prompt queue while it is still queued.
+/// Returns whether the queue changed; a missing paragraph means the queue was
+/// already drained, so a late retraction is a harmless no-op rather than an
+/// error. Only whole paragraphs match — text that merely contains `paragraph`
+/// stays queued.
+///
+/// Reached through `channels::mark_read`, which retracts a child-result notice
+/// once the reading session has consumed the result it points at.
+pub(crate) async fn retract_pending_prompt_paragraph_tx(
+    tx: &mut SqliteConnection,
+    id: &str,
+    paragraph: &str,
+) -> Result<bool> {
+    let pending: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT pending_prompt FROM sessions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+    let Some(pending) = pending.filter(|text| !text.trim().is_empty()) else {
+        return Ok(false);
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = false;
+    for part in pending.split("\n\n") {
+        if part.trim() == paragraph.trim() {
+            removed = true;
+        } else {
+            kept.push(part);
+        }
+    }
+    if !removed {
+        return Ok(false);
+    }
+    let combined = kept.join("\n\n");
+    let result = sqlx::query(
+        "UPDATE sessions SET pending_prompt = ?
+         WHERE id = ? AND pending_prompt = ?",
+    )
+    .bind(&combined)
+    .bind(id)
+    .bind(&pending)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        bail!("queued prompt changed while a notice was being retracted");
+    }
+    Ok(true)
+}
+
 pub async fn delete(db: &Db, id: &str) -> Result<Option<i64>> {
     let mut tx = weaver_core::db::begin_immediate(db).await?;
     let had_placement: bool = sqlx::query_scalar(
@@ -2205,5 +2255,83 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(taken.as_deref(), Some("send after stop"));
+    }
+
+    #[tokio::test]
+    async fn retracting_a_paragraph_removes_only_that_paragraph() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let branch = branch_id(&db, "weaver/retract").await;
+        insert(&db, &new_session("retract", &branch, None))
+            .await
+            .unwrap();
+        let notice = "Child session c posted a result. Read it with `loom channels read`.";
+        append_pending_prompt(&db, "retract", "say:keep one")
+            .await
+            .unwrap();
+        append_pending_prompt(&db, "retract", notice).await.unwrap();
+        append_pending_prompt(&db, "retract", "say:keep two")
+            .await
+            .unwrap();
+
+        let mut tx = weaver_core::db::begin_immediate(&db).await.unwrap();
+        assert!(
+            retract_pending_prompt_paragraph_tx(&mut tx, "retract", notice)
+                .await
+                .unwrap(),
+            "the queued notice paragraph is removed"
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(
+            read_pending_prompt(&db, "retract").await.unwrap(),
+            "say:keep one\n\nsay:keep two",
+            "the surrounding queued prompts survive"
+        );
+
+        let mut tx = weaver_core::db::begin_immediate(&db).await.unwrap();
+        assert!(
+            !retract_pending_prompt_paragraph_tx(&mut tx, "retract", notice)
+                .await
+                .unwrap(),
+            "a second retraction is a no-op"
+        );
+        tx.commit().await.unwrap();
+
+        // A paragraph that merely contains the notice text stays queued: only
+        // an exact whole-paragraph match retracts.
+        let containing = format!("prefix {notice} suffix");
+        append_pending_prompt(&db, "retract", &containing)
+            .await
+            .unwrap();
+        let mut tx = weaver_core::db::begin_immediate(&db).await.unwrap();
+        assert!(
+            !retract_pending_prompt_paragraph_tx(&mut tx, "retract", notice)
+                .await
+                .unwrap(),
+            "text containing the notice is not the notice paragraph"
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(
+            read_pending_prompt(&db, "retract").await.unwrap(),
+            format!("say:keep one\n\nsay:keep two\n\n{containing}")
+        );
+    }
+
+    #[tokio::test]
+    async fn retracting_from_an_empty_queue_is_a_no_op() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let branch = branch_id(&db, "weaver/retract-empty").await;
+        insert(&db, &new_session("retract-empty", &branch, None))
+            .await
+            .unwrap();
+
+        let mut tx = weaver_core::db::begin_immediate(&db).await.unwrap();
+        assert!(
+            !retract_pending_prompt_paragraph_tx(&mut tx, "retract-empty", "any text")
+                .await
+                .unwrap(),
+            "an empty queue has nothing to retract"
+        );
+        tx.commit().await.unwrap();
+        assert_eq!(read_pending_prompt(&db, "retract-empty").await.unwrap(), "");
     }
 }

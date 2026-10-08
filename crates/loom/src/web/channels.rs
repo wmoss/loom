@@ -226,16 +226,19 @@ async fn notify_parent_of_result(
     if parent_channel.state != channels::OPEN_STATE {
         return Ok(());
     }
+    // The result id keeps notice bodies unique: retraction strips queued
+    // notices by exact body text, so two results from one child must never
+    // share identical notice paragraphs.
     let body = format!(
-        "Child session {} posted a result. Read it with `loom channels read --channel {} --kinds result`.",
-        author.id, result.channel_id
+        "Child session {} posted result {}. Read it with `loom channels read --channel {} --kinds result`.",
+        author.id, result.id, result.channel_id
     );
     let payload = json!({
         "child_session_id": author.id,
         "source_channel_id": result.channel_id,
         "source_message_id": result.id,
     });
-    let idempotency_key = format!("child-result:{}", result.id);
+    let idempotency_key = channels::child_result_notice_key(&result.id);
     let urgency = Urgency::parse(&result.urgency).expect("stored channel urgency is valid");
     // Appending as the child would also subscribe it to the parent's channel.
     // The server owns this linked notification; its payload preserves the child.
@@ -695,7 +698,8 @@ pub(super) async fn set_channel_read_marker_operation(
 /// the scan cursor to the channel's latest known message, validates `timeout`
 /// to the `1..=3600` second window, then polls once a second until a match
 /// lands or the deadline passes. Returns exactly one response after the wait,
-/// never a stream.
+/// never a stream. The returned message is consumed — the caller's read
+/// marker advances through it, like the agent CLI's wait loop.
 pub(super) async fn wait_for_channel_message_operation(
     context: OperationContext,
     input: ops::wait::Input,
@@ -737,6 +741,11 @@ pub(super) async fn wait_for_channel_message_operation(
                 .is_none_or(|kind| message.kind == kind)
                 && (!input.urgent || matches!(message.urgency.as_str(), "attention" | "blocked"))
         }) {
+            // A returned message is consumed, matching the agent CLI's wait,
+            // which acknowledges everything it scans: advance the caller's
+            // read marker so unread state — and any queued child-result notice
+            // for a result the caller just received — follows.
+            channels::mark_read(&st.db, &channel_id, &subject, Some(message.seq)).await?;
             return Ok(message);
         }
         if tokio::time::Instant::now() >= deadline {
