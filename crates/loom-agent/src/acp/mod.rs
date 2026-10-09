@@ -132,6 +132,10 @@ pub struct AcpLaunch {
     /// Maximum time to wait for one ACP setup response. Kept on the launch so
     /// integration tests can exercise a silent adapter without a 30-second wait.
     pub setup_timeout: Duration,
+    /// Placement override stamped on the session: run the relay supervisor
+    /// directly beside the loom server process instead of the configured
+    /// runner.
+    pub local_runner: bool,
 }
 
 const ONE_SHOT_INPUT_MAX_BYTES: usize = 128 * 1024;
@@ -237,16 +241,27 @@ pub async fn validate_launch(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    crate::backend::new_relay_session(
-        &relay_name,
-        &launch.adapter_cmd,
-        &env,
-        launch.env_clear,
-        &launch.cwd,
-        crate::backend::memory_max_gb(db).await,
-    )
-    .await
-    .map_err(|error| LaunchValidationError::Relay {
+    let spawn = if launch.local_runner {
+        crate::backend::new_relay_session_local(
+            &relay_name,
+            &launch.adapter_cmd,
+            &env,
+            launch.env_clear,
+            &launch.cwd,
+        )
+        .await
+    } else {
+        crate::backend::new_relay_session(
+            &relay_name,
+            &launch.adapter_cmd,
+            &env,
+            launch.env_clear,
+            &launch.cwd,
+            crate::backend::memory_max_gb(db).await,
+        )
+        .await
+    };
+    spawn.map_err(|error| LaunchValidationError::Relay {
         error: error.context("starting ACP validation relay"),
         validation: None,
     })?;
@@ -297,15 +312,27 @@ pub async fn prompt_once(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    crate::backend::new_relay_session(
-        &relay_name,
-        &launch.adapter_cmd,
-        &env,
-        launch.env_clear,
-        &launch.cwd,
-        crate::backend::memory_max_gb(db).await,
-    )
-    .await?;
+    let spawn = if launch.local_runner {
+        crate::backend::new_relay_session_local(
+            &relay_name,
+            &launch.adapter_cmd,
+            &env,
+            launch.env_clear,
+            &launch.cwd,
+        )
+        .await
+    } else {
+        crate::backend::new_relay_session(
+            &relay_name,
+            &launch.adapter_cmd,
+            &env,
+            launch.env_clear,
+            &launch.cwd,
+            crate::backend::memory_max_gb(db).await,
+        )
+        .await
+    };
+    spawn?;
 
     let operation = async {
         let stream = crate::backend::subscribe_relay(&relay_name, 0).await?;
@@ -1272,15 +1299,27 @@ async fn start_inner(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    crate::backend::new_relay_session(
-        &relay_name,
-        &launch.adapter_cmd,
-        &env,
-        launch.env_clear,
-        &launch.cwd,
-        crate::backend::memory_max_gb(&state.db).await,
-    )
-    .await?;
+    let spawn = if launch.local_runner {
+        crate::backend::new_relay_session_local(
+            &relay_name,
+            &launch.adapter_cmd,
+            &env,
+            launch.env_clear,
+            &launch.cwd,
+        )
+        .await
+    } else {
+        crate::backend::new_relay_session(
+            &relay_name,
+            &launch.adapter_cmd,
+            &env,
+            launch.env_clear,
+            &launch.cwd,
+            crate::backend::memory_max_gb(&state.db).await,
+        )
+        .await
+    };
+    spawn?;
     let (events_tx, _) = broadcast::channel(256);
     // From this point onward the detached relay exists. Any failure must tear it
     // down and clear partially-persisted provider state before returning, or the

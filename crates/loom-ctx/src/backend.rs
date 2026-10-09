@@ -167,6 +167,33 @@ pub async fn new_session_on_host(
     new_session_with_placement(name, cwd, script, env, env_clear, 0, SessionPlacement::Host).await
 }
 
+/// Create a detached PTY session directly beside the Loom server process,
+/// bypassing the configured placement backend.
+///
+/// The `runner: "local"` launch option uses this escape hatch so a session
+/// explicitly trusted to forgo isolation (a code-review subagent) skips the
+/// container machinery entirely. Like [`new_session_on_host`], the session gets
+/// no memory cgroup; unlike it, this is an ordinary agent session, not an
+/// operator console.
+pub async fn new_session_local(
+    name: &str,
+    cwd: &std::path::Path,
+    script: &str,
+    env: &[(&str, &str)],
+    env_clear: bool,
+) -> Result<()> {
+    new_session_with_placement(
+        name,
+        cwd,
+        script,
+        env,
+        env_clear,
+        0,
+        SessionPlacement::Local,
+    )
+    .await
+}
+
 /// Ask `owner`'s Tapestry supervisor to launch a sibling PTY session.
 ///
 /// The sibling inherits the owner's complete materialized environment rather
@@ -204,6 +231,7 @@ pub async fn new_session_derived(
 enum SessionPlacement {
     Configured,
     Host,
+    Local,
 }
 
 async fn new_session_with_placement(
@@ -232,7 +260,7 @@ async fn new_session_with_placement(
     };
     let result = match placement {
         SessionPlacement::Configured => runner::spawn(&options, memory_max_gb).await,
-        SessionPlacement::Host => runner::spawn_on_host(&options).await,
+        SessionPlacement::Host | SessionPlacement::Local => runner::spawn_on_host(&options).await,
     };
     match &result {
         Ok(()) => tracing::info!(session = %name, "terminal session spawned"),
@@ -259,6 +287,52 @@ pub async fn new_relay_session(
     cwd: &std::path::Path,
     memory_max_gb: u64,
 ) -> Result<()> {
+    new_relay_session_placed(
+        name,
+        script,
+        env,
+        env_clear,
+        cwd,
+        memory_max_gb,
+        SessionPlacement::Configured,
+    )
+    .await
+}
+
+/// Create a detached relay session directly beside the Loom server process —
+/// the [`new_relay_session`] placement analogue of [`new_session_local`], for a
+/// `runner: "local"` ACP session.
+pub async fn new_relay_session_local(
+    name: &str,
+    script: &str,
+    env: &[(&str, &str)],
+    env_clear: bool,
+    cwd: &std::path::Path,
+) -> Result<()> {
+    new_relay_session_placed(
+        name,
+        script,
+        env,
+        env_clear,
+        cwd,
+        0,
+        SessionPlacement::Local,
+    )
+    .await
+}
+
+/// The one relay spawn body, placed by the caller: the configured runner honors
+/// the per-session memory ceiling, while the host-side placements ignore it
+/// (no cgroup) exactly as the PTY path does.
+async fn new_relay_session_placed(
+    name: &str,
+    script: &str,
+    env: &[(&str, &str)],
+    env_clear: bool,
+    cwd: &std::path::Path,
+    memory_max_gb: u64,
+    placement: SessionPlacement,
+) -> Result<()> {
     tracing::info!(session = %name, cwd = %cwd.display(), memory_max_gb, "spawning relay session");
     let supervisor_bin = tapestry_bin();
     let options = tapestry::LaunchOptions {
@@ -273,7 +347,10 @@ pub async fn new_relay_session(
         segment_max_bytes: None,
         supervisor_bin: supervisor_bin.as_deref(),
     };
-    let result = runner::spawn(&options, memory_max_gb).await;
+    let result = match placement {
+        SessionPlacement::Configured => runner::spawn(&options, memory_max_gb).await,
+        SessionPlacement::Host | SessionPlacement::Local => runner::spawn_on_host(&options).await,
+    };
     match &result {
         Ok(()) => tracing::info!(session = %name, "relay session spawned"),
         Err(e) => tracing::warn!(session = %name, error = %e, "failed to spawn relay session"),

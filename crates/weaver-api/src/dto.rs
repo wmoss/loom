@@ -218,6 +218,12 @@ pub struct SessionSummaryView {
     pub origin: String,
     #[serde(default = "default_class")]
     pub class: String,
+    /// Runtime placement override stamped once at create: `"local"` runs
+    /// this session's supervisor directly beside the loom server process
+    /// instead of the deployment's configured runner; blank means the
+    /// configured runner.
+    #[serde(default)]
+    pub runner: String,
     pub tracking_issue: Option<i64>,
     #[serde(default = "default_profile")]
     pub profile: String,
@@ -294,6 +300,12 @@ pub struct SessionView {
     /// and older rows read as `"terminal"`.
     #[serde(default = "default_protocol")]
     pub protocol: String,
+    /// Runtime placement override stamped once at create: `"local"` runs
+    /// this session's supervisor directly beside the loom server process
+    /// instead of the deployment's configured runner; blank means the
+    /// configured runner.
+    #[serde(default)]
+    pub runner: String,
     /// The agent's own on-disk ACP session id for an `acp` session, or `null`.
     #[serde(default)]
     pub acp_session_id: Option<String>,
