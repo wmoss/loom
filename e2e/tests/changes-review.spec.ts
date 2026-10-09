@@ -1,5 +1,6 @@
 import { expect, test } from "../fixtures/weaver";
 import type { Locator } from "@playwright/test";
+import { execFileSync } from "child_process";
 import { writeFileSync } from "fs";
 import { join } from "path";
 
@@ -274,4 +275,87 @@ test("comments whose lines leave the view persist in the outdated section", asyn
   await toggle.click();
   await expect(toggle).toHaveAttribute("aria-expanded", "true");
   await expect(section).toContainText("This line fell off the end.");
+});
+
+test("mixed expand clicks never leave a dead hunk bar behind", async ({
+  page,
+  weaver,
+}) => {
+  const session = await weaver.seedSession({
+    goal: "review a big diff",
+    name: "expand-bars",
+  });
+  const git = (args: string[]) =>
+    execFileSync("git", ["-C", session.work_dir, ...args]);
+  // Base README with two far-apart edits: the commit's own diff carries a gap
+  // of ~104 collapsible lines between its hunks, enough for the up/down
+  // expand pair and the library's 40-line expansion step.
+  const base = Array.from({ length: 260 }, (_, index) => `line ${index + 1}`);
+  const work = [...base];
+  work[4] = "line 5 changed";
+  work[154] = "line 155 changed";
+  writeFileSync(join(session.work_dir, "README.md"), base.join("\n") + "\n");
+  git(["add", "-A"]);
+  git(["commit", "-m", "seed the readme"]);
+  writeFileSync(join(session.work_dir, "README.md"), work.join("\n") + "\n");
+  git(["add", "-A"]);
+  git(["commit", "-m", "touch two distant lines"]);
+
+  await page.goto(`${weaver.baseUrl}/s/${session.id}/commits`);
+  await page.getByTestId("commit-review-button").first().click();
+  await expect(page).toHaveURL(new RegExp(`rev=`));
+  const fileToggle = page.getByRole("button", { name: /README\.md/ });
+  const article = page.locator("article").filter({ has: fileToggle });
+
+  // Expand Down twice, then Expand Up, on the gap bar: the interleaving that
+  // strands a hunk-header row between contiguous lines with dead buttons.
+  const bar = article
+    .locator('tr[data-state="hunk"]')
+    .filter({ hasText: "@@ -152" });
+  await expect(bar).toHaveCount(1);
+  await bar.locator('button[title="Expand Down"]').click();
+  await bar.locator('button[title="Expand Down"]').click();
+  await bar.locator('button[title="Expand Up"]').click();
+
+  // Every remaining hunk bar must still guard genuinely hidden lines: none
+  // may sit between line numbers that are already contiguous.
+  await expect
+    .poll(async () => {
+      return article.evaluate((root) => {
+        const tables = root.querySelectorAll('table[data-mode="old"]');
+        let dead = 0;
+        tables.forEach((table) => {
+          [...table.querySelectorAll('tr[data-state="hunk"]')].forEach(
+            (row) => {
+              if (!row.querySelector("button")) return;
+              const around = (dir: 1 | -1) => {
+                let cur: Element | null = row;
+                while (
+                  (cur =
+                    dir === 1
+                      ? cur.nextElementSibling
+                      : cur.previousElementSibling)
+                ) {
+                  const line = cur.getAttribute("data-line") ?? "";
+                  if (/^\d+$/.test(line)) return Number(line);
+                }
+                return null;
+              };
+              const prev = around(-1);
+              const next = around(1);
+              if (prev != null && next != null && next === prev + 1) {
+                dead++;
+                console.log(
+                  "DEAD:",
+                  row.getAttribute("data-line"),
+                  JSON.stringify(row.textContent?.slice(0, 70)),
+                );
+              }
+            },
+          );
+        });
+        return dead;
+      });
+    })
+    .toBe(0);
 });
