@@ -107,6 +107,8 @@ export type {
   ReviewCommentDto as ReviewComment,
   ReviewDto as Review,
   ReviewSubjectDto as ReviewSubject,
+  SessionCommitDto as SessionCommit,
+  SessionCommitsDto as SessionCommits,
   RunView as AutomationRun,
   ScratchFileView as ScratchFile,
   ScratchLimitsView as ScratchLimits,

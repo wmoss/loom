@@ -199,7 +199,12 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
         .await
         .unwrap();
     assert_eq!(added.comments[0].subject_version, "1");
-    assert!(added.message.contains("\"prefix\":\"Alpha \""));
+    // The delivery prompt is compact: the anchor's location makes the cut,
+    // its surrounding context does not.
+    assert!(added
+        .message
+        .contains("1. \"beta\", block 1 (revision 1):\nExplain why this is safe."));
+    assert!(!added.message.contains("Alpha "));
 
     let session_token = loom::auth::create_session_token(
         &ts.state.db,
@@ -517,6 +522,7 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
         .client
         .invoke::<sessions::changes::Op>(&sessions::changes::Input {
             session: session.id.to_string(),
+            rev: None,
         })
         .await
         .unwrap();
@@ -946,4 +952,187 @@ async fn terminal_delivery_queues_offline_recovers_and_reports_real_failure() {
             .delivery_state,
         "failed"
     );
+}
+
+/// Drive Loom's built-in MCP server over stdio with a session credential,
+/// exactly the way the reviewed session's agent runtime does.
+async fn run_mcp_tool_calls(ts: &TestServer, token: &str, calls: &[Value]) -> Vec<Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .args(["mcp", "serve"])
+        .env("WEAVER_API", format!("http://{}", ts.addr))
+        .env("LOOM_TOKEN", token)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for call in calls {
+        stdin
+            .write_all(format!("{call}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+    drop(stdin);
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let mut values = Vec::new();
+    while let Some(line) = lines.next_line().await.unwrap() {
+        values.push(serde_json::from_str(&line).unwrap());
+    }
+    assert!(child.wait().await.unwrap().success());
+    values
+}
+
+/// The delivered prompt is compact — a comment contributes its one-line
+/// location, not its full anchor — while the durable review stays readable
+/// through the reviewed session's own MCP tool, complete anchors included.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_reads_full_review_detail_through_its_mcp_tool() {
+    let ts = TestServer::start().await;
+    let session = insert_api_session(&ts, "mcp-review-detail").await;
+    seed_artifact(&ts, &session).await;
+    let draft = draft_with_comment(&ts, &session, "Explain why this is safe.").await;
+    let submitted = ts
+        .client
+        .invoke::<reviews::submit::Op>(&reviews::submit::Input {
+            id: draft.id,
+            expected_revision: draft.draft_revision,
+            acknowledge_outdated: false,
+        })
+        .await
+        .unwrap();
+
+    assert!(submitted
+        .message
+        .contains("1. \"beta\", block 1 (revision 1):\nExplain why this is safe."));
+    assert!(!submitted.message.contains("Alpha "));
+
+    let token =
+        loom::auth::create_session_token(&ts.state.db, None, &session.id, &session.branch.id)
+            .await
+            .unwrap();
+    let responses = run_mcp_tool_calls(
+        &ts,
+        &token,
+        &[json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "review_list", "arguments": {
+                "subject_kind": "artifact", "subject_key": "design" } }
+        })],
+    )
+    .await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["result"]["isError"], false);
+    let listed = &responses[0]["result"]["structuredContent"]["items"];
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["id"], submitted.id);
+    assert_eq!(listed[0]["message"], submitted.message);
+    let anchor = &listed[0]["comments"][0]["anchor"];
+    assert_eq!(anchor["quote"], "beta");
+    assert_eq!(anchor["prefix"], "Alpha ");
+    assert_eq!(anchor["suffix"], " gamma");
+}
+
+/// A review scoped to one commit anchors and submits against that commit's
+/// own snapshot, not the branch's whole change-set.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_scoped_review_anchors_against_its_own_snapshot() {
+    let ts = TestServer::start().await;
+    let session = insert_api_session(&ts, "commit-scoped-review").await;
+    let repo = ts.repo_path();
+    let sh = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {:?} failed", args);
+    };
+    std::fs::write(repo.join("committed.txt"), "one\ntwo\nthree\n").unwrap();
+    sh(&["add", "-A"]);
+    sh(&["commit", "-m", "seed committed lines"]);
+    std::fs::write(repo.join("committed.txt"), "one\nTWO\nthree\n").unwrap();
+    sh(&["add", "-A"]);
+    sh(&["commit", "-m", "touch the second line"]);
+
+    // The commit-scoped snapshot the Code Review UI renders for this commit.
+    let snapshot = ts
+        .client
+        .invoke::<sessions::changes::Op>(&sessions::changes::Input {
+            session: session.id.clone(),
+            rev: Some("HEAD".to_string()),
+        })
+        .await
+        .unwrap();
+    let version = snapshot.version.clone().unwrap();
+    assert!(
+        version.starts_with("changes-commit-v1:"),
+        "a commit snapshot must carry a commit-scoped version, got {version}"
+    );
+
+    // Drafting against the commit snapshot is the flow that used to 409 with
+    // "change-set version moved" because the backend only knew the branch
+    // change-set.
+    let draft = ts
+        .client
+        .invoke::<reviews::create::Op>(&reviews::create::Input {
+            session: session.id.to_string(),
+            subject_kind: ReviewSubjectKindDto::Changes,
+            subject_key: "changes".to_string(),
+            subject_version: version.clone(),
+        })
+        .await
+        .unwrap();
+    let commented = ts
+        .client
+        .invoke::<reviews::comments::create::Op>(&reviews::comments::create::Input {
+            id: draft.id,
+            expected_revision: draft.draft_revision,
+            subject_version: version.clone(),
+            anchor_kind: ReviewAnchorKindDto::Change,
+            anchor: ReviewAnchorDto::Change(ChangeAnchorDto {
+                path: snapshot.files[0].path.clone(),
+                side: ChangeSideDto::New,
+                start_line: 2,
+                end_line: 2,
+                hunk_header: snapshot.files[0].hunks[0].header.clone(),
+                context_before: Vec::new(),
+                selected: Vec::new(),
+                context_after: Vec::new(),
+            }),
+            body: "Explain the second line.".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(commented.comments.len(), 1);
+    assert_eq!(commented.comments[0].subject_version, version);
+
+    // The pinned commit is immutable, so the review is never outdated and
+    // the list reports it as fresh against its own snapshot.
+    let listed = ts
+        .client
+        .invoke::<reviews::list::Op>(&reviews::list::Input {
+            subject_kind: ReviewSubjectKindDto::Changes,
+            subject_key: "changes".to_string(),
+            session: session.id.to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].outdated);
+    let submitted = ts
+        .client
+        .invoke::<reviews::submit::Op>(&reviews::submit::Input {
+            id: draft.id,
+            expected_revision: commented.draft_revision,
+            acknowledge_outdated: false,
+        })
+        .await
+        .unwrap();
+    assert!(!submitted.acknowledged_outdated);
 }

@@ -2403,6 +2403,7 @@ mod tests {
         assert_eq!(read_pending_prompt(&db, "retract-empty").await.unwrap(), "");
     }
 
+    #[tokio::test]
     async fn launch_policy_runner_is_stamped_and_read_back() {
         let db = crate::db::connect_in_memory().await.unwrap();
         let mut policy = SessionLaunchPolicy::compatible(&new_session(
