@@ -39,6 +39,35 @@ async fn agents_list_merges_builtins_and_custom() {
 
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_efforts_is_safe_for_any_agent_kind() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    // A garbage kind, a blank model, and a custom agent name all resolve to
+    // "no choices" rather than a 500 — the operation forwards `agent`
+    // verbatim and must not reach an `expect` on a non-builtin kind.
+    for (agent, model) in [
+        ("totally-bogus", "whatever"),
+        ("cursor-agent", ""),
+        ("shell", "whatever"),
+    ] {
+        let res = client
+            .post(
+                "/api/agents/model_efforts",
+                json!({ "agent": agent, "model": model }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("model_efforts({agent:?}, {model:?}) failed: {e}"));
+        assert_eq!(
+            res["efforts"].as_array().map(Vec::len),
+            Some(0),
+            "expected no efforts for {agent:?}/{model:?}, got {res}"
+        );
+    }
+}
+
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn custom_agent_crud_and_validation() {
     let ts = TestServer::start().await;
     let client = &ts.client;
