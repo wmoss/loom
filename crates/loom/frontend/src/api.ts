@@ -634,6 +634,13 @@ export const updateReview = (
   body: Omit<OperationInput<'reviews.update'>, 'id'>,
 ) => invokeOperation('reviews.update', { id: reviewId, ...body });
 
+export const resolveReviewComment = (reviewId: number, commentId: number, resolved: boolean) =>
+  invokeOperation('reviews.comments.resolve', {
+    id: reviewId,
+    comment_id: commentId,
+    resolved,
+  });
+
 export const deleteReviewComment = (
   reviewId: number,
   commentId: number,
