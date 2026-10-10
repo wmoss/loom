@@ -508,6 +508,9 @@ pub struct AgentLaunchContext<'a> {
     /// Per-session memory ceiling in GiB (0 = unlimited), resolved from the
     /// `session.memory_max_gb` setting by [`launch`].
     pub memory_max_gb: u64,
+    /// Placement override stamped on the session: run the supervisor directly
+    /// beside the loom server process instead of the configured runner.
+    pub local_runner: bool,
 }
 
 impl AgentType for ClaudeAgentType {
@@ -863,6 +866,9 @@ pub struct LaunchSpec<'a> {
     /// looks up the named custom agent in the current registry (the adopt
     /// path).
     pub custom: Option<&'a CustomAgent>,
+    /// Placement override stamped on the session: run the supervisor directly
+    /// beside the loom server process instead of the configured runner.
+    pub local_runner: bool,
 }
 
 /// Bring up the session's terminal running the agent. `spec.runtime` is resolved
@@ -883,6 +889,7 @@ pub async fn launch(db: &Db, spec: &LaunchSpec<'_>, mode: LaunchMode) -> Result<
         extra_env: spec.extra_env,
         env_clear: spec.env_clear,
         memory_max_gb: backend::memory_max_gb(db).await,
+        local_runner: spec.local_runner,
     };
     let resolved = if let Some(custom) = spec.custom {
         if custom.name != spec.runtime {
@@ -959,16 +966,21 @@ async fn start_terminal(
         session = ctx.term_session,
         "launching agent session"
     );
-    backend::new_session(
-        ctx.term_session,
-        ctx.work_dir,
-        &script,
-        &env,
-        ctx.env_clear,
-        ctx.memory_max_gb,
-    )
-    .await
-    .with_context(|| format!("terminal: launching session {}", ctx.term_session))?;
+    let spawned = if ctx.local_runner {
+        backend::new_session_local(ctx.term_session, ctx.work_dir, &script, &env, ctx.env_clear)
+            .await
+    } else {
+        backend::new_session(
+            ctx.term_session,
+            ctx.work_dir,
+            &script,
+            &env,
+            ctx.env_clear,
+            ctx.memory_max_gb,
+        )
+        .await
+    };
+    spawned.with_context(|| format!("terminal: launching session {}", ctx.term_session))?;
     tracing::info!(
         branch = ctx.branch_id,
         runtime,
@@ -1117,6 +1129,9 @@ pub struct AcpLaunchSpec<'a> {
     /// The resolved custom agent when `runtime` names one (its `launch` command is
     /// the ACP adapter); `None` for the builtin claude.
     pub custom: Option<&'a CustomAgent>,
+    /// Placement override stamped on the session: run the supervisor directly
+    /// beside the loom server process instead of the configured runner.
+    pub local_runner: bool,
 }
 
 /// Build the [`AcpLaunch`] for a `protocol='acp'` session. For the builtin
@@ -1246,6 +1261,7 @@ pub async fn build_acp_launch(
             .then(|| spec.effort.trim().to_string()),
         goal,
         setup_timeout: std::time::Duration::from_secs(30),
+        local_runner: spec.local_runner,
     })
 }
 
@@ -2006,6 +2022,9 @@ impl<'a> AgentManager<'a> {
                 allowed_tools: &launch_policy.allowed_tools,
                 mcp_access: &launch_policy.mcp_access,
                 custom: custom.as_ref(),
+                // A one-shot prompt is engine housekeeping, not session work:
+                // it keeps the configured placement.
+                local_runner: false,
             },
             AcpOpen::Fresh,
         )
@@ -2146,6 +2165,7 @@ mod tests {
             extra_env: &[],
             env_clear: false,
             memory_max_gb: 0,
+            local_runner: false,
         }
     }
 
@@ -2535,6 +2555,7 @@ mod tests {
             initial_effort: Some("high".to_string()),
             goal: Some("real goal".to_string()),
             setup_timeout: Duration::from_secs(30),
+            local_runner: false,
         };
 
         let summary = transient_prompt_launch(&incoming);
@@ -2594,6 +2615,7 @@ mod tests {
             initial_effort: Some("high".to_string()),
             goal: Some("live goal".to_string()),
             setup_timeout: Duration::from_secs(30),
+            local_runner: false,
         };
 
         let transient = transient_prompt_launch(&incoming);
@@ -3033,6 +3055,7 @@ mod tests {
                 mcp_access:
                     r#"{"selection":{"mode":"none","groups":[]},"capability_sets":[],"custom_servers":[]}"#,
                 custom: None,
+                local_runner: false,
             },
             AcpOpen::Fresh,
         )
@@ -3086,5 +3109,40 @@ mod tests {
                 }
             ])
         );
+    }
+
+    /// The placement override rides on the launch inputs, so a `runner:
+    /// "local"` session reaches its relay spawn as a local placement.
+    #[tokio::test]
+    async fn acp_launch_carries_the_local_runner_placement() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let work_dir = tempfile::tempdir().unwrap();
+        let launch = build_acp_launch(
+            &db,
+            &AcpLaunchSpec {
+                session_id: "session-1",
+                branch_id: "branch-1",
+                runtime: "claude",
+                work_dir: work_dir.path(),
+                server_addr: "127.0.0.1:7878",
+                model: "",
+                effort: "",
+                goal_file: None,
+                primer_file: None,
+                extra_env: &[],
+                env_clear: false,
+                mode: "default",
+                prelude: "none",
+                restricted: false,
+                allowed_tools: "[]",
+                mcp_access: r#"{"selection":{"mode":"none","groups":[]},"capability_sets":[]}"#,
+                custom: None,
+                local_runner: true,
+            },
+            AcpOpen::Fresh,
+        )
+        .await
+        .unwrap();
+        assert!(launch.local_runner);
     }
 }

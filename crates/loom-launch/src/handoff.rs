@@ -710,6 +710,7 @@ async fn handoff_session_inner(
             allowed_tools: &handoff_policy.allowed_tools,
             mcp_access: &handoff_policy.mcp_access,
             custom: plan.custom_agent.as_ref(),
+            local_runner: session.runner_is_local(),
         },
         agent::AcpOpen::Fresh,
     )

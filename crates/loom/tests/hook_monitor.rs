@@ -288,6 +288,7 @@ async fn seed_classed_session(
             creator_subject: "test".to_string(),
             parent_session_id: None,
             automation_run_id: None,
+            runner: String::new(),
         },
     )
     .await

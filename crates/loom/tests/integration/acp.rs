@@ -106,6 +106,7 @@ async fn start_new_with_env(
         initial_effort: None,
         goal: goal.map(str::to_string),
         setup_timeout: Duration::from_secs(5),
+        local_runner: false,
     };
     acp::start(&ts.state.acp_ctx(), id, launch)
         .await
@@ -126,6 +127,7 @@ fn transient_launch(ts: &TestServer, env: Vec<(String, String)>) -> AcpLaunch {
         initial_effort: None,
         goal: None,
         setup_timeout: Duration::from_secs(5),
+        local_runner: false,
     }
 }
 
@@ -152,6 +154,7 @@ async fn silent_setup_stage_times_out_and_cleans_provider_state() {
         initial_effort: None,
         goal: Some("say:never starts".to_string()),
         setup_timeout: Duration::from_millis(150),
+        local_runner: false,
     };
 
     let error = acp::start(&ts.state.acp_ctx(), "acp-setup-timeout", launch)
@@ -630,6 +633,7 @@ async fn launch_model_and_effort_replace_adapter_config_defaults() {
         initial_effort: Some("high".to_string()),
         goal: None,
         setup_timeout: Duration::from_secs(5),
+        local_runner: false,
     };
     acp::start(&ts.state.acp_ctx(), "acp-launch-config", launch)
         .await
@@ -668,6 +672,7 @@ async fn load_preserves_adapter_restored_model_and_effort() {
         initial_effort: None,
         goal: None,
         setup_timeout: Duration::from_secs(5),
+        local_runner: false,
     };
     acp::start(&ts.state.acp_ctx(), "acp-load-config", launch)
         .await
@@ -4862,6 +4867,7 @@ async fn codex_acp_launch_maps_the_adapter_contract() {
         allowed_tools: "[]",
         mcp_access: r#"{"selection":{"mode":"none","groups":[]},"capability_sets":[],"custom_servers":[]}"#,
         custom: None,
+        local_runner: false,
     };
 
     let launch = loom::agent::build_acp_launch(

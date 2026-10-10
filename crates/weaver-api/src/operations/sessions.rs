@@ -631,6 +631,14 @@ pub mod launch {
         /// else is rejected). Blank/absent derives from the launch origin
         /// (watch/actions/ops/grafana → automation, else interactive).
         pub class: Option<String>,
+        /// Runtime placement override: `"local"` runs this session's supervisor
+        /// directly beside the loom server process — no container isolation and
+        /// no memory cgroup — instead of the deployment's configured runner.
+        /// The cheap placement for a trusted helper such as a code-review
+        /// subagent. Requires the `session.local_runner` setting; blank/absent
+        /// uses the configured runner (anything other than `"local"` is
+        /// rejected).
+        pub runner: Option<String>,
         /// Named launch profile; blank selects `default`.
         pub profile: Option<String>,
         /// A pre-existing Loom backlog item to claim for this session.

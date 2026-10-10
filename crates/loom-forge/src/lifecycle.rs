@@ -142,9 +142,14 @@ pub async fn auto_archive(
         );
         return Ok(None);
     }
-    archive_locked(st, &current_session, &current_branch)
-        .await
-        .map(Some)
+    archive_locked(
+        st,
+        &current_session,
+        &current_branch,
+        std::time::Instant::now() + CASCADE_DEADLINE,
+    )
+    .await
+    .map(Some)
 }
 
 /// Manual archive entry point. Refresh after acquiring the lifecycle lock so a
@@ -164,7 +169,13 @@ pub async fn archive(st: &AppState, session: &Session, _branch: &Branch) -> Resu
             else {
                 return Err(anyhow!("session not found"));
             };
-            archive_locked(&st, &current_session, &current_branch).await
+            archive_locked(
+                &st,
+                &current_session,
+                &current_branch,
+                std::time::Instant::now() + CASCADE_DEADLINE,
+            )
+            .await
         }
         .await;
         let _ = result_tx.send(result);
@@ -365,6 +376,7 @@ pub async fn archive_locked(
     st: &AppState,
     session: &Session,
     branch: &Branch,
+    cascade_deadline: std::time::Instant,
 ) -> Result<Vec<String>> {
     tracing::info!(session = %session.id, branch = %branch.id, "archiving session");
     // A person archiving a session is asking for it to go away; an abandoned
@@ -431,6 +443,9 @@ pub async fn archive_locked(
         )
         .await
         .ok();
+        // The launcher going away takes its finished delegates with it. Every
+        // child that outlives the archive is reported, never hidden.
+        warnings.extend(archive_children(st, &session.id, cascade_deadline).await);
         if warnings.is_empty() {
             tracing::info!(session = %session.id, branch = %branch.id, "session archived");
         } else {
@@ -792,6 +807,132 @@ pub async fn ensure_awake(st: &AppState, session: &Session) -> Result<Session> {
         return Ok(session.clone());
     }
     wake(st, session).await
+}
+
+/// A child session that may still be doing work: its agent is starting up
+/// (`created`) or has checked in (`running`). `orphaned` is deliberately
+/// excluded — the supervisor is gone, so the child cannot make progress and
+/// only its cleanup remains.
+fn child_is_live(session: &Session) -> bool {
+    matches!(session.status.as_str(), "created" | "running")
+}
+
+/// One teardown budget for a whole archive cascade, shared across every
+/// descendant. The caller holds the process-global lifecycle lock, and each
+/// child alone can consume [`TEARDOWN_DEADLINE`], so without a shared bound a
+/// launcher with many finished children would serialize every adopt, resume,
+/// and archive fleet-wide. The budget is only checked between children, so a
+/// child is never cancelled mid-teardown.
+const CASCADE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Archive the finished child sessions of a just-archived launcher, reporting
+/// each child that outlives it instead. Runs under the caller's lifecycle
+/// lock: every child goes through [`archive_locked`], so its own finished
+/// children cascade the same way and a completed subtree is torn down
+/// together — including the descendants of a child archived earlier, whose
+/// link is walked through rather than re-archived. A failure or refusal on
+/// one child never undoes the parent's archive — it becomes a warning the
+/// caller surfaces.
+async fn archive_children(
+    st: &AppState,
+    parent_session_id: &str,
+    cascade_deadline: std::time::Instant,
+) -> Vec<String> {
+    let children = match session_mod::list_children(&st.db, parent_session_id).await {
+        Ok(children) => children,
+        Err(error) => {
+            tracing::warn!(
+                parent = %parent_session_id,
+                %error,
+                "could not list child sessions while cascading archive"
+            );
+            return vec![format!("could not list child sessions: {error}")];
+        }
+    };
+    let mut warnings = Vec::new();
+    for (index, child) in children.iter().enumerate() {
+        if std::time::Instant::now() >= cascade_deadline {
+            warnings.push(format!(
+                "cascade exceeded {}s with {} child session(s) left unexamined — archive them separately",
+                CASCADE_DEADLINE.as_secs(),
+                children.len() - index
+            ));
+            break;
+        }
+        if child.status == "archived" {
+            // Already torn down, but its own descendants were never reached
+            // through it; walk through the link without re-archiving.
+            warnings.extend(Box::pin(archive_children(st, &child.id, cascade_deadline)).await);
+            continue;
+        }
+        if child_is_live(child) {
+            warnings.push(format!(
+                "child session {} is {} — left it alone; archive it separately",
+                child.id, child.status
+            ));
+            continue;
+        }
+        let Some(branch) = (match branch_mod::get(&st.db, &child.branch_id).await {
+            Ok(branch) => branch,
+            Err(error) => {
+                warnings.push(format!(
+                    "could not archive child session {}: {error}",
+                    child.id
+                ));
+                continue;
+            }
+        }) else {
+            tracing::warn!(
+                session = %child.id,
+                "child session had no branch while cascading archive"
+            );
+            warnings.push(format!(
+                "child session {} has no branch — left it alone; archive or remove it separately",
+                child.id
+            ));
+            continue;
+        };
+        // The cascade is an automatic archive from the child's point of view,
+        // so its own opt-out still applies; manual archive remains available.
+        match tags::auto_archive_disabled(&st.db, &branch.id).await {
+            Ok(true) => {
+                warnings.push(format!(
+                    "child session {} opted out of automatic archive — left it alone; archive it separately",
+                    child.id
+                ));
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warnings.push(format!(
+                    "could not archive child session {}: {error}",
+                    child.id
+                ));
+                continue;
+            }
+        }
+        // Boxed: archive_children recurses back through archive_locked for a
+        // child's own children, and the indirection bounds the future's size.
+        match Box::pin(archive_locked(st, child, &branch, cascade_deadline)).await {
+            Ok(child_warnings) => warnings.extend(
+                child_warnings
+                    .into_iter()
+                    .map(|warning| format!("child session {}: {warning}", child.id)),
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    session = %child.id,
+                    %error,
+                    "could not archive child session while cascading"
+                );
+                warnings.push(format!(
+                    "could not archive child session {}: {error}",
+                    child.id
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 /// Finish every lifecycle transition whose owner can no longer finish it.
@@ -1229,6 +1370,8 @@ pub async fn create_warm_session(
             creator_subject: format!("watch:{}", watch.id),
             parent_session_id: None,
             automation_run_id: None,
+            // Engine-owned warm sessions always follow the configured runner.
+            runner: String::new(),
         },
     )
     .await?;
@@ -1260,6 +1403,7 @@ pub async fn create_warm_session(
                 allowed_tools: &stamped_allowed_tools,
                 mcp_access: &session.policy_mcp_access,
                 custom: custom_agent.as_ref(),
+                local_runner: false,
             },
             agent::AcpOpen::Fresh,
         )
@@ -1285,6 +1429,7 @@ pub async fn create_warm_session(
                 extra_env: &extra_env,
                 env_clear: launch_profile.env_clear,
                 custom: custom_agent.as_ref(),
+                local_runner: false,
             },
             agent::LaunchMode::Fresh,
         )
@@ -1602,6 +1747,7 @@ pub async fn adopt_terminal_into_acp(
             allowed_tools: &session.policy_allowed_tools,
             mcp_access: &session.policy_mcp_access,
             custom: None,
+            local_runner: session.runner_is_local(),
         },
         open,
     )
@@ -1731,6 +1877,7 @@ pub async fn adopt_acp(
                 allowed_tools: &session.policy_allowed_tools,
                 mcp_access: &session.policy_mcp_access,
                 custom: custom_agent,
+                local_runner: session.runner_is_local(),
             },
             open,
         )
@@ -1988,6 +2135,7 @@ pub async fn resume_agent(
             extra_env: &extra_env,
             env_clear: session.policy_env_clear,
             custom: custom_agent,
+            local_runner: session.runner_is_local(),
         },
         agent::LaunchMode::Adopt,
     )
