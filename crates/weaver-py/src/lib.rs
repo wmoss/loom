@@ -180,11 +180,14 @@ impl Client {
     }
 
     /// Typed, bounded worktree changes relative to the session's local base
-    /// (`sessions.changes`).
-    fn changes(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyAny>> {
+    /// (`sessions.changes`). `rev` optionally scopes the snapshot to one
+    /// commit's own diff (`rev^..rev`).
+    #[pyo3(signature = (key, rev=None))]
+    fn changes(&self, py: Python<'_>, key: &str, rev: Option<&str>) -> PyResult<Py<PyAny>> {
         let value = py
             .detach(|| self.rt.block_on(self.inner.invoke::<sessions::changes::Op>(&sessions::changes::Input {
             session: key.to_string(),
+            rev: rev.map(str::to_string),
         })))
             .map_err(api_err)?;
         to_py(py, &value)

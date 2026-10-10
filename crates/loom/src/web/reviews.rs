@@ -142,11 +142,23 @@ async fn current_review_version(st: &AppState, item: &review::Review) -> ApiResu
             if item.subject_id != branch.id {
                 return Err(AppError::bad_request("invalid changes review subject"));
             }
-            Ok(
-                crate::changes::load(std::path::Path::new(&session.work_dir), &branch.base_branch)
-                    .await?
-                    .version,
-            )
+            match crate::changes::commit_for_version(&item.subject_version) {
+                // A pinned commit is immutable, so its current version is its
+                // own snapshot — unavailable only if the commit is gone.
+                Some(rev) => Ok(crate::changes::load_commit(
+                    std::path::Path::new(&session.work_dir),
+                    rev,
+                )
+                .await
+                .ok()
+                .and_then(|changes| changes.version)),
+                None => Ok(crate::changes::load(
+                    std::path::Path::new(&session.work_dir),
+                    &branch.base_branch,
+                )
+                .await?
+                .version),
+            }
         }
         _ => Err(AppError::bad_request("unsupported review subject kind")),
     }
@@ -306,10 +318,19 @@ async fn list_for(
         viewer,
     )
     .await?;
-    let mut out: Vec<ReviewDto> = reviews
-        .iter()
-        .map(|item| review_dto(item, &current_version))
-        .collect();
+    let mut out: Vec<ReviewDto> = Vec::with_capacity(reviews.len());
+    for item in &reviews {
+        // A commit-pinned review is its own current version — the snapshot it
+        // names cannot move — while the branch change-set stays one shared load.
+        let current = match (
+            q.subject_kind,
+            crate::changes::commit_for_version(&item.subject_version),
+        ) {
+            (ReviewSubjectKindDto::Changes, Some(_)) => item.subject_version.clone(),
+            _ => current_version.clone(),
+        };
+        out.push(review_dto(item, &current));
+    }
     if q.subject_kind == ReviewSubjectKindDto::Artifact {
         let artifact_id = subject_id
             .parse()
@@ -352,9 +373,13 @@ async fn create_for(
                         "changes review subject_key must be 'changes'",
                     ));
                 }
-                let changes = crate::changes::load(
+                // The snapshot the caller is looking at may be the branch's
+                // whole change-set or one commit's diff; the version string
+                // says which.
+                let changes = crate::changes::load_for_review(
                     std::path::Path::new(&session.work_dir),
                     &branch.base_branch,
+                    crate::changes::commit_for_version(&body.subject_version),
                 )
                 .await?;
                 let version = changes.version.ok_or_else(|| {
@@ -442,9 +467,14 @@ async fn require_anchor(
         }
         ("changes", ReviewAnchorKindDto::Change, ReviewAnchorDto::Change(anchor)) => {
             let (session, branch) = require_session(&st.db, &item.session_id).await?;
-            let changes =
-                crate::changes::load(std::path::Path::new(&session.work_dir), &branch.base_branch)
-                    .await?;
+            // Validate against the exact snapshot the comment's version names:
+            // the branch's change-set, or one commit's diff.
+            let changes = crate::changes::load_for_review(
+                std::path::Path::new(&session.work_dir),
+                &branch.base_branch,
+                crate::changes::commit_for_version(subject_version),
+            )
+            .await?;
             let anchor = crate::changes::validate_anchor(&changes, subject_version, anchor)
                 .map_err(|error| AppError::conflict(error.to_string()))?;
             Ok((

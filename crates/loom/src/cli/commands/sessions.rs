@@ -106,8 +106,17 @@ pub enum SessionCmd {
         #[arg(long, default_value = "0")]
         lines: usize,
     },
-    /// Print the typed, bounded worktree changes relative to the branch base.
+    /// Print the typed, bounded worktree changes relative to the branch base,
+    /// or one commit's own changes with `--rev`.
     Changes {
+        /// Session key: id, branch id, branch name, or `repo:branch`.
+        session: String,
+        /// Review this commit's own changes (`rev^..rev`) instead.
+        #[arg(long)]
+        rev: Option<String>,
+    },
+    /// Print the branch's own commits since the fork point with its base.
+    Commits {
         /// Session key: id, branch id, branch name, or `repo:branch`.
         session: String,
     },
@@ -346,13 +355,23 @@ pub async fn run_session(cmd: SessionCmd) -> Result<()> {
         } => cmd_session_send(session, message.join(" "), !no_enter).await,
         SessionCmd::Interrupt { session } => cmd_session_interrupt(session).await,
         SessionCmd::Preview { session, lines } => cmd_session_preview(session, lines).await,
-        SessionCmd::Changes { session } => {
+        SessionCmd::Changes { session, rev } => {
             let changes = client::default()?
                 .invoke::<sessions::changes::Op>(&sessions::changes::Input {
                     session: session.to_string(),
+                    rev,
                 })
                 .await?;
             println!("{}", serde_json::to_string_pretty(&changes)?);
+            Ok(())
+        }
+        SessionCmd::Commits { session } => {
+            let commits = client::default()?
+                .invoke::<sessions::commits::Op>(&sessions::commits::Input {
+                    session: session.to_string(),
+                })
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&commits)?);
             Ok(())
         }
         SessionCmd::Tags { cmd } => {

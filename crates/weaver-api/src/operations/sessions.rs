@@ -74,15 +74,34 @@ pub mod wake {
 pub mod changes {
     use super::prelude::*;
 
-    /// The session's uncommitted worktree changes against its base branch.
+    /// The session's uncommitted worktree changes against its base branch, or —
+    /// with `rev` — the diff that one commit introduces.
     #[operation(id = "sessions.changes", actor = SessionSelf, scope = Session, risk = Read,
                 grants = ["loom/sessions/read@v1"], cli = "sessions changes")]
     pub struct Input {
+        /// Which commit to review: the snapshot becomes `rev^..rev`, that
+        /// commit's own changes. Omitted means the whole branch state.
+        pub rev: Option<String>,
         #[operand(context)]
         pub session: String,
     }
 
     pub type Output = ChangeSetDto;
+}
+
+pub mod commits {
+    use super::prelude::*;
+
+    /// The session branch's own commits, from the fork point with its base
+    /// branch, newest first.
+    #[operation(id = "sessions.commits", actor = SessionSelf, scope = Session, risk = Read,
+                grants = ["loom/sessions/read@v1"], cli = "sessions commits")]
+    pub struct Input {
+        #[operand(context)]
+        pub session: String,
+    }
+
+    pub type Output = SessionCommitsDto;
 }
 
 pub mod chat {
@@ -1455,6 +1474,7 @@ static OPERATIONS: &[&OperationSpec] = &[
     handoff::SPEC,
     handoff::resolve::SPEC,
     changes::SPEC,
+    commits::SPEC,
     chat::SPEC,
     conversation::SPEC,
     conversation::block::SPEC,

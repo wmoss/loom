@@ -1156,6 +1156,7 @@ const DocBody = () => {
 
     <ReviewTray
       ref="reviewTrayRef"
+      :floating="true"
       :reviews="reviews"
       :draft="draft"
       :open="trayOpen"

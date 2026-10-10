@@ -600,7 +600,11 @@ export const listArtifactReviews = (id: string, name: string) =>
     session: id,
   });
 
-export const getChanges = (id: string) => invokeOperation('sessions.changes', { session: id });
+export const getChanges = (id: string, rev?: string) =>
+  invokeOperation('sessions.changes', { session: id, ...(rev ? { rev } : {}) });
+
+export const getSessionCommits = (id: string) =>
+  invokeOperation('sessions.commits', { session: id });
 
 export const listChangesReviews = (id: string) =>
   invokeOperation('reviews.list', {

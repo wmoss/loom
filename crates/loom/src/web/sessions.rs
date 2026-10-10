@@ -1274,6 +1274,7 @@ pub(super) fn bound_operations() -> Vec<Bound> {
     ];
     bound.extend(super::session_summary::bound_operations());
     bound.extend(super::changes::bound_operations());
+    bound.extend(super::commits::bound_operations());
     bound.extend(super::scratch::bound_operations());
     bound
 }

@@ -1886,6 +1886,15 @@ pub struct ChangeFileDto {
     pub content: ChangeContentDto,
     pub hunks: Vec<ChangeHunkDto>,
     pub truncated: bool,
+    /// The full pre-change file text when it fits the content budget — the
+    /// browser feeds it to the diff renderer so hunk expansion has real lines
+    /// to reveal. Absent when the file is binary, oversized, or the budget
+    /// ran out.
+    #[serde(default)]
+    pub old_content: Option<String>,
+    /// The full post-change file text, same bounds as `old_content`.
+    #[serde(default)]
+    pub new_content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1943,6 +1952,38 @@ pub struct ChangeSetDto {
     pub files: Vec<ChangeFileDto>,
     pub truncated: bool,
     pub limits: ChangeLimitsDto,
+}
+
+// ---------------------------------------------------------------------------
+// Commits — the session branch's own commits since its fork point.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCommitDto {
+    pub oid: String,
+    pub author_name: String,
+    pub author_email: String,
+    /// Authoring time, RFC 3339.
+    pub authored_at: String,
+    /// First line of the commit message.
+    pub subject: String,
+    /// The commit message below its subject, when there is one.
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCommitsDto {
+    /// The same fork-point resolution the Changes surface diffs against, so
+    /// the two never disagree about where the branch's own work starts.
+    pub base: ChangeBaseDto,
+    pub head_oid: Option<String>,
+    /// Newest first.
+    pub commits: Vec<SessionCommitDto>,
+    /// The branch holds more commits than the listing bound.
+    pub truncated: bool,
 }
 
 /// One watch, as the API exposes it. The JSON-bearing columns (`trigger`,

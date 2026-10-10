@@ -1,11 +1,17 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import type { ComponentPublicInstance } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
+import { DiffModeEnum, DiffViewWithMultiSelect, SplitSide } from '@git-diff-view/vue';
+import type { LineRange } from '@git-diff-view/vue';
+import '@git-diff-view/vue/styles/diff-view-pure.css';
 import {
   addReviewComment,
   createReview,
   deleteReviewComment,
   discardReview,
   getChanges,
+  getSessionCommits,
   listChangesReviews,
   retryReviewDelivery,
   retargetReviewToCurrent,
@@ -14,24 +20,89 @@ import {
   updateReviewComment,
   ApiError,
 } from '../api';
-import type { ChangeAnchor, ChangeFile, ChangeHunk, ChangeLine, ChangeSet, Review } from '../types';
+import type {
+  ChangeAnchor,
+  ChangeFile,
+  ChangeLine,
+  ChangeSet,
+  ChangeSide,
+  Review,
+  ReviewComment,
+  SessionCommit,
+} from '../types';
 import { ReviewDraftController } from '../lib/reviewDraftController';
+import { toGitDiffViewData, type GitDiffViewData } from '../lib/gitDiffAdapter';
+import { theme } from '../theme';
+import CommitList from './CommitList.vue';
 import ReviewCommentCard from './ReviewCommentCard.vue';
 import ReviewTray from './ReviewTray.vue';
 
 const props = defineProps<{ id: string }>();
+const route = useRoute();
+const router = useRouter();
+/** `?rev=<oid>` scopes the snapshot to one commit's own changes. */
+const rev = computed(() => (typeof route.query.rev === 'string' ? route.query.rev : null));
 const changes = ref<ChangeSet | null>(null);
 const reviews = ref<Review[]>([]);
 const loading = ref(false);
 const error = ref('');
 const notice = ref('');
-const expanded = reactive(new Set<string>());
+const collapsed = reactive(new Set<string>());
+const mounted = reactive(new Set<string>());
+let fileObserver: IntersectionObserver | null = null;
 const activeComment = ref<number | null>(null);
 const reanchorComment = ref<number | null>(null);
 const commentErrors = reactive<Record<number, string>>({});
 const deliveryErrors = reactive<Record<number, string>>({});
 const trayOpen = ref(false);
 const trayError = ref('');
+// The compose aside: a hierarchical, resizable file rail on the diff's left,
+// off until asked for.
+const asideOpen = ref(false);
+/** The outdated-comments section starts open so nothing is hidden; it can
+ * be folded away once read. */
+const outdatedOpen = ref(true);
+const asideFilter = ref('');
+// Folders default expanded; membership tracks the collapsed ones.
+const collapsedFolders = reactive(new Set<string>());
+const MIN_ASIDE_WIDTH = 180;
+const MAX_ASIDE_WIDTH = 720;
+const ASIDE_WIDTH_KEY = 'loom.changesAsideWidth';
+const asideEl = ref<HTMLElement | null>(null);
+const asideWidth = ref(loadAsideWidth());
+
+function loadAsideWidth(): number {
+  const v = Number(localStorage.getItem(ASIDE_WIDTH_KEY));
+  return Number.isFinite(v) && v >= MIN_ASIDE_WIDTH ? v : 288;
+}
+
+let asideDragging = false;
+function onAsideDrag(event: MouseEvent) {
+  if (!asideDragging || !asideEl.value) return;
+  const left = asideEl.value.getBoundingClientRect().left;
+  asideWidth.value = Math.min(Math.max(event.clientX - left, MIN_ASIDE_WIDTH), MAX_ASIDE_WIDTH);
+}
+function stopAsideDrag() {
+  if (!asideDragging) return;
+  asideDragging = false;
+  localStorage.setItem(ASIDE_WIDTH_KEY, String(Math.round(asideWidth.value)));
+  document.removeEventListener('mousemove', onAsideDrag);
+  document.removeEventListener('mouseup', stopAsideDrag);
+  document.body.style.userSelect = '';
+}
+function startAsideDrag(event: MouseEvent) {
+  asideDragging = true;
+  event.preventDefault();
+  document.addEventListener('mousemove', onAsideDrag);
+  document.addEventListener('mouseup', stopAsideDrag);
+  // Suppress text selection while dragging the divider.
+  document.body.style.userSelect = 'none';
+}
+
+function toggleFolder(path: string) {
+  if (collapsedFolders.has(path)) collapsedFolders.delete(path);
+  else collapsedFolders.add(path);
+}
 const overallNote = ref('');
 const summaryDirty = ref(false);
 const summarySaving = ref(false);
@@ -39,12 +110,67 @@ const acknowledgeOutdated = ref(false);
 const submitting = ref(false);
 const discarding = ref(false);
 
-type Pending = { anchor: ChangeAnchor; body: string; version: string };
+type Pending = {
+  anchor: ChangeAnchor;
+  body: string;
+  version: string;
+  fileKey: string;
+  lineNumber: number;
+  side: ChangeSide;
+  reanchorId?: number;
+};
 const pending = ref<Pending | null>(null);
 const savingComment = ref(false);
 const composerInput = ref<HTMLTextAreaElement | null>(null);
+// A plain `ref="composerInput"` inside this v-for's scoped slot would make Vue
+// collect it into an array (its v-for-ref behavior is lexical, not runtime),
+// so bind with a function ref instead to keep a single element reference.
+function setComposerInput(el: Element | ComponentPublicInstance | null) {
+  composerInput.value = el instanceof HTMLTextAreaElement ? el : null;
+}
+// The composer's discard confirm; same function-ref constraint as above.
+const confirmDiscard = ref(false);
+const discardButton = ref<HTMLButtonElement | null>(null);
+function setDiscardButton(el: Element | ComponentPublicInstance | null) {
+  discardButton.value = el instanceof HTMLButtonElement ? el : null;
+}
+
+const diffDataCache = new Map<string, GitDiffViewData | null>();
 
 const draft = computed(() => reviews.value.find((review) => review.status === 'draft') ?? null);
+
+/** True when the anchor's side and line range is rendered by some hunk of its
+ * file — the same contiguity the backend's anchor validation requires. */
+function anchorPlaced(anchor: ChangeAnchor): boolean {
+  const file = (changes.value?.files ?? []).find((item) => item.path.bytes === anchor.path.bytes);
+  if (!file) return false;
+  for (const hunk of file.hunks) {
+    const eligible = hunk.lines
+      .map((line) => (anchor.side === 'old' ? line.old_line : line.new_line))
+      .filter((line): line is number => line != null);
+    const first = eligible.indexOf(anchor.start_line);
+    if (first < 0) continue;
+    let resolves = true;
+    for (let offset = 1; offset <= anchor.end_line - anchor.start_line; offset++) {
+      if (eligible[first + offset] !== anchor.start_line + offset) {
+        resolves = false;
+        break;
+      }
+    }
+    if (resolves) return true;
+  }
+  return false;
+}
+
+/** Draft comments that cannot be placed inline in this view — the anchored
+ * file left the change set, or its lines are no longer rendered. They still
+ * submit with the review, so they persist in the outdated section where they
+ * can be edited, re-anchored, or deleted. */
+const outdatedComments = computed(() =>
+  (draft.value?.comments ?? []).filter(
+    (comment) => comment.anchor_kind === 'change' && !anchorPlaced(comment.anchor as ChangeAnchor),
+  ),
+);
 
 const baseProblem = computed(() => {
   const base = changes.value?.base;
@@ -119,7 +245,7 @@ async function load() {
   loading.value = true;
   try {
     const [nextChanges, nextReviews] = await Promise.all([
-      getChanges(props.id),
+      getChanges(props.id, rev.value ?? undefined),
       listChangesReviews(props.id),
     ]);
     const nextDraft = nextReviews.find((review) => review.status === 'draft') ?? null;
@@ -138,121 +264,194 @@ function fileKey(file: ChangeFile): string {
   return file.path.bytes;
 }
 
+function isExpanded(file: ChangeFile): boolean {
+  return !collapsed.has(fileKey(file));
+}
+
 function toggleFile(file: ChangeFile) {
   const key = fileKey(file);
-  if (expanded.has(key)) expanded.delete(key);
-  else expanded.add(key);
+  if (collapsed.has(key)) collapsed.delete(key);
+  else collapsed.add(key);
 }
 
-function lineSide(line: ChangeLine): 'old' | 'new' {
-  return line.kind === 'deletion' ? 'old' : 'new';
+/** Mounts a file's diff once its container scrolls near the viewport, instead of all at once. */
+function ensureFileObserver(): IntersectionObserver {
+  if (!fileObserver) {
+    fileObserver = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          const key = (entry.target as HTMLElement).dataset.fileKey;
+          if (key) mounted.add(key);
+          fileObserver?.unobserve(entry.target);
+        }
+      },
+      { rootMargin: '600px 0px' },
+    );
+  }
+  return fileObserver;
 }
 
-function lineNumber(line: ChangeLine, side: 'old' | 'new'): number | null {
+function observeFile(el: unknown, file: ChangeFile) {
+  if (!(el instanceof Element) || mounted.has(fileKey(file))) return;
+  ensureFileObserver().observe(el);
+}
+
+onBeforeUnmount(() => fileObserver?.disconnect());
+
+function gitDiffData(file: ChangeFile): GitDiffViewData | null {
+  const key = `${changes.value?.version ?? ''}:${fileKey(file)}`;
+  if (!diffDataCache.has(key)) diffDataCache.set(key, toGitDiffViewData(file));
+  return diffDataCache.get(key) ?? null;
+}
+
+function lineNumber(line: ChangeLine, side: ChangeSide): number | null {
   return side === 'old' ? line.old_line : line.new_line;
 }
 
-function anchorFor(
-  file: ChangeFile,
-  hunk: ChangeHunk,
-  line: ChangeLine,
-  last = line,
-): ChangeAnchor | null {
-  const side = lineSide(line);
-  const start = lineNumber(line, side);
-  const end = lineNumber(last, side);
-  if (start == null || end == null) return null;
-  const low = Math.min(start, end);
-  const high = Math.max(start, end);
-  const eligible = hunk.lines.filter((line) => lineNumber(line, side) != null);
-  const selected = eligible.filter((line) => {
-    const number = lineNumber(line, side)!;
-    return number >= low && number <= high;
-  });
-  if (selected.length !== high - low + 1) return null;
-  const first = eligible.indexOf(selected[0]);
-  const lastIndex = eligible.indexOf(selected.at(-1)!);
-  return {
-    path: file.path,
-    side,
-    start_line: low,
-    end_line: high,
-    hunk_header: hunk.header,
-    context_before: eligible.slice(Math.max(0, first - 2), first).map((line) => line.text),
-    selected: selected.map((line) => line.text),
-    context_after: eligible.slice(lastIndex + 1, lastIndex + 3).map((line) => line.text),
+function sideFromSplitSide(side: SplitSide): ChangeSide {
+  return side === SplitSide.old ? 'old' : 'new';
+}
+
+/** Finds the range's containing hunk on `range.side` and clamps its end to that hunk's last line. */
+function scopeToHunk(file: ChangeFile) {
+  return (range: LineRange): LineRange | null => {
+    // The multi-select side is already the wire spelling; `SplitSide` is a
+    // numeric enum used only by the widget-click payload.
+    const side: ChangeSide = range.side;
+    for (const hunk of file.hunks) {
+      const numbers = hunk.lines
+        .map((line) => lineNumber(line, side))
+        .filter((value): value is number => value != null);
+      if (!numbers.length) continue;
+      const low = numbers[0];
+      const high = numbers[numbers.length - 1];
+      if (range.startLineNumber < low || range.startLineNumber > high) continue;
+      return { ...range, endLineNumber: Math.min(range.endLineNumber, high) };
+    }
+    return null;
   };
 }
 
-function selectLine(file: ChangeFile, hunk: ChangeHunk, line: ChangeLine) {
-  const version = changes.value?.version;
-  if (!version) return;
-  const next = anchorFor(file, hunk, line);
-  if (!next) return;
-  if (reanchorComment.value != null) {
-    void applyReanchor(reanchorComment.value, next);
-    return;
+/** Builds a `ChangeAnchor` for a contiguous line range, deriving context text from the hunk it falls in. */
+function buildAnchor(
+  file: ChangeFile,
+  side: ChangeSide,
+  startLine: number,
+  endLine: number,
+): ChangeAnchor | null {
+  for (const hunk of file.hunks) {
+    const eligible = hunk.lines.filter((line) => lineNumber(line, side) != null);
+    const selected = eligible.filter((line) => {
+      const number = lineNumber(line, side)!;
+      return number >= startLine && number <= endLine;
+    });
+    if (selected.length !== endLine - startLine + 1) continue;
+    const first = eligible.indexOf(selected[0]);
+    const lastIndex = eligible.indexOf(selected.at(-1)!);
+    return {
+      path: file.path,
+      side,
+      start_line: startLine,
+      end_line: endLine,
+      hunk_header: hunk.header,
+      context_before: eligible.slice(Math.max(0, first - 2), first).map((line) => line.text),
+      selected: selected.map((line) => line.text),
+      context_after: eligible.slice(lastIndex + 1, lastIndex + 3).map((line) => line.text),
+    };
   }
-  const current = pending.value?.anchor;
-  if (
-    pending.value?.version === version &&
-    current?.path.bytes === file.path.bytes &&
-    current.side === next.side &&
-    current.hunk_header === hunk.header
-  ) {
-    const first = hunk.lines.find(
-      (candidate) => lineNumber(candidate, current.side) === current.start_line,
-    );
-    const range = first && anchorFor(file, hunk, first, line);
-    if (range) {
-      pending.value = { ...pending.value!, anchor: range };
-      return;
-    }
-  }
-  pending.value = { anchor: next, body: pending.value?.body ?? '', version };
-  void nextTick(() => composerInput.value?.focus());
+  return null;
 }
 
-function extendSelection(file: ChangeFile, hunk: ChangeHunk, line: ChangeLine, direction: -1 | 1) {
+function widgetStateFor(file: ChangeFile): { side: SplitSide; lineNumber: number } | undefined {
+  if (!pending.value || pending.value.fileKey !== fileKey(file)) return undefined;
+  return {
+    side: pending.value.side === 'old' ? SplitSide.old : SplitSide.new,
+    lineNumber: pending.value.lineNumber,
+  };
+}
+
+function extendDataFor(file: ChangeFile): {
+  oldFile: Record<string, { data: ReviewComment[] }>;
+  newFile: Record<string, { data: ReviewComment[] }>;
+} {
+  const oldFile: Record<string, { data: ReviewComment[] }> = {};
+  const newFile: Record<string, { data: ReviewComment[] }> = {};
+  for (const comment of draft.value?.comments ?? []) {
+    if (comment.anchor_kind !== 'change') continue;
+    const anchor = comment.anchor as ChangeAnchor;
+    if (anchor.path.bytes !== file.path.bytes || !anchorPlaced(anchor)) continue;
+    const bucket = anchor.side === 'old' ? oldFile : newFile;
+    const key = String(anchor.end_line);
+    (bucket[key] ??= { data: [] }).data.push(comment);
+  }
+  return { oldFile, newFile };
+}
+
+function onAddWidgetClick(
+  file: ChangeFile,
+  payload: { lineNumber: number; fromLineNumber?: number; side: SplitSide },
+) {
   const version = changes.value?.version;
   if (!version) return;
-  const side = lineSide(line);
-  const eligible = hunk.lines.filter((candidate) => lineNumber(candidate, side) != null);
-  const current = pending.value;
-  const sameRange =
-    current?.version === version &&
-    current.anchor.path.bytes === file.path.bytes &&
-    current.anchor.side === side &&
-    current.anchor.hunk_header === hunk.header;
-  const boundary = sameRange
-    ? direction < 0
-      ? current!.anchor.start_line
-      : current!.anchor.end_line
-    : lineNumber(line, side);
-  const boundaryIndex = eligible.findIndex((candidate) => lineNumber(candidate, side) === boundary);
-  const target = eligible[boundaryIndex + direction];
-  if (boundaryIndex < 0 || !target) return;
-  let range: ChangeAnchor | null;
-  if (!sameRange) {
-    range =
-      direction < 0 ? anchorFor(file, hunk, target, line) : anchorFor(file, hunk, line, target);
-  } else {
-    const first = hunk.lines.find(
-      (candidate) => lineNumber(candidate, side) === current!.anchor.start_line,
-    );
-    const last =
-      direction < 0
-        ? hunk.lines.find((candidate) => lineNumber(candidate, side) === current!.anchor.end_line)
-        : target;
-    range =
-      first && last && direction < 0
-        ? anchorFor(file, hunk, target, last)
-        : first && last
-          ? anchorFor(file, hunk, first, target)
-          : null;
+  const side = sideFromSplitSide(payload.side);
+  const start = Math.min(payload.fromLineNumber ?? payload.lineNumber, payload.lineNumber);
+  const end = Math.max(payload.fromLineNumber ?? payload.lineNumber, payload.lineNumber);
+  const anchor = buildAnchor(file, side, start, end);
+  if (!anchor) return;
+  const key = fileKey(file);
+  confirmDiscard.value = false;
+  pending.value = {
+    anchor,
+    body: reanchorComment.value == null && pending.value?.fileKey === key ? pending.value.body : '',
+    version,
+    fileKey: key,
+    lineNumber: payload.lineNumber,
+    side,
+    reanchorId: reanchorComment.value ?? undefined,
+  };
+  // The library's "+" button focuses itself on mousedown; wait a frame past
+  // that native default action so our focus call isn't immediately stolen back.
+  void nextTick(() => requestAnimationFrame(() => composerInput.value?.focus()));
+}
+
+function cancelPending(onClose: () => void) {
+  if (pending.value?.reanchorId != null) reanchorComment.value = null;
+  confirmDiscard.value = false;
+  pending.value = null;
+  onClose();
+}
+
+/** Escape or Cancel with text typed swaps the composer for a discard confirm
+ * whose button takes focus, so Enter confirms and Escape returns to editing. */
+function requestCancel(onClose: () => void) {
+  if (!pending.value?.body.trim()) {
+    cancelPending(onClose);
+    return;
   }
-  if (!range) return;
-  pending.value = { anchor: range, body: current?.body ?? '', version };
+  confirmDiscard.value = true;
+  void nextTick(() => requestAnimationFrame(() => discardButton.value?.focus()));
+}
+
+function keepEditing() {
+  confirmDiscard.value = false;
+  void nextTick(() => requestAnimationFrame(() => composerInput.value?.focus()));
+}
+
+async function confirmPending(onClose: () => void) {
+  if (!pending.value) return;
+  if (pending.value.reanchorId != null) {
+    // Leave re-anchor mode before the attempt: a failed move reports on the
+    // comment card and must not hijack the next "+" click into another move.
+    const reanchorId = pending.value.reanchorId;
+    reanchorComment.value = null;
+    await applyReanchor(reanchorId, pending.value.anchor);
+    pending.value = null;
+    onClose();
+    return;
+  }
+  await saveComment();
+  if (!pending.value) onClose();
 }
 
 async function saveComment() {
@@ -280,7 +479,6 @@ async function saveComment() {
     });
     activeComment.value = updated.comments.at(-1)?.id ?? null;
     pending.value = null;
-    trayOpen.value = true;
     notice.value = 'Pending comment saved.';
   } catch (cause) {
     trayError.value = mutationMessage(cause);
@@ -405,14 +603,196 @@ async function retryDelivery(item: Review) {
   }
 }
 
+/** Marks a draft comment active and reveals it: expanding and force-mounting
+ * its file when needed, then scrolling its card — inline or in the outdated
+ * section — into view. Shared by the tray's prev/next and direct clicks. */
+function focusComment(commentId: number) {
+  const comment = draft.value?.comments.find((item) => item.id === commentId);
+  if (!comment) return;
+  if (outdatedComments.value.some((item) => item.id === commentId)) outdatedOpen.value = true;
+  if (comment.anchor_kind === 'change') {
+    const key = (comment.anchor as ChangeAnchor).path.bytes;
+    collapsed.delete(key);
+    mounted.add(key);
+  }
+  activeComment.value = commentId;
+  void nextTick(() =>
+    document
+      .querySelector(`[data-review-collapsed="${commentId}"], [data-review-card="${commentId}"]`)
+      ?.scrollIntoView({ block: 'center' }),
+  );
+}
+
 function navigate(direction: number) {
   const comments = draft.value?.comments ?? [];
   if (!comments.length) return;
   const current = comments.findIndex((comment) => comment.id === activeComment.value);
-  activeComment.value = comments[(current + direction + comments.length) % comments.length].id;
+  focusComment(comments[(current + direction + comments.length) % comments.length].id);
 }
 
+watch(rev, () => void load());
 onMounted(load);
+
+/** This file's pending-comment count. */
+function pendingFor(file: ChangeFile): number {
+  const key = file.path.bytes;
+  return (
+    draft.value?.comments.filter(
+      (comment) =>
+        comment.anchor_kind === 'change' && (comment.anchor as ChangeAnchor).path.bytes === key,
+    ).length ?? 0
+  );
+}
+
+interface AsideNode {
+  name: string;
+  /** The full path: the segment chain down to this node. */
+  path: string;
+  folder?: AsideNode[];
+  file?: { entry: ChangeFile; pending: number };
+  /** Folder rollups: total descendant files and their pending comments. */
+  count?: number;
+  pending?: number;
+}
+
+/** The change set folded into a directory tree, folders before files. */
+const asideTree = computed<AsideNode[]>(() => {
+  const root: AsideNode[] = [];
+  const folders = new Map<string, AsideNode>();
+  for (const file of changes.value?.files ?? []) {
+    const parts = file.path.display.split('/').filter(Boolean);
+    const name = parts.pop() ?? file.path.display;
+    let children = root;
+    let prefix = '';
+    for (const part of parts) {
+      prefix = prefix ? `${prefix}/${part}` : part;
+      let node = folders.get(prefix);
+      if (!node) {
+        node = { name: part, path: prefix, folder: [] };
+        folders.set(prefix, node);
+        children.push(node);
+      }
+      children = node.folder!;
+    }
+    children.push({
+      name,
+      path: file.path.display,
+      file: { entry: file, pending: pendingFor(file) },
+    });
+  }
+  const sortLevel = (nodes: AsideNode[]) => {
+    nodes.sort((a, b) =>
+      Boolean(a.folder) === Boolean(b.folder) ? a.name.localeCompare(b.name) : a.folder ? -1 : 1,
+    );
+    for (const node of nodes) {
+      if (!node.folder) continue;
+      sortLevel(node.folder);
+      node.count = node.folder.reduce(
+        (sum, child) => sum + (child.folder ? (child.count ?? 0) : 1),
+        0,
+      );
+      node.pending = node.folder.reduce((sum, child) => sum + (child.pending ?? 0), 0);
+    }
+  };
+  sortLevel(root);
+  return root;
+});
+
+interface AsideRow {
+  depth: number;
+  node: AsideNode;
+}
+
+/** The tree flattened for rendering: filter-narrowed, and collapsed folders
+ * hide their children (filtering forces everything matched open). */
+const asideRows = computed<AsideRow[]>(() => {
+  const needle = asideFilter.value.trim().toLowerCase();
+  const matches = (node: AsideNode) =>
+    !needle || node.name.toLowerCase().includes(needle) || node.path.toLowerCase().includes(needle);
+  const walk = (nodes: AsideNode[], depth: number): AsideRow[] => {
+    const rows: AsideRow[] = [];
+    for (const node of nodes) {
+      if (node.file) {
+        if (matches(node)) rows.push({ depth, node });
+      } else {
+        const children = walk(node.folder!, depth + 1);
+        if (!children.length) continue;
+        rows.push({ depth, node });
+        if (!needle && collapsedFolders.has(node.path)) continue;
+        rows.push(...children);
+      }
+    }
+    return rows;
+  };
+  return walk(asideTree.value, 0);
+});
+
+/** Reveals and scrolls to a file's diff from the aside. The scroll targets
+ * the file's header, not its diff body: the sticky filename bar would cover
+ * the body's first lines otherwise. */
+function jumpTo(file: ChangeFile) {
+  const key = fileKey(file);
+  collapsed.delete(key);
+  mounted.add(key);
+  void nextTick(() =>
+    document
+      .querySelector(`[data-file-key="${key}"]`)
+      ?.closest('article')
+      ?.scrollIntoView({ block: 'start' }),
+  );
+}
+
+/** Drops the `?rev` scoping and returns to the whole branch state. */
+function reviewAllChanges() {
+  void router.push(`/s/${props.id}/changes`);
+}
+
+// --- The commit picker: scope the review to one commit from the header -----
+const pickerOpen = ref(false);
+const pickerCommits = ref<SessionCommit[] | null>(null);
+const pickerLoading = ref(false);
+const pickerError = ref('');
+const pickerEl = ref<HTMLElement | null>(null);
+const pickerToggleEl = ref<HTMLButtonElement | null>(null);
+
+async function loadPicker() {
+  pickerLoading.value = true;
+  try {
+    pickerCommits.value = (await getSessionCommits(props.id)).commits;
+    pickerError.value = '';
+  } catch (cause) {
+    pickerError.value = (cause as Error).message;
+  } finally {
+    pickerLoading.value = false;
+  }
+}
+
+// The overlay sits over page content, so a pointerdown outside it (and
+// outside its own toggle) minimizes it back away.
+function onPickerDocPointerDown(event: PointerEvent) {
+  const target = event.target as Node;
+  if (pickerEl.value?.contains(target) || pickerToggleEl.value?.contains(target)) return;
+  pickerOpen.value = false;
+}
+
+watch(pickerOpen, (open) => {
+  document.removeEventListener('pointerdown', onPickerDocPointerDown);
+  if (open) {
+    document.addEventListener('pointerdown', onPickerDocPointerDown);
+    void loadPicker();
+  }
+});
+onBeforeUnmount(() => document.removeEventListener('pointerdown', onPickerDocPointerDown));
+
+function reviewFromPicker(oid: string) {
+  pickerOpen.value = false;
+  void router.push(`/s/${props.id}/changes?rev=${oid}`);
+}
+
+function reviewAllFromPicker() {
+  pickerOpen.value = false;
+  reviewAllChanges();
+}
 </script>
 
 <template>
@@ -421,15 +801,111 @@ onMounted(load);
     data-testid="changes-panel"
   >
     <header class="flex flex-wrap items-center gap-2 border-b border-line px-3 py-2">
-      <div class="min-w-0 flex-1">
+      <!-- A fixed width keeps the row from shifting when the glyph swaps. -->
+      <button
+        type="button"
+        class="btn-secondary w-8 px-0 py-1 text-xs"
+        data-testid="changes-aside-toggle"
+        :aria-pressed="asideOpen"
+        title="Expand file tree"
+        @click="asideOpen = !asideOpen"
+      >
+        {{ asideOpen ? '✕' : '◫' }}
+      </button>
+      <div class="relative min-w-0 flex-1">
         <h2 class="text-sm font-semibold text-fg">Changes</h2>
-        <p
-          v-if="changes?.base.state === 'available'"
-          class="truncate font-mono text-2xs text-faint"
+        <div class="flex items-center gap-2">
+          <p
+            v-if="changes?.base.state === 'available'"
+            class="truncate font-mono text-2xs text-faint"
+          >
+            {{ changes.base.reference }} · {{ changes.base.oid.slice(0, 10) }}
+          </p>
+          <button
+            v-if="changes"
+            ref="pickerToggleEl"
+            type="button"
+            class="btn-secondary px-2 py-0.5 text-2xs"
+            data-testid="changes-commit-scope-button"
+            title="Pick which commit the review covers"
+            @click="pickerOpen = !pickerOpen"
+          >
+            {{ rev ? `Commit ${rev.slice(0, 10)}` : 'All commits' }}
+          </button>
+        </div>
+
+        <!-- The commit picker: scope the review to one commit's own changes.
+             -->
+        <div
+          v-if="pickerOpen"
+          ref="pickerEl"
+          class="absolute left-0 top-full z-30 mt-1 w-[min(28rem,calc(100vw-1.5rem))] rounded-lg border border-line bg-surface shadow-xl"
+          data-testid="changes-commit-picker"
         >
-          {{ changes.base.reference }} · {{ changes.base.oid.slice(0, 10) }}
-        </p>
+          <div class="flex items-center justify-between border-b border-line px-3 py-2">
+            <button
+              type="button"
+              class="btn-primary px-2.5 py-1 text-xs"
+              data-testid="changes-review-all"
+              @click="reviewAllFromPicker"
+            >
+              Review all commits
+            </button>
+            <button
+              type="button"
+              class="btn-secondary px-2 py-1 text-xs"
+              aria-label="Close the commit picker"
+              @click="pickerOpen = false"
+            >
+              ✕
+            </button>
+          </div>
+          <p class="border-b border-line px-3 py-2 text-xs font-semibold text-fg">
+            Select a commit to review
+          </p>
+          <div class="max-h-[min(50vh,26rem)] overflow-y-auto">
+            <p v-if="pickerLoading" class="p-3 text-sm text-muted">Loading commits…</p>
+            <p
+              v-else-if="pickerError"
+              class="m-3 rounded bg-block-soft p-2 text-xs text-block"
+              role="alert"
+            >
+              {{ pickerError }}
+            </p>
+            <CommitList
+              v-else-if="pickerCommits?.length"
+              :commits="pickerCommits"
+              @review="reviewFromPicker"
+            />
+            <p v-else class="p-3 text-sm text-muted">No commits on this branch beyond its base.</p>
+          </div>
+        </div>
       </div>
+      <ReviewTray
+        :floating="false"
+        :reviews="reviews"
+        :draft="draft"
+        :open="trayOpen"
+        :overall-note="overallNote"
+        :summary-saving="summarySaving || summaryDirty"
+        :acknowledge-outdated="acknowledgeOutdated"
+        :error="trayError"
+        :layout-busy="false"
+        :submitting="submitting"
+        :discarding="discarding"
+        :delivery-errors="deliveryErrors"
+        subject-label="changes"
+        :discard-action="discardDraft"
+        @update:open="trayOpen = $event"
+        @update:overall-note="editOverall"
+        @update:acknowledge-outdated="acknowledgeOutdated = $event"
+        @navigate="navigate"
+        @focus-comment="focusComment"
+        @save-overall="saveOverall"
+        @retarget="retarget"
+        @submit="submit"
+        @retry="retryDelivery"
+      />
       <span v-if="changes" class="text-xs text-muted">
         {{ changes.totals.files }} files · +{{ changes.totals.additions }} −{{
           changes.totals.deletions
@@ -437,6 +913,17 @@ onMounted(load);
       </span>
       <button type="button" class="btn-secondary px-2 py-1 text-xs" @click="load">Refresh</button>
     </header>
+    <p
+      v-if="rev && changes"
+      class="flex flex-wrap items-center gap-2 border-b border-line bg-subtle/50 px-3 py-1.5 text-xs text-muted"
+      data-testid="changes-commit-scope"
+    >
+      Reviewing commit <code class="font-mono text-fg">{{ rev.slice(0, 10) }}</code> — its own
+      changes only.
+      <button type="button" class="btn-secondary px-2 py-0.5 text-2xs" @click="reviewAllChanges">
+        All changes
+      </button>
+    </p>
 
     <p v-if="error" class="m-3 rounded bg-block-soft p-2 text-xs text-block" role="alert">
       {{ error }}
@@ -447,140 +934,290 @@ onMounted(load);
     >
       {{ baseProblem }}
     </p>
-    <div v-else class="min-h-0 flex-1 overflow-auto">
-      <p v-if="loading && !changes" class="p-3 text-sm text-muted">Loading changes…</p>
-      <p v-else-if="changes && !changes.files.length" class="p-3 text-sm text-muted">
-        No branch or worktree changes.
-      </p>
-      <p v-if="changes?.truncated" class="m-3 rounded bg-block-soft p-2 text-xs text-block">
-        This response reached its explicit display bounds. Refresh after narrowing the change set;
-        the version still covers all final bytes when available.
-      </p>
-
-      <article v-for="file in changes?.files" :key="file.path.bytes" class="border-b border-line">
-        <button
-          type="button"
-          class="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-subtle"
-          :aria-expanded="expanded.has(fileKey(file))"
-          @click="toggleFile(file)"
-        >
-          <span class="w-4 text-faint">{{ expanded.has(fileKey(file)) ? '▾' : '▸' }}</span>
-          <span class="rounded bg-subtle px-1.5 py-0.5 text-2xs uppercase text-muted">
-            {{ file.status }}
-          </span>
-          <code class="min-w-0 flex-1 truncate text-xs">{{ file.path.display }}</code>
-          <span class="text-2xs text-faint">{{ file.sources.join(' · ') }}</span>
-          <span class="font-mono text-2xs text-muted"
-            >+{{ file.additions ?? '–' }} −{{ file.deletions ?? '–' }}</span
-          >
-        </button>
-
-        <div v-if="expanded.has(fileKey(file))" class="overflow-x-auto bg-code font-mono text-xs">
-          <p v-if="file.content !== 'text'" class="px-4 py-3 text-muted">
-            {{ file.content }} content is not rendered.
-          </p>
-          <div v-for="hunk in file.hunks" :key="hunk.header">
-            <p class="sticky left-0 bg-subtle px-3 py-1 text-accent">{{ hunk.header }}</p>
-            <button
-              v-for="line in hunk.lines"
-              :key="`${line.old_line}:${line.new_line}:${line.kind}`"
-              type="button"
-              class="grid min-w-full grid-cols-[3rem_3rem_1rem_1fr] text-left hover:bg-subtle focus:bg-subtle"
-              :class="{
-                'bg-green-950/20': line.kind === 'addition',
-                'bg-red-950/20': line.kind === 'deletion',
-              }"
-              :aria-label="`Comment on ${file.path.display} ${lineSide(line)} line ${lineNumber(line, lineSide(line))}`"
-              @click="selectLine(file, hunk, line)"
-              @keydown.shift.up.prevent="extendSelection(file, hunk, line, -1)"
-              @keydown.shift.down.prevent="extendSelection(file, hunk, line, 1)"
-            >
-              <span class="select-none px-1 text-right text-faint">{{ line.old_line }}</span>
-              <span class="select-none px-1 text-right text-faint">{{ line.new_line }}</span>
-              <span class="select-none text-center">{{
-                line.kind === 'addition' ? '+' : line.kind === 'deletion' ? '−' : ' '
-              }}</span>
-              <span class="whitespace-pre px-1">{{ line.text || ' ' }}</span>
-            </button>
-          </div>
-        </div>
-      </article>
-
-      <div v-if="draft?.comments.length" class="space-y-1 p-3">
-        <template v-if="draft">
-          <ReviewCommentCard
-            v-for="comment in draft.comments"
-            :key="comment.id"
-            :review="draft"
-            :comment="comment"
-            :active="activeComment === comment.id"
-            :reanchoring="reanchorComment === comment.id"
-            :error="commentErrors[comment.id] ?? ''"
-            :delete-action="removeComment"
-            @focus="activeComment = $event"
-            @close="activeComment = null"
-            @edit="editComment"
-            @reanchor="reanchorComment = $event"
-            @cancel-reanchor="reanchorComment = null"
+    <div v-else class="flex min-h-0 flex-1">
+      <aside
+        v-if="asideOpen"
+        ref="asideEl"
+        class="shrink-0 overflow-y-auto border-r border-line"
+        :style="{ width: `${asideWidth}px` }"
+        aria-label="Change files"
+        data-testid="changes-aside"
+      >
+        <div class="sticky top-0 z-10 border-b border-line bg-surface p-2">
+          <input
+            v-model="asideFilter"
+            type="search"
+            placeholder="Filter files…"
+            class="w-full rounded border border-line bg-input px-2 py-1 text-xs text-fg outline-none focus:border-accent"
+            data-testid="changes-aside-filter"
           />
-        </template>
+        </div>
+        <button
+          v-for="row in asideRows"
+          :key="row.node.path"
+          type="button"
+          class="flex w-full items-center gap-1.5 py-1 pr-2 text-left text-2xs hover:bg-subtle"
+          :style="{ paddingLeft: `${row.depth * 12 + 8}px` }"
+          :data-aside-folder="row.node.folder ? row.node.path : undefined"
+          :data-aside-file="row.node.file ? row.node.file.entry.path.display : undefined"
+          :title="row.node.path"
+          @click="row.node.folder ? toggleFolder(row.node.path) : jumpTo(row.node.file!.entry)"
+        >
+          <span v-if="row.node.folder" class="w-3 shrink-0 text-faint" aria-hidden="true">
+            {{ collapsedFolders.has(row.node.path) && !asideFilter.trim() ? '▸' : '▾' }}
+          </span>
+          <span
+            v-else
+            class="shrink-0 rounded bg-subtle px-1 uppercase text-muted"
+            :title="row.node.file!.entry.status"
+          >
+            {{ row.node.file!.entry.status.slice(0, 1) }}
+          </span>
+          <span class="min-w-0 flex-1 truncate" :class="row.node.folder ? 'text-muted' : 'text-fg'">
+            {{ row.node.name }}
+          </span>
+          <span
+            v-if="row.node.pending"
+            class="shrink-0 rounded-full bg-accent/20 px-1.5 text-2xs text-accent"
+            title="Pending comments"
+          >
+            {{ row.node.pending }}
+          </span>
+          <span v-if="row.node.file" class="shrink-0 font-mono text-2xs text-muted"
+            >+{{ row.node.file.entry.additions ?? '–' }} −{{
+              row.node.file.entry.deletions ?? '–'
+            }}</span
+          >
+          <span v-else class="shrink-0 text-2xs text-faint">{{ row.node.count }}</span>
+        </button>
+        <p v-if="!asideRows.length" class="p-3 text-center text-2xs text-faint">No files match.</p>
+      </aside>
+      <div
+        v-if="asideOpen"
+        class="w-1 shrink-0 cursor-col-resize bg-line hover:bg-accent"
+        title="Drag to resize the file rail"
+        data-testid="changes-aside-resize"
+        @mousedown="startAsideDrag"
+      ></div>
+      <div class="min-h-0 min-w-0 flex-1 overflow-auto">
+        <p v-if="loading && !changes" class="p-3 text-sm text-muted">Loading changes…</p>
+        <p v-else-if="changes && !changes.files.length" class="p-3 text-sm text-muted">
+          No branch or worktree changes.
+        </p>
+        <p v-if="changes?.truncated" class="m-3 rounded bg-block-soft p-2 text-xs text-block">
+          This response reached its explicit display bounds. Refresh after narrowing the change set;
+          the version still covers all final bytes when available.
+        </p>
+
+        <section
+          v-if="outdatedComments.length"
+          class="border-b border-line"
+          aria-label="Outdated comments"
+          data-testid="outdated-comments"
+        >
+          <button
+            type="button"
+            class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-subtle"
+            :aria-expanded="outdatedOpen"
+            data-testid="outdated-comments-toggle"
+            @click="outdatedOpen = !outdatedOpen"
+          >
+            <span class="w-4 text-faint" aria-hidden="true">{{ outdatedOpen ? '▾' : '▸' }}</span>
+            <span>Outdated comments</span>
+            <span
+              class="rounded-full bg-accent/20 px-1.5 text-2xs text-accent"
+              title="Outdated comments"
+            >
+              {{ outdatedComments.length }}
+            </span>
+          </button>
+          <template v-if="outdatedOpen">
+            <p class="px-3 pb-2 text-2xs text-faint">
+              These comments anchor to lines this view no longer shows — they still submit with the
+              review, and can be re-anchored onto a current line.
+            </p>
+            <div
+              v-for="comment in outdatedComments"
+              :key="comment.id"
+              class="border-t border-line bg-code p-2"
+            >
+              <p class="mb-1 truncate font-mono text-2xs text-faint">
+                {{ (comment.anchor as ChangeAnchor).path.display }} ·
+                {{ (comment.anchor as ChangeAnchor).side }}
+                {{ (comment.anchor as ChangeAnchor).start_line }}–{{
+                  (comment.anchor as ChangeAnchor).end_line
+                }}
+              </p>
+              <ReviewCommentCard
+                :review="draft!"
+                :comment="comment"
+                :active="activeComment === comment.id"
+                :reanchoring="reanchorComment === comment.id"
+                :error="commentErrors[comment.id] ?? ''"
+                :delete-action="removeComment"
+                @focus="activeComment = $event"
+                @close="activeComment = null"
+                @edit="editComment"
+                @reanchor="reanchorComment = $event"
+                @cancel-reanchor="reanchorComment = null"
+              />
+            </div>
+          </template>
+        </section>
+
+        <article v-for="file in changes?.files" :key="file.path.bytes" class="border-b border-line">
+          <button
+            type="button"
+            class="sticky top-0 z-10 flex w-full items-center gap-2 border-b border-line bg-surface px-3 py-2 text-left hover:bg-subtle"
+            :aria-expanded="isExpanded(file)"
+            @click="toggleFile(file)"
+          >
+            <span class="w-4 text-faint">{{ isExpanded(file) ? '▾' : '▸' }}</span>
+            <span class="rounded bg-subtle px-1.5 py-0.5 text-2xs uppercase text-muted">
+              {{ file.status }}
+            </span>
+            <code class="min-w-0 flex-1 truncate text-xs">{{ file.path.display }}</code>
+            <span class="text-2xs text-faint">{{ file.sources.join(' · ') }}</span>
+            <span class="font-mono text-2xs text-muted"
+              >+{{ file.additions ?? '–' }} −{{ file.deletions ?? '–' }}</span
+            >
+          </button>
+
+          <div v-if="isExpanded(file)" class="overflow-x-auto bg-code text-xs">
+            <p v-if="file.content !== 'text'" class="px-4 py-3 font-mono text-muted">
+              {{ file.content }} content is not rendered.
+            </p>
+            <div v-else :ref="(el) => observeFile(el, file)" :data-file-key="fileKey(file)">
+              <DiffViewWithMultiSelect
+                v-if="mounted.has(fileKey(file)) && gitDiffData(file)"
+                :key="`${fileKey(file)}:${changes?.version}`"
+                :data="gitDiffData(file)!"
+                :diff-view-mode="DiffModeEnum.Split"
+                :diff-view-theme="theme"
+                :diff-view-highlight="true"
+                :diff-view-add-widget="true"
+                :extend-data="extendDataFor(file)"
+                :initial-widget-state="widgetStateFor(file)"
+                :scope-multi-select-to-hunk="scopeToHunk(file)"
+                @on-add-widget-click="(payload) => onAddWidgetClick(file, payload)"
+              >
+                <template #widget="{ onClose }">
+                  <form
+                    v-if="pending && pending.fileKey === fileKey(file)"
+                    class="m-2 rounded border border-accent bg-surface p-2 text-xs shadow-xl"
+                    data-testid="change-comment-composer"
+                    @submit.prevent="confirmPending(onClose)"
+                  >
+                    <template v-if="pending.reanchorId != null">
+                      <p class="mb-2 text-2xs text-muted">
+                        Move comment #{{ pending.reanchorId }} to
+                        {{ pending.anchor.path.display }} · {{ pending.anchor.side }}
+                        {{ pending.anchor.start_line }}–{{ pending.anchor.end_line }}?
+                      </p>
+                      <div class="flex justify-end gap-2">
+                        <button
+                          type="button"
+                          class="btn-secondary px-2 py-1 text-xs"
+                          @click="cancelPending(onClose)"
+                        >
+                          Cancel
+                        </button>
+                        <button type="submit" class="btn-primary px-2 py-1 text-xs">
+                          Move comment here
+                        </button>
+                      </div>
+                    </template>
+                    <template v-else-if="confirmDiscard">
+                      <p
+                        class="mb-2 text-2xs text-block"
+                        data-testid="change-comment-discard-confirm"
+                      >
+                        Discard this pending comment?
+                      </p>
+                      <div class="flex justify-end gap-2" @keydown.esc.stop.prevent="keepEditing">
+                        <button
+                          type="button"
+                          class="btn-secondary px-2 py-1 text-xs"
+                          @click="keepEditing"
+                        >
+                          Keep editing
+                        </button>
+                        <button
+                          :ref="setDiscardButton"
+                          type="button"
+                          class="rounded bg-block px-2 py-1 text-xs text-white"
+                          @click="cancelPending(onClose)"
+                        >
+                          Discard comment
+                        </button>
+                      </div>
+                    </template>
+                    <template v-else>
+                      <p class="mb-1 text-2xs font-semibold uppercase text-accent">
+                        {{ pending.anchor.path.display }} · {{ pending.anchor.side }}
+                        {{ pending.anchor.start_line }}–{{ pending.anchor.end_line }}
+                      </p>
+                      <textarea
+                        :ref="setComposerInput"
+                        v-model="pending.body"
+                        rows="3"
+                        class="w-full rounded border border-line bg-input p-2 text-xs"
+                        @keydown.ctrl.enter.prevent="confirmPending(onClose)"
+                        @keydown.meta.enter.prevent="confirmPending(onClose)"
+                        @keydown.esc.prevent="requestCancel(onClose)"
+                      ></textarea>
+                      <div class="mt-2 flex justify-end gap-2">
+                        <button
+                          type="button"
+                          class="btn-secondary px-2 py-1 text-xs"
+                          @click="requestCancel(onClose)"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="submit"
+                          class="btn-primary px-2 py-1 text-xs"
+                          :disabled="!pending.body.trim() || savingComment"
+                        >
+                          {{ savingComment ? 'Saving…' : 'Add pending comment' }}
+                        </button>
+                      </div>
+                    </template>
+                  </form>
+                </template>
+                <template #extend="{ data }">
+                  <div class="space-y-1 bg-surface p-2">
+                    <ReviewCommentCard
+                      v-for="comment in data as ReviewComment[]"
+                      :key="comment.id"
+                      :review="draft!"
+                      :comment="comment"
+                      :active="activeComment === comment.id"
+                      :reanchoring="reanchorComment === comment.id"
+                      :error="commentErrors[comment.id] ?? ''"
+                      :delete-action="removeComment"
+                      @focus="activeComment = $event"
+                      @close="activeComment = null"
+                      @edit="editComment"
+                      @reanchor="reanchorComment = $event"
+                      @cancel-reanchor="reanchorComment = null"
+                    />
+                  </div>
+                </template>
+              </DiffViewWithMultiSelect>
+              <p
+                v-else-if="!mounted.has(fileKey(file))"
+                class="px-4 py-8 text-center text-2xs text-faint"
+              >
+                Loading diff…
+              </p>
+              <p v-else class="px-4 py-8 text-center text-2xs text-faint">No renderable diff.</p>
+            </div>
+          </div>
+        </article>
       </div>
     </div>
 
-    <form
-      v-if="pending"
-      class="absolute bottom-14 left-3 z-30 w-[min(30rem,calc(100%-1.5rem))] rounded border border-accent bg-surface p-2 shadow-xl"
-      data-testid="change-comment-composer"
-      @submit.prevent="saveComment"
-    >
-      <p class="mb-1 text-2xs font-semibold uppercase text-accent">
-        {{ pending.anchor.path.display }} · {{ pending.anchor.side }}
-        {{ pending.anchor.start_line }}–{{ pending.anchor.end_line }}
-      </p>
-      <textarea
-        ref="composerInput"
-        v-model="pending.body"
-        rows="3"
-        class="w-full rounded border border-line bg-input p-2 text-xs"
-      ></textarea>
-      <div class="mt-2 flex justify-end gap-2">
-        <button type="button" class="btn-secondary px-2 py-1 text-xs" @click="pending = null">
-          Cancel
-        </button>
-        <button
-          type="submit"
-          class="btn-primary px-2 py-1 text-xs"
-          :disabled="!pending.body.trim() || savingComment"
-        >
-          {{ savingComment ? 'Saving…' : 'Add pending comment' }}
-        </button>
-      </div>
-    </form>
-
-    <ReviewTray
-      :reviews="reviews"
-      :draft="draft"
-      :open="trayOpen"
-      :overall-note="overallNote"
-      :summary-saving="summarySaving || summaryDirty"
-      :acknowledge-outdated="acknowledgeOutdated"
-      :error="trayError"
-      :layout-busy="false"
-      :submitting="submitting"
-      :discarding="discarding"
-      :delivery-errors="deliveryErrors"
-      subject-label="changes"
-      :discard-action="discardDraft"
-      @update:open="trayOpen = $event"
-      @update:overall-note="editOverall"
-      @update:acknowledge-outdated="acknowledgeOutdated = $event"
-      @navigate="navigate"
-      @focus-comment="activeComment = $event"
-      @save-overall="saveOverall"
-      @retarget="retarget"
-      @submit="submit"
-      @retry="retryDelivery"
-    />
     <p v-if="notice" class="absolute bottom-1 left-3 text-2xs text-accent" role="status">
       {{ notice }}
     </p>
