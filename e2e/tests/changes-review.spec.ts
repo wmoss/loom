@@ -359,3 +359,70 @@ test("mixed expand clicks never leave a dead hunk bar behind", async ({
     })
     .toBe(0);
 });
+
+test("submitted comments persist in the diff and resolve from collapsed", async ({
+  page,
+  weaver,
+}) => {
+  const session = await weaver.seedSession({
+    goal: "submit then resolve",
+    name: "submitted-comments",
+  });
+  const changedPath = join(session.work_dir, "resolve.txt");
+  const twenty = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`);
+  writeFileSync(changedPath, twenty.join("\n") + "\n");
+
+  await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
+  const fileToggle = page.getByRole("button", { name: /resolve\.txt/ });
+  const article = page.locator("article").filter({ has: fileToggle });
+  await (await addWidgetButton(article, "new", 5)).click();
+  const composer = page.getByTestId("change-comment-composer");
+  await composer.locator("textarea").fill("Submitted comments persist here.");
+  await composer.getByRole("button", { name: "Add pending comment" }).click();
+  await expect(article).toContainText("Submitted comments persist here.");
+
+  // Submitting does not pull the comment out of the diff: it stays inline as
+  // a collapsed submitted thread.
+  await page.getByTestId("review-tray-toggle").click();
+  const submitted = page.waitForResponse(
+    (response) =>
+      response.ok() &&
+      new URL(response.url()).pathname === "/api/reviews/submit",
+  );
+  await page.getByTestId("submit-review").click();
+  await submitted;
+  // The card stayed open across the submit; its Resolve control proves the
+  // thread is now submitted and still inline.
+  const card = article
+    .locator("[data-review-card]")
+    .filter({ hasText: "Submitted comments persist here." });
+  await expect(card.getByRole("button", { name: "Resolve" })).toBeVisible();
+  const resolved = page.waitForResponse(
+    (response) =>
+      response.ok() &&
+      new URL(response.url()).pathname === "/api/reviews/comments/resolve",
+  );
+  await card.getByRole("button", { name: "Resolve" }).click();
+  await resolved;
+  await expect(card).toContainText("Resolved");
+
+  // Closing collapses the resolved thread to a pill that still shows its
+  // state and can be clicked open again to un-resolve.
+  const pill = article
+    .locator("[data-review-collapsed]")
+    .filter({ hasText: "Submitted comments persist here." });
+  await card.getByRole("button", { name: "Close" }).click();
+  await expect(pill).toContainText("Resolved");
+  await pill.click();
+  await card.getByRole("button", { name: "Reopen" }).click();
+  await card.getByRole("button", { name: "Close" }).click();
+  await expect(pill).toContainText("Submitted");
+
+  // When the anchored line later leaves the view, the submitted comment moves
+  // to the outdated section instead of vanishing.
+  writeFileSync(changedPath, twenty.slice(0, 3).join("\n") + "\n");
+  await page.getByRole("button", { name: "Refresh" }).click();
+  const section = page.getByTestId("outdated-comments");
+  await expect(section).toBeVisible();
+  await expect(section).toContainText("Submitted comments persist here.");
+});

@@ -8,6 +8,7 @@ import '@git-diff-view/vue/styles/diff-view-pure.css';
 import {
   addReviewComment,
   createReview,
+  resolveReviewComment,
   deleteReviewComment,
   discardReview,
   getChanges,
@@ -162,14 +163,29 @@ function anchorPlaced(anchor: ChangeAnchor): boolean {
   return false;
 }
 
-/** Draft comments that cannot be placed inline in this view — the anchored
- * file left the change set, or its lines are no longer rendered. They still
- * submit with the review, so they persist in the outdated section where they
- * can be edited, re-anchored, or deleted. */
-const outdatedComments = computed(() =>
-  (draft.value?.comments ?? []).filter(
-    (comment) => comment.anchor_kind === 'change' && !anchorPlaced(comment.anchor as ChangeAnchor),
+/** One change comment paired with the review it belongs to. Draft and
+ * submitted reviews place comments through exactly one code path: this union
+ * feeds both the inline widgets and the outdated section. */
+interface ReviewCommentEntry {
+  review: Review;
+  comment: ReviewComment;
+}
+
+const changeCommentEntries = computed<ReviewCommentEntry[]>(() =>
+  (reviews.value ?? []).flatMap((review) =>
+    review.comments
+      .filter((comment) => comment.anchor_kind === 'change')
+      .map((comment) => ({ review, comment })),
   ),
+);
+
+/** Comments — draft or submitted — that cannot be placed inline in this
+ * view: the anchored file left the change set, or its lines are no longer
+ * rendered. Drafts still submit with the review, so everything persists in
+ * the outdated section where drafts can be edited, re-anchored, or deleted
+ * and submitted comments can be resolved. */
+const outdatedComments = computed(() =>
+  changeCommentEntries.value.filter((entry) => !anchorPlaced(entry.comment.anchor as ChangeAnchor)),
 );
 
 const baseProblem = computed(() => {
@@ -372,18 +388,17 @@ function widgetStateFor(file: ChangeFile): { side: SplitSide; lineNumber: number
 }
 
 function extendDataFor(file: ChangeFile): {
-  oldFile: Record<string, { data: ReviewComment[] }>;
-  newFile: Record<string, { data: ReviewComment[] }>;
+  oldFile: Record<string, { data: ReviewCommentEntry[] }>;
+  newFile: Record<string, { data: ReviewCommentEntry[] }>;
 } {
-  const oldFile: Record<string, { data: ReviewComment[] }> = {};
-  const newFile: Record<string, { data: ReviewComment[] }> = {};
-  for (const comment of draft.value?.comments ?? []) {
-    if (comment.anchor_kind !== 'change') continue;
-    const anchor = comment.anchor as ChangeAnchor;
+  const oldFile: Record<string, { data: ReviewCommentEntry[] }> = {};
+  const newFile: Record<string, { data: ReviewCommentEntry[] }> = {};
+  for (const entry of changeCommentEntries.value) {
+    const anchor = entry.comment.anchor as ChangeAnchor;
     if (anchor.path.bytes !== file.path.bytes || !anchorPlaced(anchor)) continue;
     const bucket = anchor.side === 'old' ? oldFile : newFile;
     const key = String(anchor.end_line);
-    (bucket[key] ??= { data: [] }).data.push(comment);
+    (bucket[key] ??= { data: [] }).data.push(entry);
   }
   return { oldFile, newFile };
 }
@@ -603,15 +618,17 @@ async function retryDelivery(item: Review) {
   }
 }
 
-/** Marks a draft comment active and reveals it: expanding and force-mounting
- * its file when needed, then scrolling its card — inline or in the outdated
- * section — into view. Shared by the tray's prev/next and direct clicks. */
+/** Marks a comment — draft or submitted — active and reveals it: expanding
+ * and force-mounting its file when needed, then scrolling its card — inline
+ * or in the outdated section — into view. Shared by the tray's prev/next and
+ * direct clicks. */
 function focusComment(commentId: number) {
-  const comment = draft.value?.comments.find((item) => item.id === commentId);
-  if (!comment) return;
-  if (outdatedComments.value.some((item) => item.id === commentId)) outdatedOpen.value = true;
-  if (comment.anchor_kind === 'change') {
-    const key = (comment.anchor as ChangeAnchor).path.bytes;
+  const entry = changeCommentEntries.value.find((item) => item.comment.id === commentId);
+  if (!entry) return;
+  if (outdatedComments.value.some((item) => item.comment.id === commentId))
+    outdatedOpen.value = true;
+  if (entry.comment.anchor_kind === 'change') {
+    const key = (entry.comment.anchor as ChangeAnchor).path.bytes;
     collapsed.delete(key);
     mounted.add(key);
   }
@@ -624,10 +641,23 @@ function focusComment(commentId: number) {
 }
 
 function navigate(direction: number) {
-  const comments = draft.value?.comments ?? [];
+  const comments = changeCommentEntries.value;
   if (!comments.length) return;
-  const current = comments.findIndex((comment) => comment.id === activeComment.value);
-  focusComment(comments[(current + direction + comments.length) % comments.length].id);
+  const current = comments.findIndex((entry) => entry.comment.id === activeComment.value);
+  focusComment(comments[(current + direction + comments.length) % comments.length].comment.id);
+}
+
+/** Resolve or reopen a submitted review's comment in place. */
+async function toggleResolved(commentId: number, resolved: boolean) {
+  const entry = changeCommentEntries.value.find((item) => item.comment.id === commentId);
+  if (!entry) return;
+  try {
+    const comment = await resolveReviewComment(entry.review.id, commentId, resolved);
+    const index = entry.review.comments.findIndex((item) => item.id === commentId);
+    if (index >= 0) entry.review.comments.splice(index, 1, comment);
+  } catch (cause) {
+    commentErrors[commentId] = (cause as Error).message;
+  }
 }
 
 watch(rev, () => void load());
@@ -1033,33 +1063,35 @@ function reviewAllFromPicker() {
           </button>
           <template v-if="outdatedOpen">
             <p class="px-3 pb-2 text-2xs text-faint">
-              These comments anchor to lines this view no longer shows — they still submit with the
-              review, and can be re-anchored onto a current line.
+              These comments anchor to lines this view no longer shows. Drafts still submit with the
+              review and can be re-anchored onto a current line; submitted ones stay for the record
+              and can be resolved.
             </p>
             <div
-              v-for="comment in outdatedComments"
-              :key="comment.id"
+              v-for="entry in outdatedComments"
+              :key="entry.comment.id"
               class="border-t border-line bg-code p-2"
             >
               <p class="mb-1 truncate font-mono text-2xs text-faint">
-                {{ (comment.anchor as ChangeAnchor).path.display }} ·
-                {{ (comment.anchor as ChangeAnchor).side }}
-                {{ (comment.anchor as ChangeAnchor).start_line }}–{{
-                  (comment.anchor as ChangeAnchor).end_line
+                {{ (entry.comment.anchor as ChangeAnchor).path.display }} ·
+                {{ (entry.comment.anchor as ChangeAnchor).side }}
+                {{ (entry.comment.anchor as ChangeAnchor).start_line }}–{{
+                  (entry.comment.anchor as ChangeAnchor).end_line
                 }}
               </p>
               <ReviewCommentCard
-                :review="draft!"
-                :comment="comment"
-                :active="activeComment === comment.id"
-                :reanchoring="reanchorComment === comment.id"
-                :error="commentErrors[comment.id] ?? ''"
+                :review="entry.review"
+                :comment="entry.comment"
+                :active="activeComment === entry.comment.id"
+                :reanchoring="reanchorComment === entry.comment.id"
+                :error="commentErrors[entry.comment.id] ?? ''"
                 :delete-action="removeComment"
                 @focus="activeComment = $event"
                 @close="activeComment = null"
                 @edit="editComment"
                 @reanchor="reanchorComment = $event"
                 @cancel-reanchor="reanchorComment = null"
+                @resolution="toggleResolved"
               />
             </div>
           </template>
@@ -1188,19 +1220,20 @@ function reviewAllFromPicker() {
                 <template #extend="{ data }">
                   <div class="space-y-1 bg-surface p-2">
                     <ReviewCommentCard
-                      v-for="comment in data as ReviewComment[]"
-                      :key="comment.id"
-                      :review="draft!"
-                      :comment="comment"
-                      :active="activeComment === comment.id"
-                      :reanchoring="reanchorComment === comment.id"
-                      :error="commentErrors[comment.id] ?? ''"
+                      v-for="entry in data as ReviewCommentEntry[]"
+                      :key="entry.comment.id"
+                      :review="entry.review"
+                      :comment="entry.comment"
+                      :active="activeComment === entry.comment.id"
+                      :reanchoring="reanchorComment === entry.comment.id"
+                      :error="commentErrors[entry.comment.id] ?? ''"
                       :delete-action="removeComment"
                       @focus="activeComment = $event"
                       @close="activeComment = null"
                       @edit="editComment"
                       @reanchor="reanchorComment = $event"
                       @cancel-reanchor="reanchorComment = null"
+                      @resolution="toggleResolved"
                     />
                   </div>
                 </template>
