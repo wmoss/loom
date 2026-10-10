@@ -75,6 +75,35 @@ loom by hand, isolate it the same way:
 WEAVER_HOME=$(mktemp -d) loom server run --addr 127.0.0.1:0
 ```
 
+## Delegating to subsessions
+
+When a task benefits from a subagent, launch one with `loom launch` rather than
+your harness's built-in subagent tool: a loom child gets its own worktree, branch,
+and credential context, is observable on the dashboard, and its result arrives
+durably on your channel. One rule governs the whole exchange: **everything
+crosses a loom channel or a repo-shared artifact — never another session's
+worktree.**
+
+- **Brief in-bounds.** A child cannot read your worktree; an out-of-bounds read
+  stalls it on a permission prompt nobody answers. Put short briefs inline in
+  the launch goal, long ones in a repo-shared artifact (`loom artifacts write
+  <name> --repo`) and name it in the goal (`loom artifacts show <name> --repo`).
+  Point at git refs — branches and commit ranges are visible from every worktree
+  of the shared repo — not at filesystem paths.
+- **Take results back in-bounds.** Have the child deliver with `loom channels
+  send --kind result`, with the substantive content in the message or published
+  as a repo-shared artifact it names. Don't ask it to drop a file in its worktree
+  for you to open — the parent has no more business reading the child's worktree
+  than the child has reading yours.
+- **Wait, don't poll.** `loom channels wait --channel <id> --kind result` blocks
+  until the child's result lands (raise `--timeout` for long reviews);
+  `loom sessions preview <id>` if a child goes quiet mid-flight. A
+  `[permission] … (pending)` line means the brief went out-of-bounds — fix the
+  brief and relaunch instead of waiting.
+- **Clean up.** A review-only child that made no commits can be `loom sessions
+  rm`'d when its result lands (check `loom sessions commits <id>` first); keep
+  children that produced durable work.
+
 ## Landing changes
 
 The full commit → lint-review decision → PR → CI handoff flow is the
