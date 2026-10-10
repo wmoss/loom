@@ -266,7 +266,8 @@ pub mod subscription {
 pub mod wait {
     use super::prelude::*;
 
-    /// Wait for the next matching channel message.
+    /// Wait for the next matching channel message. A returned message counts
+    /// as read for the caller.
     #[operation(id = "channels.wait", actor = SessionSelf, scope = Channel, risk = Read,
                 grants = ["loom/channels/read@v1"], cli = "channels wait", view = View,
                 render = custom)]

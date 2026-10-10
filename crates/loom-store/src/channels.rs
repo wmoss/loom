@@ -485,6 +485,7 @@ pub async fn mark_read(
     // subscription to `observe`. The default only applies when this is the
     // subject's first interaction with the channel.
     advance_read_tx(&mut tx, channel_id, subject, seq, &now).await?;
+    retract_consumed_result_notices_tx(&mut tx, channel_id, subject, seq).await?;
     let row = sqlx::query_as::<_, SubscriptionRow>(
         "SELECT * FROM channel_subscriptions
          WHERE channel_id = ? AND subject_kind = ? AND subject_id = ?",
@@ -496,6 +497,71 @@ pub async fn mark_read(
     .await?;
     tx.commit().await?;
     Ok(subscription_view(row))
+}
+
+/// The idempotency-key prefix linking a child's `result` to the notice Loom
+/// appends to the parent's channel for it.
+pub const CHILD_RESULT_NOTICE_KEY_PREFIX: &str = "child-result:";
+
+/// Idempotency key of the notice a child's `result` produces on the parent's
+/// channel. Defined beside the retraction that looks the notice up by it.
+pub fn child_result_notice_key(result_message_id: &str) -> String {
+    format!("{CHILD_RESULT_NOTICE_KEY_PREFIX}{result_message_id}")
+}
+
+/// A queued child-result notice tells the parent to read the result. Once the
+/// parent's read marker on the child's channel passes the result, the notice
+/// is stale: retract it from the parent's prompt queue so the next turn
+/// boundary does not deliver a pointer to something already consumed. Only the
+/// notice's own recipient retracts — another ancestor reading the child's
+/// channel says nothing about the parent's queue. The check is best-effort at
+/// read time: a read that races in after the result exists but before the
+/// notice paragraph is queued retracts nothing, and that notice is then
+/// delivered as it always was.
+async fn retract_consumed_result_notices_tx(
+    tx: &mut SqliteConnection,
+    channel_id: &str,
+    reader: &Subject,
+    read_seq: i64,
+) -> Result<()> {
+    if reader.kind != SubjectKind::Session {
+        return Ok(());
+    }
+    let child: Option<String> = sqlx::query_scalar(
+        "SELECT session_id FROM channels WHERE id = ? AND session_id IS NOT NULL",
+    )
+    .bind(channel_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(child) = child else {
+        return Ok(());
+    };
+    let parent: Option<String> =
+        sqlx::query_scalar("SELECT parent_session_id FROM sessions WHERE id = ?")
+            .bind(&child)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+    if parent.as_deref() != Some(reader.id.as_str()) {
+        return Ok(());
+    }
+    let notice_bodies: Vec<String> = sqlx::query_scalar(
+        "SELECT n.body
+         FROM channel_messages m
+         JOIN channel_messages n
+           ON n.channel_id = ? AND n.idempotency_key = ? || m.id
+         WHERE m.channel_id = ? AND m.kind = 'result' AND m.seq <= ?",
+    )
+    .bind(&reader.id)
+    .bind(CHILD_RESULT_NOTICE_KEY_PREFIX)
+    .bind(channel_id)
+    .bind(read_seq)
+    .fetch_all(&mut *tx)
+    .await?;
+    for body in notice_bodies {
+        crate::session::retract_pending_prompt_paragraph_tx(tx, &reader.id, &body).await?;
+    }
+    Ok(())
 }
 
 fn subscription_view(row: SubscriptionRow) -> ChannelSubscriptionView {
@@ -883,6 +949,189 @@ mod tests {
         assert!(
             get(&db, &custom.id, &owner).await.unwrap().is_some(),
             "a custom channel outlives its creator's session branch"
+        );
+    }
+
+    /// A child result queues a notice in the parent's prompt queue; once the
+    /// parent's read marker passes the result, that notice is stale and
+    /// retracts so the next turn boundary does not deliver a pointer to
+    /// something already consumed.
+    #[tokio::test]
+    async fn reading_past_a_child_result_retracts_the_queued_notice() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let parent_branch = branch_mod::upsert(&db, "/repo", "weaver/notice-parent", "main")
+            .await
+            .unwrap();
+        let child_branch = branch_mod::upsert(&db, "/repo", "weaver/notice-child", "main")
+            .await
+            .unwrap();
+        session::insert(&db, &new_session("notice-parent", &parent_branch.id))
+            .await
+            .unwrap();
+        session::insert(&db, &new_session("notice-child", &child_branch.id))
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE sessions SET parent_session_id = 'notice-parent' WHERE id = 'notice-child'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let child = Subject::new(SubjectKind::Session, "notice-child");
+        let parent = Subject::new(SubjectKind::Session, "notice-parent");
+        let system = Subject::new(SubjectKind::System, "loom");
+        let queue_notice = |body: String| {
+            let db = &db;
+            async move {
+                session::append_pending_prompt(db, "notice-parent", "say:current work")
+                    .await
+                    .unwrap();
+                session::append_pending_prompt(db, "notice-parent", &body)
+                    .await
+                    .unwrap();
+            }
+        };
+        let pending = || async {
+            session::read_pending_prompt(&db, "notice-parent")
+                .await
+                .unwrap()
+        };
+
+        // Child posts a result; the server's notification would append the
+        // linked notice to the parent's channel and queue its delivery.
+        let result = append(
+            &db,
+            "notice-child",
+            NewMessage {
+                kind: MessageKind::Result,
+                urgency: Urgency::Normal,
+                author: &child,
+                body: "done",
+                payload: &Value::Null,
+                reply_to: None,
+                idempotency_key: None,
+            },
+        )
+        .await
+        .unwrap();
+        let notice_body = format!(
+            "Child session notice-child posted result {}. Read it with \
+             `loom channels read --channel notice-child --kinds result`.",
+            result.id
+        );
+        append(
+            &db,
+            "notice-parent",
+            NewMessage {
+                kind: MessageKind::Message,
+                urgency: Urgency::Normal,
+                author: &system,
+                body: &notice_body,
+                payload: &serde_json::json!({
+                    "child_session_id": "notice-child",
+                    "source_channel_id": "notice-child",
+                    "source_message_id": result.id,
+                }),
+                reply_to: None,
+                idempotency_key: Some(&child_result_notice_key(&result.id)),
+            },
+        )
+        .await
+        .unwrap();
+        queue_notice(notice_body.clone()).await;
+        assert_eq!(
+            pending().await,
+            format!("say:current work\n\n{notice_body}"),
+            "the notice queues behind the parent's live turn"
+        );
+
+        // Another reader — even an ancestor further up — does not consume the
+        // parent's copy: the notice stays queued.
+        let user = Subject::new(SubjectKind::User, "alice");
+        mark_read(&db, "notice-child", &user, None).await.unwrap();
+        assert!(
+            pending().await.contains("posted result"),
+            "a non-parent reader does not retract the parent's notice"
+        );
+
+        // A marker that has not reached the result changes nothing.
+        mark_read(&db, "notice-child", &parent, Some(result.seq - 1))
+            .await
+            .unwrap();
+        assert!(pending().await.contains("posted result"));
+
+        // The parent's own read past the result retracts exactly the notice.
+        mark_read(&db, "notice-child", &parent, Some(result.seq))
+            .await
+            .unwrap();
+        assert_eq!(
+            pending().await,
+            "say:current work",
+            "the consumed result's notice retracts, the live prompt stays"
+        );
+
+        // Regression: two queued notices must retract independently. Notice
+        // bodies are unique per result, so consuming the first result strips
+        // only its own notice — not a second result's queued alongside it.
+        let result2 = append(
+            &db,
+            "notice-child",
+            NewMessage {
+                kind: MessageKind::Result,
+                urgency: Urgency::Normal,
+                author: &child,
+                body: "done again",
+                payload: &Value::Null,
+                reply_to: None,
+                idempotency_key: None,
+            },
+        )
+        .await
+        .unwrap();
+        let notice2_body = format!(
+            "Child session notice-child posted result {}. Read it with \
+             `loom channels read --channel notice-child --kinds result`.",
+            result2.id
+        );
+        append(
+            &db,
+            "notice-parent",
+            NewMessage {
+                kind: MessageKind::Message,
+                urgency: Urgency::Normal,
+                author: &system,
+                body: &notice2_body,
+                payload: &serde_json::json!({
+                    "child_session_id": "notice-child",
+                    "source_channel_id": "notice-child",
+                    "source_message_id": result2.id,
+                }),
+                reply_to: None,
+                idempotency_key: Some(&child_result_notice_key(&result2.id)),
+            },
+        )
+        .await
+        .unwrap();
+        session::append_pending_prompt(&db, "notice-parent", &notice_body)
+            .await
+            .unwrap();
+        session::append_pending_prompt(&db, "notice-parent", &notice2_body)
+            .await
+            .unwrap();
+        mark_read(&db, "notice-child", &parent, Some(result.seq))
+            .await
+            .unwrap();
+        assert_eq!(
+            pending().await,
+            format!("say:current work\n\n{notice2_body}"),
+            "consuming the first result leaves the second result's notice queued"
+        );
+        mark_read(&db, "notice-child", &parent, None).await.unwrap();
+        assert_eq!(
+            pending().await,
+            "say:current work",
+            "reading through the second result retracts its notice too"
         );
     }
 }

@@ -1579,6 +1579,169 @@ async fn child_result_waits_for_parent_acp_turn() {
     }));
 }
 
+/// Every path that consumes a child result — a non-peek `channels read`,
+/// `channels ack`, and a `channels wait` that returned the message — retracts
+/// the still-queued notice from the parent's prompt queue, so a parent that
+/// already acted on a result never gets a follow-up turn pointing back at it.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consumed_child_results_retract_the_queued_notice() {
+    let ts = TestServer::start().await;
+    let parent_id = "acp-retract-notice";
+    start_new(&ts, parent_id, None, None).await;
+    let parent = session_mod::get(&ts.state.db, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let parent_token = loom::auth::create_session_token(
+        &ts.state.db,
+        Some("rjpower"),
+        parent_id,
+        &parent.branch_id,
+    )
+    .await
+    .unwrap();
+    let first = ts
+        .client
+        .post(
+            "/api/sessions/prompt/create",
+            json!({ "text": "wait:8000|say:first turn finished", "session": parent_id }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first["queued"], false);
+
+    let http = reqwest::Client::new();
+    let child = http
+        .post(format!("http://{}/api/sessions/launch", ts.addr))
+        .bearer_auth(&parent_token)
+        .json(&json!({ "cwd": ts.cwd(), "goal": "retract notice child", "agent": "shell" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(child.status(), reqwest::StatusCode::OK);
+    let child: Value = child.json().await.unwrap();
+    let child_id = child["id"].as_str().unwrap();
+    let child_token = loom::auth::create_session_token(
+        &ts.state.db,
+        Some("rjpower"),
+        child_id,
+        child["branch"]["id"].as_str().unwrap(),
+    )
+    .await
+    .unwrap();
+    let pending_notice = || async {
+        session_mod::get(&ts.state.db, parent_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending_prompt
+            .unwrap_or_default()
+    };
+    async fn post_child_result(
+        ts: &TestServer,
+        http: &reqwest::Client,
+        child_token: &str,
+        child_id: &str,
+        body: &str,
+    ) -> Value {
+        let result = http
+            .post(format!("http://{}/api/channels/messages/create", ts.addr))
+            .bearer_auth(child_token)
+            .json(&json!({ "channel": child_id, "kind": "result", "body": body }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.status(), reqwest::StatusCode::OK);
+        result.json::<Value>().await.unwrap()
+    }
+
+    // A non-peek read consumes the result and retracts its queued notice.
+    post_child_result(&ts, &http, &child_token, child_id, "done a").await;
+    assert!(
+        pending_notice().await.contains(child_id),
+        "the notice queues behind the live parent turn"
+    );
+    let read = http
+        .post(format!("http://{}/api/channels/messages/list", ts.addr))
+        .bearer_auth(&parent_token)
+        .json(&json!({ "channel": child_id, "kinds": ["result"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        pending_notice().await,
+        "",
+        "a consumed result retracts its queued notice"
+    );
+
+    // `channels ack` consumes through the latest message and retracts too.
+    let result_b = post_child_result(&ts, &http, &child_token, child_id, "done b").await;
+    assert!(pending_notice().await.contains(child_id));
+    let ack = http
+        .post(format!("http://{}/api/channels/read_marker/set", ts.addr))
+        .bearer_auth(&parent_token)
+        .json(&json!({ "channel": child_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ack.status(), reqwest::StatusCode::OK);
+    assert_eq!(pending_notice().await, "");
+
+    // A `channels wait` that returns the result consumes it as well.
+    let result_c = post_child_result(&ts, &http, &child_token, child_id, "done c").await;
+    assert!(pending_notice().await.contains(child_id));
+    let waited = http
+        .post(format!("http://{}/api/channels/wait", ts.addr))
+        .bearer_auth(&parent_token)
+        .json(&json!({
+            "channel": child_id,
+            "kind": "result",
+            "after": result_b["seq"],
+            "timeout": 5,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(waited.status(), reqwest::StatusCode::OK);
+    let waited: Value = waited.json().await.unwrap();
+    assert_eq!(
+        waited["id"], result_c["id"],
+        "the wait returned the new result"
+    );
+    assert_eq!(pending_notice().await, "");
+
+    // The parent turn ends with nothing left to dispatch: no follow-up turn
+    // points back at results the parent already consumed.
+    poll_chat(&ts, parent_id, Duration::from_secs(15), |blocks| {
+        blocks
+            .iter()
+            .any(|b| b["kind"] == "agent_message" && b["payload"]["text"] == "first turn finished")
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let chat = poll_chat(&ts, parent_id, Duration::from_secs(5), |blocks| {
+        blocks
+            .iter()
+            .any(|b| b["kind"] == "agent_message" && b["payload"]["text"] == "first turn finished")
+    })
+    .await;
+    let blocks = chat["blocks"].as_array().unwrap();
+    assert!(
+        !blocks.iter().any(|b| b["kind"] == "user_message"
+            && b["payload"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("posted result"))),
+        "no redundant notice turn was dispatched"
+    );
+    assert_eq!(
+        count_kind(blocks, "turn_end"),
+        1,
+        "the parent ran exactly its own turn"
+    );
+}
+
 /// Retracting unseen feedback is serialized by the ACP task: either the browser
 /// gets the exact durable text back for editing, or a turn boundary wins and the
 /// request conflicts. It can never both dispatch and return the same prompt.

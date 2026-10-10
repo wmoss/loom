@@ -448,7 +448,12 @@ pane). The link uses the source message id for idempotency. System authorship
 matters here:
 appending under the child's identity would subscribe it to the parent channel
 and widen its access. This handoff grants the child no access to the parent
-channel.
+channel. The queued notice is also retractable: when the parent's read marker on
+the child's channel passes the result — via a non-peek `channels read`,
+`channels ack`, or a `channels wait` that returned the message — `mark_read`
+strips the still-queued notice from the parent's prompt queue, so a parent
+that already consumed the result never gets a follow-up turn pointing back at
+it. A retraction after the queue drained is a harmless no-op.
 
 One capability is narrower now: an automation credential reaches no raw path,
 only `actor = Internal` operations — `runs.create` alone. Nothing used its old
