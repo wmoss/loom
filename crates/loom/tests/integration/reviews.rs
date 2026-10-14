@@ -199,11 +199,19 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
         .await
         .unwrap();
     assert_eq!(added.comments[0].subject_version, "1");
-    // The delivery prompt is compact: the anchor's location makes the cut,
-    // its surrounding context does not.
+    // The delivery prompt is compact: the anchor's location makes the cut —
+    // with the comment id the reply tool needs — its surrounding context
+    // does not, and the closing line tells the session how to respond.
+    assert!(added.message.contains(&format!(
+        "1. \"beta\", block 1 (revision 1, comment id {}):\nExplain why this is safe.",
+        added.comments[0].id
+    )));
     assert!(added
         .message
-        .contains("1. \"beta\", block 1 (revision 1):\nExplain why this is safe."));
+        .contains("Respond to each comment with the `review_comment_reply` tool"));
+    assert!(added
+        .message
+        .contains("Resolving a comment is the reviewer's action, not yours."));
     assert!(!added.message.contains("Alpha "));
 
     let session_token = loom::auth::create_session_token(
@@ -1016,15 +1024,19 @@ async fn a_session_reads_full_review_detail_through_its_mcp_tool() {
         .await
         .unwrap();
 
+    assert!(submitted.message.contains(&format!(
+        "1. \"beta\", block 1 (revision 1, comment id {}):\nExplain why this is safe.",
+        submitted.comments[0].id
+    )));
     assert!(submitted
         .message
-        .contains("1. \"beta\", block 1 (revision 1):\nExplain why this is safe."));
-    assert!(!submitted.message.contains("Alpha "));
+        .contains("Respond to each comment with the `review_comment_reply` tool"));
 
     let token =
         loom::auth::create_session_token(&ts.state.db, None, &session.id, &session.branch.id)
             .await
             .unwrap();
+    let comment_id = submitted.comments[0].id;
     let responses = run_mcp_tool_calls(
         &ts,
         &token,
@@ -1048,13 +1060,48 @@ async fn a_session_reads_full_review_detail_through_its_mcp_tool() {
     assert_eq!(anchor["quote"], "beta");
     assert_eq!(anchor["prefix"], "Alpha ");
     assert_eq!(anchor["suffix"], " gamma");
+
+    // The reviewed session answers through its own credential, and the reply
+    // is durably visible to the reviewer on the next read.
+    let responses = run_mcp_tool_calls(
+        &ts,
+        &token,
+        None,
+        &[json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "review_comment_reply", "arguments": {
+                "comment_id": comment_id, "body": "Fixed in commit 4f2c." } }
+        })],
+    )
+    .await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["result"]["isError"], false);
+    assert_eq!(
+        responses[0]["result"]["structuredContent"]["replies"][0]["body"],
+        "Fixed in commit 4f2c."
+    );
+
+    let listed = ts
+        .client
+        .invoke::<reviews::list::Op>(&reviews::list::Input {
+            subject_kind: ReviewSubjectKindDto::Artifact,
+            subject_key: "design".to_string(),
+            session: session.id.to_string(),
+        })
+        .await
+        .unwrap();
+    let replies = &listed[0].comments[0].replies;
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].body, "Fixed in commit 4f2c.");
 }
 
 /// Even a fully restricted session — a policy that grants no capability set
-/// at all — keeps the review detail tool. Reading feedback addressed to
-/// one's own work is inherent: delivery pastes the compact prompt into the
-/// conversation and points the agent at exactly this tool, so no profile
-/// narrowing may strand that pointer.
+/// at all — keeps the review tools. Reading feedback addressed to one's own
+/// work, and answering it, is inherent: delivery pastes the compact prompt
+/// into the conversation and points the agent at exactly these tools, so no
+/// profile narrowing may strand that loop.
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restricted_session_keeps_the_review_detail_tool() {
@@ -1084,11 +1131,11 @@ async fn a_restricted_session_keeps_the_review_detail_tool() {
     .unwrap();
 
     // The tool list a restricted session's launch stamps: the inherent
-    // review tool and nothing else.
+    // review tools and nothing else.
     let responses = run_mcp_tool_calls(
         &ts,
         &token,
-        Some("[\"review_list\"]"),
+        Some("[\"review_list\", \"review_comment_reply\"]"),
         &[
             json!({
                 "jsonrpc": "2.0",
@@ -1103,21 +1150,34 @@ async fn a_restricted_session_keeps_the_review_detail_tool() {
                 "params": { "name": "review_list", "arguments": {
                     "subject_kind": "artifact", "subject_key": "design" } }
             }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "review_comment_reply", "arguments": {
+                    "comment_id": submitted.comments[0].id,
+                    "body": "Answered from a restricted profile." } }
+            }),
         ],
     )
     .await;
-    assert_eq!(responses.len(), 2);
+    assert_eq!(responses.len(), 3);
     let advertised: Vec<&str> = responses[0]["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(advertised, ["review_list"]);
+    assert_eq!(advertised, ["review_list", "review_comment_reply"]);
     assert_eq!(responses[1]["result"]["isError"], false);
     let listed = &responses[1]["result"]["structuredContent"]["items"];
     assert_eq!(listed.as_array().unwrap().len(), 1);
     assert_eq!(listed[0]["id"], submitted.id);
+    assert_eq!(responses[2]["result"]["isError"], false);
+    assert_eq!(
+        responses[2]["result"]["structuredContent"]["replies"][0]["body"],
+        "Answered from a restricted profile."
+    );
 }
 
 /// A review scoped to one commit anchors and submits against that commit's

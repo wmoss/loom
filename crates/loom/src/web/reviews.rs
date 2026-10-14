@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use weaver_api::{
     ArtifactTextAnchorDto, ChangeAnchorDto, ReviewAnchorDto, ReviewAnchorKindDto, ReviewCommentDto,
-    ReviewDto, ReviewSubjectDto, ReviewSubjectKindDto,
+    ReviewCommentReplyDto, ReviewDto, ReviewSubjectDto, ReviewSubjectKindDto,
 };
 use weaver_core::artifact::{self, Artifact};
 use weaver_core::branch::Branch;
@@ -74,6 +74,15 @@ fn comment_dto(comment: &review::ReviewComment) -> ReviewCommentDto {
         anchor,
         body: comment.body.clone(),
         status: comment.status.clone(),
+        replies: comment
+            .replies
+            .iter()
+            .map(|reply| ReviewCommentReplyDto {
+                id: reply.id,
+                body: reply.body.clone(),
+                created_at: reply.created_at.clone(),
+            })
+            .collect(),
         created_at: comment.created_at.clone(),
         updated_at: comment.updated_at.clone(),
     }
@@ -186,6 +195,8 @@ fn legacy_review_dto(
             }),
             body: comment.body.clone(),
             status: thread.status.clone(),
+            // Legacy threads predate replies and carry none.
+            replies: Vec::new(),
             created_at: comment.created_at.clone(),
             updated_at: comment.created_at.clone(),
         })
@@ -572,6 +583,9 @@ pub(super) fn bound_operations() -> Vec<Bound> {
         register::<weaver_api::operations::reviews::comments::resolve::Op, _, _>(
             comments_resolve_operation,
         ),
+        register::<weaver_api::operations::reviews::comments::reply::Op, _, _>(
+            comments_reply_operation,
+        ),
         register::<weaver_api::operations::reviews::submit::Op, _, _>(submit_operation),
         register::<weaver_api::operations::reviews::retry_delivery::Op, _, _>(
             retry_delivery_operation,
@@ -832,6 +846,39 @@ async fn comments_resolve_operation(
             "subject_key": item.subject_key,
         }),
     );
+    Ok(comment_dto(&comment))
+}
+
+async fn comments_reply_operation(
+    context: OperationContext,
+    input: weaver_api::operations::reviews::comments::reply::Input,
+) -> ApiResult<weaver_api::operations::reviews::comments::reply::Output> {
+    let st = context.state;
+    // Ownership is inside the core append — a session replies to its own
+    // review or not at all; the actor policy above already pinned the caller
+    // to its own session operand.
+    let comment = review::reply_comment(&st.db, input.comment_id, &input.session, &input.body)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let item = review::get(&st.db, comment.review_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("submitted review"))?;
+    if let Some(reply) = comment.replies.last() {
+        events::emit(
+            &st.bus,
+            &item.branch_id,
+            "review_comment_replied",
+            json!({
+                "review_id": item.id,
+                "comment_id": comment.id,
+                "reply_id": reply.id,
+                "session_id": item.session_id,
+                "subject_kind": item.subject_kind,
+                "subject_key": item.subject_key,
+                "body": reply.body,
+            }),
+        );
+    }
     Ok(comment_dto(&comment))
 }
 

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import type { Anchor, ChangeAnchor, Review, ReviewComment } from '../types';
+import { timeAgo } from '../lib/time';
 import InlineConfirm from './InlineConfirm.vue';
 
 const props = defineProps<{
@@ -156,6 +157,13 @@ function cancelEdit() {
     </span>
     <span class="min-w-0 flex-1 truncate">{{ comment.body }}</span>
     <span
+      v-if="comment.replies?.length"
+      class="shrink-0 rounded-full bg-accent/20 px-1.5 text-2xs text-accent"
+      title="Session replies"
+    >
+      {{ comment.replies.length }}
+    </span>
+    <span
       v-if="comment.subject_version !== review.subject.current_version"
       class="shrink-0 text-2xs text-block"
     >
@@ -220,6 +228,24 @@ function cancelEdit() {
       <div v-else class="whitespace-pre-wrap text-fg">{{ comment.body }}</div>
     </template>
     <div v-else class="whitespace-pre-wrap text-fg">{{ comment.body }}</div>
+
+    <!-- The reviewed session's replies, oldest first — the agent's half of
+         the review loop, read-only here: resolving stays with the reviewer. -->
+    <div
+      v-if="comment.replies?.length"
+      class="mt-2 space-y-1 border-l-2 border-line pl-2"
+      data-testid="review-comment-replies"
+    >
+      <div v-for="reply in comment.replies" :key="reply.id" class="rounded bg-code/60 px-2 py-1">
+        <p class="mb-0.5 flex items-center gap-1.5 text-2xs text-faint">
+          <span class="rounded bg-subtle px-1 py-0.5 font-semibold uppercase tracking-wide">
+            Session
+          </span>
+          <span :title="reply.created_at">{{ timeAgo(reply.created_at) }}</span>
+        </p>
+        <p class="whitespace-pre-wrap text-fg">{{ reply.body }}</p>
+      </div>
+    </div>
 
     <div class="mt-2 flex flex-wrap items-center gap-1.5">
       <template v-if="review.status === 'draft'">

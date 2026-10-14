@@ -1,9 +1,10 @@
 //! Submitted reviews of this session's own work.
 //!
 //! The delivery prompt is deliberately compact — subject, overall note, and
-//! per-comment one-line locations, without anchor context excerpts. This
-//! adapter serves the full durable record on demand: `list` is a registered
-//! `reviews.*` operation, so the catalogue, the capability sets, the
+//! per-comment one-line locations with ids, without anchor context excerpts.
+//! This adapter serves the durable record on demand (`list`) and takes the
+//! session's own responses back (`comment_reply`); both are registered
+//! `reviews.*` operations, so the catalogue, the capability sets, the
 //! permission rules, and the call path are all read off [`exports`].
 
 use std::sync::OnceLock;
@@ -17,7 +18,12 @@ use super::{Adapter, CapabilitySet, ToolFuture};
 /// The tools this server exports, in the order it advertises them.
 fn exports() -> &'static [Export] {
     static EXPORTS: OnceLock<Vec<Export>> = OnceLock::new();
-    EXPORTS.get_or_init(|| vec![export::<reviews::list::Op>("list")])
+    EXPORTS.get_or_init(|| {
+        vec![
+            export::<reviews::list::Op>("list"),
+            export::<reviews::comments::reply::Op>("comment_reply"),
+        ]
+    })
 }
 
 pub(super) const ADAPTER: Adapter = Adapter {
@@ -31,7 +37,7 @@ pub(super) const ADAPTER: Adapter = Adapter {
 };
 
 /// Capability sets are derived from the registry: the exported `reviews.*`
-/// operation contributes its tool to the set named by its grant.
+/// operations contribute their tools to the sets named by their grants.
 fn capability_sets() -> &'static [CapabilitySet] {
     static SETS: OnceLock<Vec<CapabilitySet>> = OnceLock::new();
     SETS.get_or_init(|| super::dispatch::capability_sets(exports(), "review", describe_capability))
@@ -41,6 +47,9 @@ fn describe_capability(grant: &str) -> &'static str {
     match grant {
         "loom/reviews/read@v1" => {
             "Read submitted feedback on this session's own artifacts and change-set, complete anchors included."
+        }
+        "loom/reviews/write@v1" => {
+            "Reply to submitted feedback on this session's own work; resolving stays with the reviewer."
         }
         _ => "Submitted review operations.",
     }
@@ -67,7 +76,10 @@ mod tests {
 
     #[test]
     fn capability_sets_are_grouped_by_grant() {
-        assert_eq!(expand_tool_set("loom/reviews/read@v1").unwrap().len(), 1);
+        let read = expand_tool_set("loom/reviews/read@v1").unwrap();
+        let write = expand_tool_set("loom/reviews/write@v1").unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(write.len(), 1);
         assert!(expand_tool_set("loom/reviews/nonexistent@v1").is_none());
     }
 }

@@ -1767,6 +1767,15 @@ impl From<ArtifactTextAnchorDto> for ReviewAnchorDto {
     }
 }
 
+/// The reviewed session's reply to one review comment — appended after the
+/// review is submitted, never mutating the comment it answers.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReviewCommentReplyDto {
+    pub id: i64,
+    pub body: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewCommentDto {
     pub id: i64,
@@ -1775,6 +1784,10 @@ pub struct ReviewCommentDto {
     pub anchor: ReviewAnchorDto,
     pub body: String,
     pub status: String,
+    /// The reviewed session's replies, oldest first. `serde(default)` keeps
+    /// older payloads readable before replies existed.
+    #[serde(default)]
+    pub replies: Vec<ReviewCommentReplyDto>,
     pub created_at: String,
     pub updated_at: String,
 }

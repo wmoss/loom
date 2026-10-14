@@ -11,7 +11,8 @@ use super::OperationBundle;
 pub(super) use super::prelude;
 pub mod comments {
     //! Anchored feedback comments on a review: added and edited while it is a
-    //! private draft, resolved once it has been submitted.
+    //! private draft, resolved once it has been submitted, and — from the
+    //! reviewed session's own credential — answered after submit.
     pub(super) use super::prelude;
     pub mod create {
         use super::prelude::*;
@@ -98,6 +99,31 @@ pub mod comments {
             #[operand(positional)]
             pub comment_id: i64,
             pub resolved: bool,
+        }
+
+        pub type Output = ReviewCommentDto;
+    }
+
+    pub mod reply {
+        use super::prelude::*;
+
+        /// Reply to a comment on one of the caller session's submitted
+        /// reviews.
+        ///
+        /// The reviewed session's half of the review loop: it may answer
+        /// feedback, never resolve it — resolution stays with
+        /// [`super::resolve`]. Replies append without touching the draft
+        /// revision and are visible to the reviewer immediately.
+        #[operation(id = "reviews.comments.reply", actor = SessionSelf, scope = Session, risk = Write,
+                    grants = ["loom/reviews/write@v1"])]
+        pub struct Input {
+            /// The comment to reply to, as `reviews.list` reports it.
+            #[operand(positional)]
+            pub comment_id: i64,
+            /// The reply body.
+            pub body: String,
+            #[operand(context)]
+            pub session: String,
         }
 
         pub type Output = ReviewCommentDto;
@@ -338,6 +364,7 @@ static OPERATIONS: &[&OperationSpec] = &[
     comments::update::SPEC,
     comments::delete::SPEC,
     comments::resolve::SPEC,
+    comments::reply::SPEC,
     submit::SPEC,
     retry_delivery::SPEC,
 ];

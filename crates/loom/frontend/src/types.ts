@@ -105,6 +105,7 @@ export type {
   ResumptionCueView as ResumptionCue,
   ResumptionEvidenceView as ResumptionEvidence,
   ReviewCommentDto as ReviewComment,
+  ReviewCommentReplyDto as ReviewCommentReply,
   ReviewDto as Review,
   ReviewSubjectDto as ReviewSubject,
   SessionCommitDto as SessionCommit,
