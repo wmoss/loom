@@ -121,6 +121,14 @@ fn validate_adapters() {
     }
 }
 pub(crate) const ALLOWED_TOOLS_ENV: &str = "LOOM_MCP_ALLOWED_TOOLS";
+
+/// Reading submitted feedback on one's own work is inherent to every
+/// session, restricted or not: review delivery pastes the compact prompt
+/// into the session's conversation and points the agent at the
+/// `review_list` detail tool, so no profile restriction may strand that
+/// pointer. `session_capabilities` holds it in the restricted token's
+/// floor; `effective_allowed_tool_rules_for` keeps the tool advertised.
+pub(crate) const INHERENT_REVIEW_GRANT: &str = "loom/reviews/read@v1";
 const BUILTIN_SERVER_NAME: &str = "loom";
 // Compute Engine's HTTP metadata endpoint is host-local and available on every
 // VM type; its HTTPS alternative is limited to Shielded VMs.
@@ -408,6 +416,7 @@ pub fn session_capabilities<'a>(
         "loom/sessions/read@v1".to_string(),
         "loom/permissions/read@v1".to_string(),
         "loom/permissions/request@v1".to_string(),
+        INHERENT_REVIEW_GRANT.to_string(),
     ]);
     for set in sets {
         let grants = capability_set_grants(set);
@@ -512,6 +521,13 @@ pub fn effective_allowed_tool_rules_for(
 ) -> Result<Vec<String>> {
     let mut rules = expand_tool_sets(&profile.allowed_tool_rules()?)?;
     for rule in rules_for_snapshot(snapshot)? {
+        push_unique(&mut rules, rule);
+    }
+    // The inherent capabilities are advertised alongside whatever the profile
+    // narrows to — the same grants `session_capabilities` floors onto a
+    // restricted token would be pointless if the tool never reached the
+    // agent's tool list.
+    for rule in expand_tool_sets(&[INHERENT_REVIEW_GRANT.to_string()])? {
         push_unique(&mut rules, rule);
     }
     Ok(rules)
@@ -1067,6 +1083,7 @@ mod tests {
                 "loom/sessions/read@v1",
                 "loom/permissions/read@v1",
                 "loom/permissions/request@v1",
+                super::INHERENT_REVIEW_GRANT,
             ];
             expected_grants.extend_from_slice(grants);
             expected_grants.sort();

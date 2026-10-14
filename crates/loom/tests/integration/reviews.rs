@@ -955,14 +955,26 @@ async fn terminal_delivery_queues_offline_recovers_and_reports_real_failure() {
 }
 
 /// Drive Loom's built-in MCP server over stdio with a session credential,
-/// exactly the way the reviewed session's agent runtime does.
-async fn run_mcp_tool_calls(ts: &TestServer, token: &str, calls: &[Value]) -> Vec<Value> {
+/// exactly the way the reviewed session's agent runtime does. `allowed_tools`
+/// simulates the tool list the session's launch stamped into
+/// `LOOM_MCP_ALLOWED_TOOLS`.
+async fn run_mcp_tool_calls(
+    ts: &TestServer,
+    token: &str,
+    allowed_tools: Option<&str>,
+    calls: &[Value],
+) -> Vec<Value> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_loom"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_loom"));
+    command
         .args(["mcp", "serve"])
         .env("WEAVER_API", format!("http://{}", ts.addr))
-        .env("LOOM_TOKEN", token)
+        .env("LOOM_TOKEN", token);
+    if let Some(allowed) = allowed_tools {
+        command.env("LOOM_MCP_ALLOWED_TOOLS", allowed);
+    }
+    let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -1016,6 +1028,7 @@ async fn a_session_reads_full_review_detail_through_its_mcp_tool() {
     let responses = run_mcp_tool_calls(
         &ts,
         &token,
+        None,
         &[json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -1035,6 +1048,76 @@ async fn a_session_reads_full_review_detail_through_its_mcp_tool() {
     assert_eq!(anchor["quote"], "beta");
     assert_eq!(anchor["prefix"], "Alpha ");
     assert_eq!(anchor["suffix"], " gamma");
+}
+
+/// Even a fully restricted session — a policy that grants no capability set
+/// at all — keeps the review detail tool. Reading feedback addressed to
+/// one's own work is inherent: delivery pastes the compact prompt into the
+/// conversation and points the agent at exactly this tool, so no profile
+/// narrowing may strand that pointer.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restricted_session_keeps_the_review_detail_tool() {
+    let ts = TestServer::start().await;
+    let session = insert_api_session(&ts, "restricted-review-detail").await;
+    seed_artifact(&ts, &session).await;
+    let draft = draft_with_comment(&ts, &session, "Explain why this is safe.").await;
+    let submitted = ts
+        .client
+        .invoke::<reviews::submit::Op>(&reviews::submit::Input {
+            id: draft.id,
+            expected_revision: draft.draft_revision,
+            acknowledge_outdated: false,
+        })
+        .await
+        .unwrap();
+
+    let token = loom::auth::create_session_token_with_policy(
+        &ts.state.db,
+        None,
+        &session.id,
+        &session.branch.id,
+        true,
+        &serde_json::to_string(&weaver_api::McpPolicySnapshot::default()).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // The tool list a restricted session's launch stamps: the inherent
+    // review tool and nothing else.
+    let responses = run_mcp_tool_calls(
+        &ts,
+        &token,
+        Some("[\"review_list\"]"),
+        &[
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "review_list", "arguments": {
+                    "subject_kind": "artifact", "subject_key": "design" } }
+            }),
+        ],
+    )
+    .await;
+    assert_eq!(responses.len(), 2);
+    let advertised: Vec<&str> = responses[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(advertised, ["review_list"]);
+    assert_eq!(responses[1]["result"]["isError"], false);
+    let listed = &responses[1]["result"]["structuredContent"]["items"];
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["id"], submitted.id);
 }
 
 /// A review scoped to one commit anchors and submits against that commit's
