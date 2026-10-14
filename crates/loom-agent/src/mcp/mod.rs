@@ -105,7 +105,6 @@ const ADAPTERS: &[&Adapter] = &[
     &review::ADAPTER,
     &watch::ADAPTER,
 ];
-];
 
 fn adapters() -> impl Iterator<Item = &'static Adapter> {
     ADAPTERS.iter().copied()
