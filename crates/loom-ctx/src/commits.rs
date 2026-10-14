@@ -24,10 +24,13 @@ const MAX_BODY_BYTES: usize = 4_096;
 /// Cap on the raw `git log` capture before parsing.
 const MAX_LOG_BYTES: usize = 512 * 1024;
 
-/// Field separator `\x1f` between one commit's fields, record separator `\x1e`
-/// between commits; git's placeholders never emit either byte. `%b` is the
-/// message body below the subject.
-const LOG_FORMAT: &str = "%H%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1e";
+/// Six NUL-terminated fields per commit — oid, author name, author email,
+/// authoring time, subject, and `%b` (the message body below the subject) —
+/// flattened into one stream the parser chunks back into records. NUL is the
+/// one byte no field can carry: Git's object headers are NUL-terminated, so a
+/// commit message or author field holding one never makes it into the log as
+/// a field value.
+const LOG_FORMAT: &str = "%H%x00%an%x00%ae%x00%aI%x00%s%x00%b%x00";
 
 /// Read one session worktree's own commits without fetching or changing Git
 /// state. An unresolvable base is reported, not guessed — an empty list would
@@ -113,28 +116,26 @@ fn unavailable(
     }
 }
 
-/// Parses the separator-encoded log into commits, newest first. At most
-/// `limit` records are kept and a surplus marks the listing truncated; a
-/// record cut off mid-way by the capture bound is dropped, not half-shown.
+/// Parses the NUL-separated log into commits, newest first. Each commit
+/// contributes exactly six NUL-terminated fields, so chunking the flat token
+/// stream by six is deterministic — no field the author typed can be mistaken
+/// for a separator. At most `limit` records are kept and a surplus marks the
+/// listing truncated; a record cut off mid-way by the capture bound is
+/// dropped, not half-shown.
 pub(crate) fn parse_log(raw: &str, limit: usize) -> (Vec<SessionCommitDto>, bool) {
+    let mut tokens: Vec<&str> = raw.split('\0').collect();
+    // The capture bound cuts the final token mid-field, while a whole
+    // capture ends on the format's terminator and splits into one trailing
+    // empty token. Either way exactly one trailing token is not a field.
+    tokens.pop();
     let mut commits = Vec::new();
     let mut truncated = false;
-    for record in raw.split('\x1e') {
-        let fields: Vec<&str> = record.split('\x1f').collect();
-        // An empty segment is the split's residue at either end of the
-        // capture, not a commit.
-        let Some(oid) = fields
-            .first()
-            .map(|oid| oid.trim())
-            .filter(|oid| !oid.is_empty())
-        else {
-            continue;
-        };
-        // Fewer fields than the format writes means the capture bound cut
-        // this record mid-commit; the remnant is dropped, and the caller's
-        // capture flags mark the listing truncated.
+    for fields in tokens.chunks(6) {
+        // Fewer than six tokens means the capture bound cut this record
+        // mid-commit; the remnant is dropped, and the caller's capture flags
+        // mark the listing truncated.
         if fields.len() < 6 {
-            continue;
+            break;
         }
         if commits.len() == limit {
             truncated = true;
@@ -142,7 +143,7 @@ pub(crate) fn parse_log(raw: &str, limit: usize) -> (Vec<SessionCommitDto>, bool
         }
         let clip = |value: &str| sanitize_text(value, MAX_FIELD_BYTES).0;
         commits.push(SessionCommitDto {
-            oid: oid.to_string(),
+            oid: fields[0].trim().to_string(),
             author_name: clip(fields[1]),
             author_email: clip(fields[2]),
             authored_at: clip(fields[3]),
@@ -157,15 +158,15 @@ pub(crate) fn parse_log(raw: &str, limit: usize) -> (Vec<SessionCommitDto>, bool
 mod tests {
     use super::*;
 
-    const SEP: char = '\x1f';
-    const REC: char = '\x1e';
+    /// One record's six NUL-terminated fields, flattened like the capture.
+    fn record_with_body(oid: &str, subject: &str, body: &str) -> String {
+        format!(
+            "{oid}\0Ada Lovelace\0ada@example.test\02026-10-05T10:00:00+00:00\0{subject}\0{body}\0"
+        )
+    }
 
     fn record(oid: &str, subject: &str) -> String {
         record_with_body(oid, subject, "")
-    }
-
-    fn record_with_body(oid: &str, subject: &str, body: &str) -> String {
-        format!("{oid}{SEP}Ada Lovelace{SEP}ada@example.test{SEP}2026-10-05T10:00:00+00:00{SEP}{subject}{SEP}{body}{REC}")
     }
 
     fn parse(raw: &str) -> (Vec<SessionCommitDto>, bool) {
@@ -229,7 +230,7 @@ mod tests {
 
     #[test]
     fn a_record_cut_off_mid_capture_is_dropped() {
-        let raw = format!("{}abc\x1fpartial", record("a", "First"));
+        let raw = format!("{}abc\0partial", record("a", "First"));
         let (commits, truncated) = parse(&raw);
         assert!(!truncated);
         assert_eq!(commits.len(), 1);
@@ -239,10 +240,27 @@ mod tests {
     #[test]
     fn overlong_fields_are_clipped() {
         let long = "x".repeat(MAX_FIELD_BYTES + 10);
-        let raw = format!("a{SEP}{long}{SEP}e{SEP}2026{SEP}s{SEP}body{REC}");
+        let raw = format!("a\0{long}\0e\02026\0s\0body\0");
         let (commits, _) = parse(&raw);
         // The clip keeps the bound's worth of content plus its ellipsis marker.
         assert_eq!(commits[0].author_name.chars().count(), MAX_FIELD_BYTES + 1);
+    }
+
+    #[test]
+    fn a_separator_byte_in_a_message_body_is_field_content_not_a_split() {
+        // An author can type \x1f or \x1e into a commit message; a NUL they
+        // cannot — Git object headers are NUL-terminated — which is exactly
+        // why the format delimits with NUL. The record must stay whole: the
+        // body keeps its place, with its stray control bytes repaired for
+        // display rather than misread as record breaks.
+        let raw = record_with_body("a", "First", "unit\x1eseparator in\x1f the body");
+        let (commits, _) = parse(&raw);
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "First");
+        assert_eq!(
+            commits[0].body.as_deref(),
+            Some("unit\u{fffd}separator in\u{fffd} the body")
+        );
     }
 
     #[tokio::test]
