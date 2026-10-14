@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { getSessionCommits } from '../api';
 import type { SessionCommits } from '../types';
+import { changeBaseProblem } from '../lib/changeBaseProblem';
 import CommitList from './CommitList.vue';
 
 const props = defineProps<{ id: string }>();
@@ -11,16 +12,7 @@ const commits = ref<SessionCommits | null>(null);
 const loading = ref(false);
 const error = ref('');
 
-const baseProblem = computed(() => {
-  const base = commits.value?.base;
-  if (base?.state !== 'unavailable') return '';
-  const reasons: Record<typeof base.reason, string> = {
-    unborn_head: 'this worktree has no commits yet',
-    missing_base: `no local or remote-tracking ref resolves the base ${base.reference}`,
-    no_merge_base: `this branch shares no history with ${base.reference}`,
-  };
-  return `Commits unavailable: ${reasons[base.reason]}.`;
-});
+const baseProblem = computed(() => changeBaseProblem(commits.value?.base, 'Commits'));
 
 async function load() {
   loading.value = true;

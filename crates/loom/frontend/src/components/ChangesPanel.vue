@@ -32,6 +32,7 @@ import type {
   SessionCommit,
 } from '../types';
 import { ReviewDraftController } from '../lib/reviewDraftController';
+import { changeBaseProblem } from '../lib/changeBaseProblem';
 import { toGitDiffViewData, type GitDiffViewData } from '../lib/gitDiffAdapter';
 import { theme } from '../theme';
 import CommitList from './CommitList.vue';
@@ -188,16 +189,7 @@ const outdatedComments = computed(() =>
   changeCommentEntries.value.filter((entry) => !anchorPlaced(entry.comment.anchor as ChangeAnchor)),
 );
 
-const baseProblem = computed(() => {
-  const base = changes.value?.base;
-  if (base?.state !== 'unavailable') return '';
-  const reasons: Record<typeof base.reason, string> = {
-    unborn_head: 'this worktree has no commits yet',
-    missing_base: `no local or remote-tracking ref resolves the base ${base.reference}`,
-    no_merge_base: `this branch shares no history with ${base.reference}`,
-  };
-  return `Changes unavailable: ${reasons[base.reason]}.`;
-});
+const baseProblem = computed(() => changeBaseProblem(changes.value?.base, 'Changes'));
 
 function replaceReview(next: Review) {
   const index = reviews.value.findIndex((review) => review.id === next.id);

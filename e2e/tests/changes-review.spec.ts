@@ -341,11 +341,6 @@ test("mixed expand clicks never leave a dead hunk bar behind", async ({
               const next = around(1);
               if (prev != null && next != null && next === prev + 1) {
                 dead++;
-                console.log(
-                  'DEAD:',
-                  row.getAttribute('data-line'),
-                  JSON.stringify(row.textContent?.slice(0, 70)),
-                );
               }
             },
           );

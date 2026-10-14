@@ -1518,7 +1518,7 @@ async fn commit_snapshot(work_dir: &Path, oid: &str) -> Result<ChangeSetDto> {
             anyhow::anyhow!("commit {oid} is a root commit with no parent to diff against")
         })?;
     let boundary = GitBoundary::load(work_dir).await?;
-    let (raw, _) = capture_git_status(
+    let (raw, success) = capture_git_status(
         boundary.command(),
         &[
             "diff-tree",
@@ -1534,6 +1534,12 @@ async fn commit_snapshot(work_dir: &Path, oid: &str) -> Result<ChangeSetDto> {
         MAX_INVENTORY_BYTES,
     )
     .await?;
+    // A failed inventory must not read as a commit that touches nothing: the
+    // same rule `capture_git` applies, with a truncated capture's partial
+    // inventory still usable through its `truncated` flag.
+    if !success && !raw.truncated {
+        bail!("git diff-tree failed");
+    }
     let (numstat, patch) = tokio::try_join!(
         async {
             capture_diff(
