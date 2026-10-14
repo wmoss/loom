@@ -1736,7 +1736,10 @@ mod tests {
         // A revision that resolves to nothing is reported as absence — the
         // review reads as "snapshot gone" — while the strict loader keeps
         // treating it as the caller-facing error it is.
-        assert!(load_pinned_commit(dir.path(), "no-such-rev").await.unwrap().is_none());
+        assert!(load_pinned_commit(dir.path(), "no-such-rev")
+            .await
+            .unwrap()
+            .is_none());
         assert!(load_commit(dir.path(), "no-such-rev").await.is_err());
     }
 
