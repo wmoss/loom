@@ -325,29 +325,25 @@ test("mixed expand clicks never leave a dead hunk bar behind", async ({
         const tables = root.querySelectorAll('table[data-mode="old"]');
         let dead = 0;
         tables.forEach((table) => {
-          [...table.querySelectorAll('tr[data-state="hunk"]')].forEach(
+          Array.from(table.querySelectorAll('tr[data-state="hunk"]')).forEach(
             (row) => {
-              if (!row.querySelector("button")) return;
+              if (!row.querySelector('button')) return;
               const around = (dir: 1 | -1) => {
                 let cur: Element | null = row;
-                while (
-                  (cur =
-                    dir === 1
-                      ? cur.nextElementSibling
-                      : cur.previousElementSibling)
-                ) {
-                  const line = cur.getAttribute("data-line") ?? "";
+                for (;;) {
+                  cur = dir === 1 ? cur.nextElementSibling : cur.previousElementSibling;
+                  if (cur === null) return null;
+                  const line = cur.getAttribute('data-line') ?? '';
                   if (/^\d+$/.test(line)) return Number(line);
                 }
-                return null;
               };
               const prev = around(-1);
               const next = around(1);
               if (prev != null && next != null && next === prev + 1) {
                 dead++;
                 console.log(
-                  "DEAD:",
-                  row.getAttribute("data-line"),
+                  'DEAD:',
+                  row.getAttribute('data-line'),
                   JSON.stringify(row.textContent?.slice(0, 70)),
                 );
               }
