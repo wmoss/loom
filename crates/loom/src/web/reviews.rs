@@ -144,13 +144,15 @@ async fn current_review_version(st: &AppState, item: &review::Review) -> ApiResu
             }
             match crate::changes::commit_for_version(&item.subject_version) {
                 // A pinned commit is immutable, so its current version is its
-                // own snapshot — unavailable only if the commit is gone.
-                Some(rev) => Ok(crate::changes::load_commit(
+                // own snapshot — absent only when the commit no longer
+                // resolves in this worktree. Any other failure propagates:
+                // a transient git error must not masquerade as a fresh
+                // snapshot through the fallback that follows.
+                Some(rev) => Ok(crate::changes::load_pinned_commit(
                     std::path::Path::new(&session.work_dir),
                     rev,
                 )
-                .await
-                .ok()
+                .await?
                 .and_then(|changes| changes.version)),
                 None => Ok(crate::changes::load(
                     std::path::Path::new(&session.work_dir),

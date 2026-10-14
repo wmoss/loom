@@ -1477,16 +1477,41 @@ pub fn commit_for_version(version: &str) -> Option<&str> {
         .filter(|oid| !oid.is_empty())
 }
 
+/// Resolve `rev` to one commit oid, or `None` when it names nothing.
+async fn resolve_commit(work_dir: &Path, rev: &str) -> Result<Option<String>> {
+    bootstrap_text(
+        work_dir,
+        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+    )
+    .await
+}
+
 /// The diff one commit introduces (`parent..rev`), as a bounded snapshot the
 /// review surface renders exactly like the worktree state. A commit and its
 /// parent are immutable, so there is no stability re-read to race.
 pub async fn load_commit(work_dir: &Path, rev: &str) -> Result<ChangeSetDto> {
-    let oid = bootstrap_text(
-        work_dir,
-        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
-    )
-    .await?
-    .ok_or_else(|| anyhow::anyhow!("revision {rev} does not resolve to a commit"))?;
+    let Some(oid) = resolve_commit(work_dir, rev).await? else {
+        bail!("revision {rev} does not resolve to a commit");
+    };
+    commit_snapshot(work_dir, &oid).await
+}
+
+/// The snapshot a review pinned to `rev` currently names — `Ok(None)` when
+/// the commit no longer resolves in this worktree (rebased away, pruned, or
+/// the branch force-pushed past it), which reads as "the snapshot is gone",
+/// not as an error. Every other failure — a git invocation failure, a
+/// timeout, a capture bound — stays an error: a transient failure must never
+/// masquerade as a vanished (or fresh) snapshot.
+pub async fn load_pinned_commit(work_dir: &Path, rev: &str) -> Result<Option<ChangeSetDto>> {
+    match resolve_commit(work_dir, rev).await? {
+        Some(oid) => Ok(Some(commit_snapshot(work_dir, &oid).await?)),
+        None => Ok(None),
+    }
+}
+
+/// Everything a resolved commit needs for its snapshot; the caller has
+/// already decided how an unresolvable revision is reported.
+async fn commit_snapshot(work_dir: &Path, oid: &str) -> Result<ChangeSetDto> {
     let parent = bootstrap_text(work_dir, &["rev-parse", "--verify", &format!("{oid}^")])
         .await?
         .ok_or_else(|| {
@@ -1503,7 +1528,7 @@ pub async fn load_commit(work_dir: &Path, rev: &str) -> Result<ChangeSetDto> {
             "-r",
             "-z",
             &parent,
-            &oid,
+            oid,
             "--",
         ],
         MAX_INVENTORY_BYTES,
@@ -1513,7 +1538,7 @@ pub async fn load_commit(work_dir: &Path, rev: &str) -> Result<ChangeSetDto> {
         async {
             capture_diff(
                 &boundary,
-                &["--numstat", "--find-renames", "-z", &parent, &oid, "--"],
+                &["--numstat", "--find-renames", "-z", &parent, oid, "--"],
                 MAX_INVENTORY_BYTES,
             )
             .await
@@ -1526,7 +1551,7 @@ pub async fn load_commit(work_dir: &Path, rev: &str) -> Result<ChangeSetDto> {
                     "--find-renames",
                     "--unified=3",
                     &parent,
-                    &oid,
+                    oid,
                     "--",
                 ],
                 MAX_PATCH_BYTES,
@@ -1574,7 +1599,7 @@ pub async fn load_commit(work_dir: &Path, rev: &str) -> Result<ChangeSetDto> {
             reference: format!("commit {short}"),
             oid: parent.clone(),
         },
-        head_oid: Some(oid.clone()),
+        head_oid: Some(oid.to_string()),
         totals: ChangeTotalsDto {
             files: total_files,
             additions: stats.values().filter_map(|stat| stat.additions).sum(),
@@ -1678,6 +1703,42 @@ fn line_number(line: &ChangeLineDto, side: ChangeSideDto) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_commit_that_no_longer_resolves_is_absence_for_a_pinned_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.path().to_str().unwrap()])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-b", "main"]).status.success());
+        assert!(git(&["config", "user.name", "E2E"]).status.success());
+        assert!(git(&["config", "user.email", "e2e@weaver.test"])
+            .status
+            .success());
+        std::fs::write(dir.path().join("a"), "base\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "base"]).status.success());
+        std::fs::write(dir.path().join("a"), "base\ntouched\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "touched"]).status.success());
+
+        // While the commit resolves, the pinned load returns its snapshot.
+        let pinned = load_pinned_commit(dir.path(), "HEAD").await.unwrap();
+        assert!(pinned.is_some());
+        assert!(pinned.unwrap().version.is_some());
+
+        // A revision that resolves to nothing is reported as absence — the
+        // review reads as "snapshot gone" — while the strict loader keeps
+        // treating it as the caller-facing error it is.
+        assert!(load_pinned_commit(dir.path(), "no-such-rev").await.unwrap().is_none());
+        assert!(load_commit(dir.path(), "no-such-rev").await.is_err());
+    }
 
     #[tokio::test]
     async fn a_commit_snapshot_scopes_to_that_commit() {
