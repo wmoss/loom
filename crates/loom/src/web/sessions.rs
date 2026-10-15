@@ -941,10 +941,7 @@ pub(super) async fn send_session(
     Path(key): Path<String>,
     Json(req): Json<SendReq>,
 ) -> ApiResult<Json<Value>> {
-    let (session, branch) = require_session(&st.db, &key).await?;
-    // Sending to a suspended session is one of its wake signals — the
-    // runtime comes back first, then the message is delivered to it.
-    let session = ensure_awake(&st, &session).await?;
+    let (session, branch) = require_active_session(&st, &key).await?;
     // A cross-session send must not sit behind an ordinary ACP turn indefinitely
     // or be discarded with an adapter's in-memory steer. Cancel and replace that
     // turn, while allowing a provider-owned compaction to finish before the
@@ -1067,6 +1064,23 @@ pub(super) async fn ensure_awake(st: &AppState, session: &Session) -> ApiResult<
             error,
         )
     })
+}
+
+/// Resolve a session key to a session that is awake: a suspended (dormant)
+/// session is woken first, this request blocking for the seconds the respawn
+/// costs. The companion to [`require_session`], which stays a pure query —
+/// using this instead is the call site's declaration that its operation
+/// reaches into a session and therefore revives it (a sent message, a prompt,
+/// a queued channel note). Operations that only inspect or configure — stop,
+/// mode, retract, preview — keep `require_session` and refuse on a suspended
+/// row rather than silently paying a respawn.
+pub(super) async fn require_active_session(
+    st: &AppState,
+    key: &str,
+) -> ApiResult<(Session, Branch)> {
+    let (session, branch) = require_session(&st.db, key).await?;
+    let session = ensure_awake(st, &session).await?;
+    Ok((session, branch))
 }
 
 /// Permission posture captured when the persisted in-flight turn started. This
@@ -1331,8 +1345,7 @@ async fn op_send(
     mut input: ops::send::Input,
 ) -> ApiResult<SessionSendResult> {
     let st = &context.state;
-    let (session, branch) = require_session(&st.db, &input.session).await?;
-    let session = ensure_awake(st, &session).await?;
+    let (session, branch) = require_active_session(st, &input.session).await?;
     let submit = input.submit.unwrap_or(true);
     if let crate::auth::Grant::Session {
         session_id: source, ..
@@ -2367,12 +2380,8 @@ async fn op_prompt_create(
     if input.delivery_key.is_some() && !input.force_queued {
         return Err(AppError::bad_request("delivery_key requires force_queued"));
     }
-    let (session, branch) = require_session(&st.db, &input.session).await?;
+    let (session, branch) = require_active_session(st, &input.session).await?;
     require_acp(&session)?;
-    // A composer send to a suspended session wakes it first — the request
-    // takes the seconds the restart costs, then the prompt lands on the
-    // live runtime.
-    let session = ensure_awake(st, &session).await?;
     let handle = require_acp_task(st, &session)?;
     let by = if context.principal.is_human() {
         "manual"
