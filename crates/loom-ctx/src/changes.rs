@@ -1334,6 +1334,10 @@ async fn load_once(boundary: &GitBoundary, base_reference: &str) -> Result<(Chan
             });
         }
     }
+    // One path order for the whole listing: the tracked status output is
+    // sorted by path, but the untracked merge appends, which would park every
+    // new file at the end of the review instead of beside its neighbours.
+    raw_files.sort_by(|a, b| a.path.cmp(&b.path));
     let total_files = raw_files.len().min(u32::MAX as usize) as u32;
     let mut remaining_total = MAX_TOTAL_LINES;
     let mut remaining_content = MAX_TOTAL_CONTENT_BYTES;
@@ -1565,7 +1569,10 @@ async fn commit_snapshot(work_dir: &Path, oid: &str) -> Result<ChangeSetDto> {
             .await
         },
     )?;
-    let raw_files = parse_raw_files(&raw.bytes);
+    let mut raw_files = parse_raw_files(&raw.bytes);
+    // The same path order the branch change-set serves; `diff-tree` already
+    // emits it, this just keeps the two snapshot spellings from drifting.
+    raw_files.sort_by(|a, b| a.path.cmp(&b.path));
     let mut sections = patch_sections(&patch.bytes);
     let stats = parse_numstat(&numstat.bytes);
     // A commit's changes are committed by definition, and nothing in a commit
@@ -1992,7 +1999,9 @@ mod tests {
             base_view(&changes),
             ("origin/main", Some(upstream.as_str()))
         );
-        assert_eq!(paths(&changes), vec!["mine.txt", "dirty.txt"]);
+        // One path order across tracked and untracked: `dirty.txt` (untracked)
+        // sits beside `mine.txt` (committed), not parked at the end.
+        assert_eq!(paths(&changes), vec!["dirty.txt", "mine.txt"]);
     }
 
     /// A local base left behind by an upstream rebase must not drag the commits
