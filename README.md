@@ -288,8 +288,8 @@ A suspended session stays reachable: sending it a message, a GitHub `@loom`
 trigger, or a submitted code review wakes it first and then lands, and the
 composer still accepts a message (the send just takes the few seconds the
 restart costs). An automation channel delivery lands in the session's durable
-inbox, which the next wake drains — dormant parents are not revived by their
-children's updates.
+inbox, which the next wake drains — with one exception: a child's committed
+result wakes its dormant parent, so finished work always reaches its consumer.
 
 ## Recovery
 

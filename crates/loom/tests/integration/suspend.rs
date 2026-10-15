@@ -550,3 +550,195 @@ async fn bringing_a_runtime_back_refreshes_the_idle_anchor() {
         .await
         .unwrap();
 }
+
+/// A committed child result is a wake signal for its dormant parent: the
+/// notice is durable in the parent's inbox, and the respawned parent's task
+/// drains it. A duplicate post of the same idempotent result must not re-wake.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_result_wakes_a_suspended_parent() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    // A real API-launched ACP parent under the scripted fake adapter, so the
+    // session tree and channels all exist through the ordinary launch path.
+    weaver_core::config::apply(
+        &ts.state.db,
+        &[(
+            "acp.codex_cmd".to_string(),
+            Some(crate::fixtures::fake_acp_agent_cmd()),
+        )],
+    )
+    .await
+    .unwrap();
+    let parent = client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "title": "result parent", "goal": "say:ready", "cwd": ts.cwd(),
+                "agent": "codex", "protocol": "acp",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(parent["protocol"], "acp", "{parent}");
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    let parent_branch = parent["branch"]["id"].as_str().unwrap().to_string();
+
+    // A child launched under the parent's session credential — that grant is
+    // what links the two rows.
+    let parent_row = loom::session::get(&ts.state.db, &parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let parent_token = loom::auth::create_session_token(
+        &ts.state.db,
+        parent_row.created_by.as_deref(),
+        &parent_id,
+        &parent_branch,
+    )
+    .await
+    .unwrap();
+    let http = reqwest::Client::new();
+    let child: serde_json::Value = http
+        .post(format!("http://{}/api/sessions/launch", ts.addr))
+        .bearer_auth(&parent_token)
+        .json(&json!({ "goal": "deliver a result", "cwd": ts.cwd(), "agent": "shell" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let child_id = child["id"].as_str().unwrap().to_string();
+    let child_token = loom::auth::create_session_token(
+        &ts.state.db,
+        None,
+        &child_id,
+        child["branch"]["id"].as_str().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Wait out the parent's opening turn — suspend refuses mid-turn — then
+    // park it.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let s = loom::session::get(&ts.state.db, &parent_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if s.status == "running" && s.acp_inflight.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("parent should settle after its opening turn");
+    client
+        .post("/api/sessions/suspend", json!({ "session": parent_id }))
+        .await
+        .unwrap();
+    let parked = loom::session::get(&ts.state.db, &parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parked.status, "suspended");
+
+    // The child commits its result; the parent comes back for it.
+    let posted = http
+        .post(format!("http://{}/api/channels/messages/create", ts.addr))
+        .bearer_auth(&child_token)
+        .json(&json!({
+            "channel": child_id, "kind": "result",
+            "body": "the implementation is ready", "idempotency_key": "wake-parent-once",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), reqwest::StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let s = loom::session::get(&ts.state.db, &parent_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if s.status == "running" && s.lifecycle_transition.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a committed child result should wake the suspended parent");
+
+    // The drain of the result notice is itself a turn, dispatched during the
+    // wake's startup — the parent's journal shows it as a session-update user
+    // message. Wait until that turn has run and finished before parking the
+    // parent again.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let chat = client
+                .post("/api/sessions/chat", json!({ "session": parent_id }))
+                .await
+                .unwrap();
+            let blocks = chat["blocks"].as_array().cloned().unwrap_or_default();
+            let saw_notice = blocks.iter().any(|b| {
+                b["kind"] == "user_message"
+                    && b["payload"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("Update from loom session")
+            });
+            let turn_done = blocks.last().is_some_and(|b| b["kind"] == "turn_end");
+            if saw_notice && turn_done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("parent should finish consuming the result notice");
+
+    // A duplicate post of the same idempotent result must not re-wake: park
+    // the parent again, re-post, and it stays dormant.
+    client
+        .post("/api/sessions/suspend", json!({ "session": parent_id }))
+        .await
+        .unwrap();
+    let parked = loom::session::get(&ts.state.db, &parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parked.status, "suspended");
+    let reposted = http
+        .post(format!("http://{}/api/channels/messages/create", ts.addr))
+        .bearer_auth(&child_token)
+        .json(&json!({
+            "channel": child_id, "kind": "result",
+            "body": "the implementation is ready", "idempotency_key": "wake-parent-once",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reposted.status(), reqwest::StatusCode::OK);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let still = loom::session::get(&ts.state.db, &parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        still.status, "suspended",
+        "a duplicate result post must not re-wake the parent"
+    );
+
+    client
+        .post("/api/sessions/delete", json!({ "session": child_id }))
+        .await
+        .unwrap();
+    client
+        .post("/api/sessions/delete", json!({ "session": parent_id }))
+        .await
+        .unwrap();
+}
