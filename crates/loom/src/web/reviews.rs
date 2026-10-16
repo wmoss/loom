@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use weaver_api::{
     ArtifactTextAnchorDto, ChangeAnchorDto, ReviewAnchorDto, ReviewAnchorKindDto, ReviewCommentDto,
-    ReviewDto, ReviewSubjectDto, ReviewSubjectKindDto,
+    ReviewCommentReplyDto, ReviewDto, ReviewSubjectDto, ReviewSubjectKindDto,
 };
 use weaver_core::artifact::{self, Artifact};
 use weaver_core::branch::Branch;
@@ -74,6 +74,17 @@ fn comment_dto(comment: &review::ReviewComment) -> ReviewCommentDto {
         anchor,
         body: comment.body.clone(),
         status: comment.status.clone(),
+        replies: comment
+            .replies
+            .iter()
+            .map(|reply| ReviewCommentReplyDto {
+                id: reply.id,
+                author_kind: reply.author_kind.clone(),
+                author: reply.author.clone(),
+                body: reply.body.clone(),
+                created_at: reply.created_at.clone(),
+            })
+            .collect(),
         created_at: comment.created_at.clone(),
         updated_at: comment.updated_at.clone(),
     }
@@ -142,11 +153,25 @@ async fn current_review_version(st: &AppState, item: &review::Review) -> ApiResu
             if item.subject_id != branch.id {
                 return Err(AppError::bad_request("invalid changes review subject"));
             }
-            Ok(
-                crate::changes::load(std::path::Path::new(&session.work_dir), &branch.base_branch)
-                    .await?
-                    .version,
-            )
+            match crate::changes::commit_for_version(&item.subject_version) {
+                // A pinned commit is immutable, so its current version is its
+                // own snapshot — absent only when the commit no longer
+                // resolves in this worktree. Any other failure propagates:
+                // a transient git error must not masquerade as a fresh
+                // snapshot through the fallback that follows.
+                Some(rev) => Ok(crate::changes::load_pinned_commit(
+                    std::path::Path::new(&session.work_dir),
+                    rev,
+                )
+                .await?
+                .and_then(|changes| changes.version)),
+                None => Ok(crate::changes::load(
+                    std::path::Path::new(&session.work_dir),
+                    &branch.base_branch,
+                )
+                .await?
+                .version),
+            }
         }
         _ => Err(AppError::bad_request("unsupported review subject kind")),
     }
@@ -172,6 +197,8 @@ fn legacy_review_dto(
             }),
             body: comment.body.clone(),
             status: thread.status.clone(),
+            // Legacy threads predate replies and carry none.
+            replies: Vec::new(),
             created_at: comment.created_at.clone(),
             updated_at: comment.created_at.clone(),
         })
@@ -306,10 +333,19 @@ async fn list_for(
         viewer,
     )
     .await?;
-    let mut out: Vec<ReviewDto> = reviews
-        .iter()
-        .map(|item| review_dto(item, &current_version))
-        .collect();
+    let mut out: Vec<ReviewDto> = Vec::with_capacity(reviews.len());
+    for item in &reviews {
+        // A commit-pinned review is its own current version — the snapshot it
+        // names cannot move — while the branch change-set stays one shared load.
+        let current = match (
+            q.subject_kind,
+            crate::changes::commit_for_version(&item.subject_version),
+        ) {
+            (ReviewSubjectKindDto::Changes, Some(_)) => item.subject_version.clone(),
+            _ => current_version.clone(),
+        };
+        out.push(review_dto(item, &current));
+    }
     if q.subject_kind == ReviewSubjectKindDto::Artifact {
         let artifact_id = subject_id
             .parse()
@@ -352,9 +388,13 @@ async fn create_for(
                         "changes review subject_key must be 'changes'",
                     ));
                 }
-                let changes = crate::changes::load(
+                // The snapshot the caller is looking at may be the branch's
+                // whole change-set or one commit's diff; the version string
+                // says which.
+                let changes = crate::changes::load_for_review(
                     std::path::Path::new(&session.work_dir),
                     &branch.base_branch,
+                    crate::changes::commit_for_version(&body.subject_version),
                 )
                 .await?;
                 let version = changes.version.ok_or_else(|| {
@@ -442,9 +482,14 @@ async fn require_anchor(
         }
         ("changes", ReviewAnchorKindDto::Change, ReviewAnchorDto::Change(anchor)) => {
             let (session, branch) = require_session(&st.db, &item.session_id).await?;
-            let changes =
-                crate::changes::load(std::path::Path::new(&session.work_dir), &branch.base_branch)
-                    .await?;
+            // Validate against the exact snapshot the comment's version names:
+            // the branch's change-set, or one commit's diff.
+            let changes = crate::changes::load_for_review(
+                std::path::Path::new(&session.work_dir),
+                &branch.base_branch,
+                crate::changes::commit_for_version(subject_version),
+            )
+            .await?;
             let anchor = crate::changes::validate_anchor(&changes, subject_version, anchor)
                 .map_err(|error| AppError::conflict(error.to_string()))?;
             Ok((
@@ -539,6 +584,9 @@ pub(super) fn bound_operations() -> Vec<Bound> {
         ),
         register::<weaver_api::operations::reviews::comments::resolve::Op, _, _>(
             comments_resolve_operation,
+        ),
+        register::<weaver_api::operations::reviews::comments::reply::Op, _, _>(
+            comments_reply_operation,
         ),
         register::<weaver_api::operations::reviews::submit::Op, _, _>(submit_operation),
         register::<weaver_api::operations::reviews::retry_delivery::Op, _, _>(
@@ -800,6 +848,46 @@ async fn comments_resolve_operation(
             "subject_key": item.subject_key,
         }),
     );
+    Ok(comment_dto(&comment))
+}
+
+async fn comments_reply_operation(
+    context: OperationContext,
+    input: weaver_api::operations::reviews::comments::reply::Input,
+) -> ApiResult<weaver_api::operations::reviews::comments::reply::Output> {
+    let st = context.state;
+    // The credential names the speaker: a session appends as the reviewed
+    // session (and only to its own review — the scope check above already
+    // pinned the session operand to the caller's own), a human as an
+    // operator, with the same any-operator reach `resolve` grants.
+    let author = match &context.principal.grant {
+        crate::auth::Grant::Session { .. } => review::ReplyAuthor::Session(&input.session),
+        _ => review::ReplyAuthor::Operator(&context.principal.username),
+    };
+    let comment = review::reply_comment(&st.db, input.comment_id, author, &input.body)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let item = review::get(&st.db, comment.review_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("submitted review"))?;
+    if let Some(reply) = comment.replies.last() {
+        events::emit(
+            &st.bus,
+            &item.branch_id,
+            "review_comment_replied",
+            json!({
+                "review_id": item.id,
+                "comment_id": comment.id,
+                "reply_id": reply.id,
+                "session_id": item.session_id,
+                "author_kind": reply.author_kind,
+                "author": reply.author,
+                "subject_kind": item.subject_kind,
+                "subject_key": item.subject_key,
+                "body": reply.body,
+            }),
+        );
+    }
     Ok(comment_dto(&comment))
 }
 

@@ -51,6 +51,7 @@ const router = createRouter({
     { path: '/s/:id/artifacts', component: SessionDetail, props: true },
     { path: '/s/:id/artifacts/:name', component: SessionDetail, props: true },
     { path: '/s/:id/changes', component: SessionDetail, props: true },
+    { path: '/s/:id/commits', component: SessionDetail, props: true },
     { path: '/issues', component: Issues, meta: { title: 'Backlog' } },
     { path: '/channels', component: Channels, meta: { title: 'Channels' } },
     { path: '/channels/:id', component: Channels, props: true, meta: { title: 'Channels' } },

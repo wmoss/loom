@@ -149,6 +149,7 @@ pub fn bindings() -> Vec<CliBinding> {
         bind::<sessions::archive::Op>(),
         bind::<sessions::changes::Op>(),
         bind::<sessions::chat::Op>(),
+        bind::<sessions::commits::Op>(),
         bind::<sessions::conversation::Op>(),
         bind::<sessions::events::create::Op>(),
         bind::<sessions::events::list::Op>(),
