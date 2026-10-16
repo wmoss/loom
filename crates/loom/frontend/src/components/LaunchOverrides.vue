@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { computed, useId } from 'vue';
 import type { AgentMetadata, LaunchOverrides, ResolvedLaunch } from '../types';
-import ModelCombobox from './ModelCombobox.vue';
+import {
+  agentOptionsWithCurrent,
+  availableAgents,
+  isAgentAvailable,
+} from '../lib/agentAvailability';
 
 const props = defineProps<{
   agents: AgentMetadata[];
@@ -17,9 +21,19 @@ const emit = defineEmits<{
 const uid = useId();
 const settings = computed(() => props.resolved ?? props.fallback ?? null);
 const effectiveAgent = computed(
-  () => props.modelValue.agent ?? settings.value?.agent ?? props.agents[0]?.kind ?? '',
+  () =>
+    props.modelValue.agent ?? settings.value?.agent ?? availableAgents(props.agents)[0]?.kind ?? '',
 );
+// The effective agent is always an option, marked when its harness is missing,
+// so the control can never display a different agent than the one in effect.
+const agentOptions = computed(() => agentOptionsWithCurrent(props.agents, effectiveAgent.value));
 const metadata = computed(() => props.agents.find((agent) => agent.kind === effectiveAgent.value));
+const selectedModel = computed(() =>
+  metadata.value?.models.find((model) => model.id === value('model')),
+);
+const effortChoices = computed(() => selectedModel.value?.efforts ?? []);
+const fastChoices = computed(() => selectedModel.value?.fast ?? []);
+const thinkingChoices = computed(() => selectedModel.value?.thinking ?? []);
 
 function value(field: keyof LaunchOverrides): string {
   return props.modelValue[field] ?? (settings.value?.[field] as string | undefined) ?? '';
@@ -32,8 +46,10 @@ function changed(field: keyof LaunchOverrides): boolean {
 function set(field: keyof LaunchOverrides, nextValue: string) {
   const next = { ...props.modelValue, [field]: nextValue };
   if (field === 'agent') {
-    delete next.model;
-    delete next.effort;
+    next.model = '';
+    next.effort = '';
+    next.fast = '';
+    next.thinking = '';
   }
   emit('update:modelValue', next);
 }
@@ -63,12 +79,40 @@ function locked(field: keyof LaunchOverrides): boolean {
           class="w-full rounded bg-surface px-2 py-1.5 disabled:opacity-60"
           @change="set('agent', ($event.target as HTMLSelectElement).value)"
         >
-          <option v-for="agent in agents" :key="agent.kind" :value="agent.kind">
-            {{ agent.label }}
+          <option v-for="agent in agentOptions" :key="agent.kind" :value="agent.kind">
+            {{ agent.label }}{{ isAgentAvailable(agent) ? '' : ' — unavailable' }}
           </option>
         </select>
       </label>
 
+      <label class="rounded border border-line bg-input p-2 text-xs">
+        <span class="mb-1 flex items-center justify-between gap-2">
+          <span class="font-medium text-fg">Permission mode</span>
+          <span :class="changed('mode') ? 'text-accent' : 'text-faint'">
+            {{ changed('mode') ? 'changed' : 'from profile' }}
+          </span>
+        </span>
+        <select
+          :id="`${uid}-mode`"
+          aria-label="Permission mode"
+          :value="value('mode')"
+          :disabled="locked('mode')"
+          data-testid="override-mode"
+          class="w-full rounded bg-surface px-2 py-1.5 disabled:opacity-60"
+          @change="set('mode', ($event.target as HTMLSelectElement).value)"
+        >
+          <option
+            v-for="mode in ['auto', 'default', 'acceptEdits', 'plan', 'bypassPermissions']"
+            :key="mode"
+            :value="mode"
+          >
+            {{ mode }}
+          </option>
+        </select>
+      </label>
+    </div>
+
+    <div class="grid gap-3" data-testid="launch-selectors">
       <label class="rounded border border-line bg-input p-2 text-xs">
         <span class="mb-1 flex items-center justify-between gap-2">
           <span class="font-medium text-fg">Model</span>
@@ -76,18 +120,7 @@ function locked(field: keyof LaunchOverrides): boolean {
             {{ changed('model') ? 'changed' : 'from profile' }}
           </span>
         </span>
-        <ModelCombobox
-          v-if="metadata?.accepts_raw_model"
-          :id="`${uid}-model`"
-          :choices="metadata.models"
-          :model-value="value('model')"
-          :disabled="locked('model')"
-          field-class="bg-surface"
-          testid="override-model"
-          @update:model-value="set('model', $event)"
-        />
         <select
-          v-else
           :id="`${uid}-model`"
           aria-label="Model"
           :value="value('model')"
@@ -120,7 +153,7 @@ function locked(field: keyof LaunchOverrides): boolean {
           @change="set('effort', ($event.target as HTMLSelectElement).value)"
         >
           <option value="">Agent default</option>
-          <option v-for="choice in metadata?.efforts ?? []" :key="choice.id" :value="choice.id">
+          <option v-for="choice in effortChoices" :key="choice.id" :value="choice.id">
             {{ choice.label }}
           </option>
         </select>
@@ -128,26 +161,46 @@ function locked(field: keyof LaunchOverrides): boolean {
 
       <label class="rounded border border-line bg-input p-2 text-xs">
         <span class="mb-1 flex items-center justify-between gap-2">
-          <span class="font-medium text-fg">Permission mode</span>
-          <span :class="changed('mode') ? 'text-accent' : 'text-faint'">
-            {{ changed('mode') ? 'changed' : 'from profile' }}
+          <span class="font-medium text-fg">Fast</span>
+          <span :class="changed('fast') ? 'text-accent' : 'text-faint'">
+            {{ changed('fast') ? 'changed' : 'from profile' }}
           </span>
         </span>
         <select
-          :id="`${uid}-mode`"
-          aria-label="Permission mode"
-          :value="value('mode')"
-          :disabled="locked('mode')"
-          data-testid="override-mode"
+          :id="`${uid}-fast`"
+          aria-label="Fast"
+          :value="value('fast')"
+          :disabled="locked('fast')"
+          data-testid="override-fast"
           class="w-full rounded bg-surface px-2 py-1.5 disabled:opacity-60"
-          @change="set('mode', ($event.target as HTMLSelectElement).value)"
+          @change="set('fast', ($event.target as HTMLSelectElement).value)"
         >
-          <option
-            v-for="mode in ['auto', 'default', 'acceptEdits', 'plan', 'bypassPermissions']"
-            :key="mode"
-            :value="mode"
-          >
-            {{ mode }}
+          <option value="">Agent default</option>
+          <option v-for="choice in fastChoices" :key="choice.id" :value="choice.id">
+            {{ choice.label }}
+          </option>
+        </select>
+      </label>
+
+      <label class="rounded border border-line bg-input p-2 text-xs">
+        <span class="mb-1 flex items-center justify-between gap-2">
+          <span class="font-medium text-fg">Thinking</span>
+          <span :class="changed('thinking') ? 'text-accent' : 'text-faint'">
+            {{ changed('thinking') ? 'changed' : 'from profile' }}
+          </span>
+        </span>
+        <select
+          :id="`${uid}-thinking`"
+          aria-label="Thinking"
+          :value="value('thinking')"
+          :disabled="locked('thinking')"
+          data-testid="override-thinking"
+          class="w-full rounded bg-surface px-2 py-1.5 disabled:opacity-60"
+          @change="set('thinking', ($event.target as HTMLSelectElement).value)"
+        >
+          <option value="">Agent default</option>
+          <option v-for="choice in thinkingChoices" :key="choice.id" :value="choice.id">
+            {{ choice.label }}
           </option>
         </select>
       </label>
@@ -172,7 +225,7 @@ function locked(field: keyof LaunchOverrides): boolean {
             class="w-full rounded bg-surface px-2 py-1.5 disabled:opacity-60"
             @change="set('protocol', ($event.target as HTMLSelectElement).value)"
           >
-            <option value="acp">ACP</option>
+            <option v-if="metadata?.supports_acp !== false" value="acp">ACP</option>
             <option value="terminal">Terminal</option>
           </select>
         </label>

@@ -188,6 +188,8 @@ struct HandoffPlan {
     target: String,
     model: String,
     effort: String,
+    fast: String,
+    thinking: String,
     mode: String,
     class: String,
     profile: String,
@@ -295,7 +297,7 @@ async fn legacy_handoff_plan(
         .unwrap_or_default()
         .to_string();
     crate::agent::validate_model(&metadata, &model).map_err(HandoffError::bad_request)?;
-    crate::agent::validate_effort(&metadata, &effort).map_err(HandoffError::bad_request)?;
+    crate::agent::validate_effort(&metadata, &model, &effort).map_err(HandoffError::bad_request)?;
     let protocol =
         crate::agent::resolve_protocol(&metadata, None).map_err(HandoffError::bad_request)?;
     if protocol != "acp" {
@@ -346,10 +348,15 @@ async fn legacy_handoff_plan(
             .policy
             .instructions
     };
+    let (fast, thinking) = crate::launch::deserialize_snapshot(&session.launch_snapshot)
+        .map(|snapshot| (snapshot.view.fast, snapshot.view.thinking))
+        .unwrap_or_default();
     Ok(HandoffPlan {
         target: target.to_string(),
         model: model.clone(),
         effort: effort.clone(),
+        fast,
+        thinking,
         mode: mode.clone(),
         class: session.class.clone(),
         profile: session.profile.clone(),
@@ -493,6 +500,8 @@ async fn handoff_session_inner(
             target: resolved.view.agent.clone(),
             model: resolved.view.model.clone(),
             effort: resolved.view.effort.clone(),
+            fast: resolved.view.fast.clone(),
+            thinking: resolved.view.thinking.clone(),
             mode: resolved.view.mode.clone(),
             class: resolved.view.class.clone(),
             profile: resolved.profile.name.clone(),
@@ -693,6 +702,8 @@ async fn handoff_session_inner(
             server_addr: &st.addr,
             model: &model,
             effort: &effort,
+            fast: &plan.fast,
+            thinking: &plan.thinking,
             goal_file: None,
             primer_file: None,
             extra_env: &extra_env,

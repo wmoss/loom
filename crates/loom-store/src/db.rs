@@ -180,6 +180,11 @@ const LOOM_MIGRATIONS: &[(i64, &str, &str)] = &[
         "unified-input-queue",
         include_str!("../migrations/0034_unified_input_queue.sql"),
     ),
+    (
+        35,
+        "harness-model-catalog",
+        include_str!("../migrations/0035_harness_model_catalog.sql"),
+    ),
 ];
 
 const LOOM_STREAM: Stream = Stream::new("loom_schema_migrations", LOOM_MIGRATIONS);
