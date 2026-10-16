@@ -13,7 +13,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use crate::protocol::{self, op, req, Frame, PongInfo};
-use crate::DerivedLaunch;
+use crate::{AgentSiblingLaunch, DerivedLaunch};
 
 /// Buffered output frames an attach holds before the consumer must catch up.
 /// Bounded so a slow reader back-pressures the socket (and thus the supervisor)
@@ -82,6 +82,15 @@ impl Client {
     pub async fn derive(&mut self, launch: &DerivedLaunch) -> Result<()> {
         let payload = serde_json::to_vec(launch).context("encoding derived launch")?;
         protocol::write_frame(&mut self.stream, &req::derive(payload)).await?;
+        self.expect_ok().await
+    }
+
+    /// Launch a full agent-session sibling on this supervisor, with the
+    /// environment the caller supplies. An older supervisor that predates
+    /// agent siblings answers `ERR` here.
+    pub async fn derive_agent(&mut self, launch: &AgentSiblingLaunch) -> Result<()> {
+        let payload = serde_json::to_vec(launch).context("encoding agent sibling launch")?;
+        protocol::write_frame(&mut self.stream, &req::derive_agent(payload)).await?;
         self.expect_ok().await
     }
 

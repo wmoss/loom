@@ -122,6 +122,58 @@ pub(crate) async fn spawn_derived(
     .await
 }
 
+/// An agent-session sibling derived from an existing session's supervisor —
+/// a full child session placed beside its launcher (inside the launcher's
+/// container under the docker runner), not a debug shell. Unlike
+/// [`DerivedLaunch`] the sibling's environment is the caller's to supply:
+/// an agent child carries its own session credential and identity, so
+/// nothing is inherited from the owner.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentSiblingLaunch {
+    pub name: String,
+    pub cwd: std::path::PathBuf,
+    /// The shell command the sibling supervisor runs as `sh -c <script>`.
+    pub script: String,
+    pub cols: u16,
+    pub rows: u16,
+    /// Which backend the sibling supervisor runs: PTY or relay.
+    pub mode: Mode,
+    /// The complete sibling environment, delivered out of band exactly as
+    /// [`LaunchOptions::env`] — never on argv.
+    pub env: Vec<(String, String)>,
+    /// Start the sibling from an empty environment. The caller materializes
+    /// any ambient environment itself (a sibling must match a freshly placed
+    /// session, and the owning supervisor's process environment is only the
+    /// launcher's container base), so this pins to `true` and nothing is
+    /// inherited from the owner.
+    pub env_clear: bool,
+}
+
+/// Launch a detached agent-session sibling from an owning supervisor. Uses the
+/// same stdin-only launch spec as any other placement, re-execing this
+/// executable (the supervisor binary inside the owning session's container)
+/// as the sibling supervisor.
+pub(crate) async fn spawn_agent_sibling(launch: &AgentSiblingLaunch) -> Result<()> {
+    let env: Vec<_> = launch
+        .env
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    spawn_detached(&LaunchOptions {
+        name: &launch.name,
+        cwd: &launch.cwd,
+        script: &launch.script,
+        env: &env,
+        env_clear: launch.env_clear,
+        cols: launch.cols,
+        rows: launch.rows,
+        mode: launch.mode,
+        segment_max_bytes: None,
+        supervisor_bin: None,
+    })
+    .await
+}
+
 /// Encode the supervisor launch spec exactly as [`spawn_detached`] sends it.
 ///
 /// Alternative placement backends can carry the same stdin-only contract

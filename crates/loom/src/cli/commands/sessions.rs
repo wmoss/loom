@@ -316,6 +316,13 @@ pub struct LaunchOpts {
     /// for a terminal launch.
     #[arg(long)]
     mode: Option<String>,
+    /// Place this session beside its launcher (`sibling`) — inside the
+    /// launching session's own container under the docker runner, reusing
+    /// its placement instead of creating a new one. Only meaningful when
+    /// launched from within a session (a code-review subagent). Omit to use
+    /// the configured runner.
+    #[arg(long)]
+    runner: Option<String>,
 }
 
 /// Dispatch the `loom sessions <verb>` subcommands.
@@ -452,6 +459,7 @@ pub struct LaunchArgs {
     effort: Option<String>,
     protocol: Option<String>,
     mode: Option<String>,
+    runner: Option<String>,
 }
 
 impl From<LaunchOpts> for LaunchArgs {
@@ -471,6 +479,7 @@ impl From<LaunchOpts> for LaunchArgs {
             effort: o.effort,
             protocol: o.protocol,
             mode: o.mode,
+            runner: o.runner,
         }
     }
 }
@@ -554,6 +563,7 @@ pub async fn cmd_launch(a: LaunchArgs) -> Result<()> {
         effort,
         protocol,
         mode,
+        runner,
     } = a;
     let client = client::default()?;
     let target = resolve_repo_target(repo.as_deref())?;
@@ -608,6 +618,7 @@ pub async fn cmd_launch(a: LaunchArgs) -> Result<()> {
             parent_branch: parent_branch.clone(),
             name: name.clone(),
             existing_branch: branch.clone(),
+            runner,
             selection: (Some(selection)).clone(),
             expected_profile_revision: (Some(preview.profile_revision)),
             expected_resolver_revision: (Some(preview.resolver_revision)).clone(),
@@ -1444,6 +1455,7 @@ mod tests {
             effort: None,
             protocol: None,
             mode: None,
+            runner: None,
         }
     }
     // Serial: reads the process's current directory, which the precedence test

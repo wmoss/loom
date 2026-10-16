@@ -597,6 +597,14 @@ pub mod launch {
         /// else is rejected). Blank/absent derives from the launch origin
         /// (watch/actions/ops/grafana → automation, else interactive).
         pub class: Option<String>,
+        /// Runtime placement override: `"sibling"` places this session
+        /// beside its launcher — inside the launching session's own container
+        /// under the docker runner, reusing its placement instead of creating
+        /// a new one — the cheap placement for a trusted helper such as a
+        /// code-review subagent. Only meaningful when launched from within a
+        /// session. Blank/absent uses the deployment's configured runner
+        /// (anything other than `"sibling"` is rejected).
+        pub runner: Option<String>,
         /// Named launch profile; blank selects `default`.
         pub profile: Option<String>,
         /// A pre-existing Loom backlog item to claim for this session.

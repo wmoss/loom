@@ -384,6 +384,47 @@ async fn create_inner(
     // touching a repository, worktree, branch, work-item claim, or session row.
     let prepared_scratch = prepare_initial_scratch(&req.scratch)?;
     let selection = create_selection(&req)?;
+    // Placement input is validated before touching a repository so an unknown
+    // runner never leaves a half-provisioned worktree behind.
+    let runner = req
+        .runner
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    if !runner.is_empty() && runner != "sibling" {
+        return Err(ProvisionError::invalid(format!(
+            "unknown runner '{runner}' (expected 'sibling')"
+        )));
+    }
+    // `runner: "sibling"` places the child beside its launcher — inside the
+    // launching session's own container under the docker runner, the cheap
+    // placement for a trusted helper such as a code-review subagent. It is
+    // only meaningful when launched from within a session; a top-level launch
+    // has no caller to join. The parent's supervisor hosts the sibling, or
+    // the spawn falls back to the configured placement (see
+    // `backend::new_session_on_owner`).
+    let sibling_owner = if runner == "sibling" {
+        match actor.bound_parent_session() {
+            Some(parent_id) => {
+                let parent = session_mod::get(&st.db, parent_id).await?.ok_or_else(|| {
+                    ProvisionError::invalid(format!(
+                        "runner 'sibling' names its launcher, but session {parent_id} is gone"
+                    ))
+                })?;
+                Some(parent.term_session)
+            }
+            None => {
+                return Err(ProvisionError::invalid(
+                    "runner 'sibling' places the session beside its launcher — \
+                     launch it from within a session (a top-level launch has \
+                     no caller to join)",
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let selected_profile_name = match selection.profile.trim() {
         "" => crate::profile::DEFAULT_PROFILE,
         name => name,
@@ -637,6 +678,7 @@ async fn create_inner(
                 allowed_tools: &stamped_allowed_tools,
                 mcp_access: &stamped_mcp_access,
                 custom: None,
+                owner: sibling_owner.as_deref(),
             },
             agent::AcpOpen::Fresh,
         )
@@ -947,6 +989,7 @@ async fn create_inner(
         creator_subject,
         parent_session_id,
         automation_run_id: actor.automation_run_id().map(str::to_string),
+        runner: runner.to_string(),
     };
 
     // Keep an explicit claimed/imported work item attached for compatibility.
@@ -1109,6 +1152,7 @@ async fn create_inner(
                 allowed_tools: &stamped_allowed_tools,
                 mcp_access: &launch_policy.mcp_access,
                 custom: custom_agent.as_ref(),
+                owner: sibling_owner.as_deref(),
             },
             agent::AcpOpen::Fresh,
         )
@@ -1194,6 +1238,7 @@ async fn create_inner(
                 extra_env: &extra_env,
                 env_clear: launch_profile.env_clear,
                 custom: custom_agent.as_ref(),
+                owner: sibling_owner.as_deref(),
             },
             agent::LaunchMode::Fresh,
         )

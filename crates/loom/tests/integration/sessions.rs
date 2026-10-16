@@ -1230,6 +1230,262 @@ async fn session_records_its_launcher_as_tree_parent() {
         .unwrap();
 }
 
+/// The `runner` launch override places a child beside its launcher, so a
+/// top-level launch (no calling session to join) is refused, as is an unknown
+/// runner value — both before anything is provisioned.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_runner_override_is_validated_before_provisioning() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let local = client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "no caller to join",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": "no-caller",
+                "runner": "sibling",
+            }),
+        )
+        .await;
+    let error = local
+        .expect_err("a top-level launch has no caller for runner sibling to join")
+        .to_string();
+    assert!(
+        error.contains("beside its launcher") && error.contains("400"),
+        "the refusal explains the placement: {error}"
+    );
+
+    let rejected = client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "bad runner",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "runner": "docker",
+            }),
+        )
+        .await;
+    let error = rejected
+        .expect_err("an unknown runner is rejected")
+        .to_string();
+    assert!(
+        error.contains("unknown runner") && error.contains("400"),
+        "the refusal is a validation 400: {error}"
+    );
+}
+
+/// `runner: "sibling"` places the child beside its launcher: the
+/// launcher's supervisor hosts the child supervisor, so the child runs with
+/// the launcher's own placement — inside its container under the docker
+/// runner — and its row, view, and fleet summary record the override.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_runner_sibling_places_the_child_beside_its_launcher() {
+    let ts = TestServer::start().await;
+
+    // A launcher session with a live supervisor. The supervisor carries a
+    // probe variable: a sibling spawned beside it inherits the supervisor's
+    // environment, so the probe proves the child was placed there.
+    let branch =
+        weaver_core::branch::upsert(&ts.state.db, &ts.cwd(), "weaver/sibling-launcher", "main")
+            .await
+            .unwrap();
+    let launcher = loom::session::NewSession {
+        id: "sibling-launcher".to_string(),
+        branch_id: branch.id.clone(),
+        work_dir: ts.cwd(),
+        term_session: "weaver-sibling-launcher".to_string(),
+        agent_kind: "shell".to_string(),
+        model: String::new(),
+        effort: String::new(),
+        status: "running".to_string(),
+        github_repo: None,
+        parent_branch_id: None,
+        managed_by: None,
+        created_by: None,
+        protocol: "terminal".to_string(),
+        origin: "user".to_string(),
+        class: "interactive".to_string(),
+        tracking_issue_id: None,
+    };
+    loom::session::insert(&ts.state.db, &launcher)
+        .await
+        .unwrap();
+    // The launcher's supervisor runs env-cleared — a session container never
+    // sees the daemon's ambient — so any credential the sibling receives
+    // comes from the server's own materialized ambient, exactly as a placed
+    // session would.
+    std::env::set_var("SIBLING_PARITY_PROBE", "from-server-ambient");
+    loom::backend::new_session(
+        "weaver-sibling-launcher",
+        ts.repo_path(),
+        "sleep 120",
+        &[],
+        true,
+        0,
+    )
+    .await
+    .unwrap();
+
+    // The launch rides a session credential so the child can name its
+    // launcher.
+    let token =
+        loom::auth::create_session_token(&ts.state.db, None, "sibling-launcher", &branch.id)
+            .await
+            .unwrap();
+    let session_client = ts.client.clone().with_token(Some(token));
+
+    let child = session_client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "review the diff",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": "sibling-child",
+                "runner": "sibling",
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        child["runner"], "sibling",
+        "the view echoes the placement override"
+    );
+    assert_eq!(
+        child["parent_session_id"], "sibling-launcher",
+        "the child names the session that launched it"
+    );
+    let child_id = child["id"].as_str().unwrap().to_string();
+    let row = loom::session::get(&ts.state.db, &child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.runner_is_sibling(),
+        "the row carries the durable override"
+    );
+    assert!(
+        loom::backend::has_session(&row.term_session).await,
+        "the sibling supervisor is live"
+    );
+    let summary = ts
+        .client
+        .post("/api/sessions/summary/list", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        summary
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == child_id.as_str() && s["runner"] == "sibling"),
+        "the fleet summary exposes the placement override"
+    );
+
+    // The sibling supervisor is a child of the launcher's supervisor process
+    // (setsid detaches its session, not its parentage), so process genealogy
+    // proves the placement: exactly the two supervisors this test created,
+    // with the child parented by the launcher's.
+    let home = std::env::var("WEAVER_HOME").unwrap();
+    let supervisors = supervise_pids(&home);
+    assert_eq!(
+        supervisors.len(),
+        2,
+        "expected exactly the launcher and its sibling supervisor: {supervisors:?}"
+    );
+    let test_pid = i32::try_from(std::process::id()).unwrap();
+    let child = supervisors
+        .iter()
+        .find(|(_, ppid)| supervisors.iter().any(|(pid, _)| pid == ppid))
+        .expect("the sibling supervisor is parented by the launcher's");
+    assert!(
+        supervisors
+            .iter()
+            .any(|(pid, ppid)| *pid == child.1 && *ppid == test_pid),
+        "the launcher's own supervisor is parented by this test process"
+    );
+
+    // The sibling's environment reaches its agent intact: `WEAVER_API`
+    // pointing at the loom server (under a docker placement the runner's
+    // `session_api_url` override carries the container-network alias), and
+    // the server's materialized ambient — the probe var lives only in the
+    // server's environment, not the env-cleared launcher's — proving the
+    // sibling's credentials match a freshly placed session.
+    let expected_api = format!("http://{}", ts.addr);
+    let probe = "echo api=$WEAVER_API parity=$SIBLING_PARITY_PROBE".to_string();
+    let mut screen = String::new();
+    for _ in 0..100 {
+        if loom::backend::has_session(&row.term_session).await {
+            loom::backend::send_literal(&row.term_session, &probe)
+                .await
+                .ok();
+            loom::backend::send_enter(&row.term_session).await.ok();
+            screen = loom::backend::capture(&row.term_session, 5)
+                .await
+                .unwrap_or_default();
+            if screen.contains(&expected_api) && screen.contains("parity=from-server-ambient") {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        screen.contains(&expected_api),
+        "the sibling's WEAVER_API must point at the server, got: {screen:?}"
+    );
+    assert!(
+        screen.contains("parity=from-server-ambient"),
+        "the sibling inherits the server's materialized ambient, got: {screen:?}"
+    );
+    std::env::remove_var("SIBLING_PARITY_PROBE");
+
+    // Clean up the supervisors the test created outside the fixture's sweep.
+    let _ = loom::backend::kill_session_and_wait(&row.term_session).await;
+    let _ = loom::backend::kill_session_and_wait("weaver-sibling-launcher").await;
+}
+
+/// Every live tapestry supervisor process this test created, as `(pid, ppid)`
+/// — the detached `… tapestry supervise -` processes carrying this test's
+/// `WEAVER_HOME`, not loom itself, short-lived clients, or other tests'.
+pub(crate) fn supervise_pids(home: &str) -> Vec<(i32, i32)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read_to_string(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if !cmdline.contains("tapestry") || !cmdline.contains("supervise") {
+            continue;
+        }
+        let Ok(environ) = std::fs::read_to_string(entry.path().join("environ")) else {
+            continue;
+        };
+        if !environ.contains(home) {
+            continue;
+        }
+        let stat = std::fs::read_to_string(entry.path().join("stat")).unwrap_or_default();
+        // The field after the parenthesized command name is the ppid; comm is
+        // in parens, so split after its closing paren.
+        if let Some(ppid) = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+            .and_then(|ppid| ppid.parse::<i32>().ok())
+        {
+            found.push((pid, ppid));
+        }
+    }
+    found
+}
+
 /// `sessions.url` — the link an agent hands a human. It resolves by any
 /// session key (id or branch id, the `$WEAVER_BRANCH` the agent carries), and
 /// honours the operator's public origin so the URL works off-box.

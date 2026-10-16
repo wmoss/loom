@@ -93,6 +93,72 @@ pub(super) async fn start_new(ts: &TestServer, id: &str, mode: Option<&str>, goa
     start_new_with_env(ts, id, mode, goal, vec![]).await;
 }
 
+/// A relay sibling launched with an owner derives from the launcher's
+/// supervisor — the ACP-review-subagent placement — rather than a fresh
+/// placement.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_sibling_placement_derives_from_the_launching_supervisor() {
+    let ts = TestServer::start().await;
+    backend::new_session(
+        "weaver-relay-owner",
+        ts.repo_path(),
+        "sleep 120",
+        &[],
+        false,
+        0,
+    )
+    .await
+    .unwrap();
+    let id = "acp-relay-sibling";
+    make_session(&ts, id).await;
+    let cwd = ts.repo_path().to_path_buf();
+    let launch = AcpLaunch {
+        adapter_cmd: agent_cmd(),
+        cwd: cwd.clone(),
+        env: vec![],
+        env_clear: false,
+        mcp_servers: vec![],
+        new_or_load: NewOrLoad::New { cwd, meta: None },
+        mode: None,
+        initial_model: None,
+        initial_effort: None,
+        goal: Some("say:hello".to_string()),
+        setup_timeout: Duration::from_secs(5),
+        additional_directories: Vec::new(),
+        owner: Some("weaver-relay-owner".to_string()),
+    };
+    acp::start(&ts.state.acp_ctx(), id, launch)
+        .await
+        .expect("the derived relay session starts");
+
+    // The relay supervisor is a child of the launcher's supervisor process.
+    let home = std::env::var("WEAVER_HOME").unwrap();
+    let supervisors = crate::sessions::supervise_pids(&home);
+    assert_eq!(
+        supervisors.len(),
+        2,
+        "expected exactly the launcher and its relay sibling: {supervisors:?}"
+    );
+    let test_pid = i32::try_from(std::process::id()).unwrap();
+    let child = supervisors
+        .iter()
+        .find(|(_, ppid)| supervisors.iter().any(|(pid, _)| pid == ppid))
+        .expect("the relay sibling is parented by the launcher's supervisor");
+    assert!(
+        supervisors
+            .iter()
+            .any(|(pid, ppid)| *pid == child.1 && *ppid == test_pid),
+        "the launcher's own supervisor is parented by this test process"
+    );
+
+    session_mod::set_status(&ts.state.db, id, "done")
+        .await
+        .unwrap();
+    let _ = backend::kill_session_and_wait("weaver-relay-owner").await;
+    let _ = backend::kill_session_and_wait(&format!("weaver-{id}")).await;
+}
+
 async fn start_new_with_env(
     ts: &TestServer,
     id: &str,
@@ -115,6 +181,7 @@ async fn start_new_with_env(
         initial_effort: None,
         goal: goal.map(str::to_string),
         setup_timeout: Duration::from_secs(5),
+        owner: None,
     };
     acp::start(&ts.state.acp_ctx(), id, launch)
         .await
@@ -136,6 +203,7 @@ fn transient_launch(ts: &TestServer, env: Vec<(String, String)>) -> AcpLaunch {
         initial_effort: None,
         goal: None,
         setup_timeout: Duration::from_secs(5),
+        owner: None,
     }
 }
 
@@ -163,6 +231,7 @@ async fn silent_setup_stage_times_out_and_cleans_provider_state() {
         initial_effort: None,
         goal: Some("say:never starts".to_string()),
         setup_timeout: Duration::from_millis(150),
+        owner: None,
     };
 
     let error = acp::start(&ts.state.acp_ctx(), "acp-setup-timeout", launch)
@@ -671,6 +740,7 @@ async fn launch_model_and_effort_replace_adapter_config_defaults() {
         initial_effort: Some("high".to_string()),
         goal: None,
         setup_timeout: Duration::from_secs(5),
+        owner: None,
     };
     acp::start(&ts.state.acp_ctx(), "acp-launch-config", launch)
         .await
@@ -710,6 +780,7 @@ async fn load_preserves_adapter_restored_model_and_effort() {
         initial_effort: None,
         goal: None,
         setup_timeout: Duration::from_secs(5),
+        owner: None,
     };
     acp::start(&ts.state.acp_ctx(), "acp-load-config", launch)
         .await
@@ -5457,6 +5528,7 @@ async fn codex_acp_launch_maps_the_adapter_contract() {
         allowed_tools: "[]",
         mcp_access: r#"{"selection":{"mode":"none","groups":[]},"capability_sets":[],"custom_servers":[]}"#,
         custom: None,
+        owner: None,
     };
 
     let launch = loom::agent::build_acp_launch(

@@ -504,6 +504,9 @@ async fn handle_conn(
             op::DERIVE => {
                 derive(&mut stream, &frame.payload, &environment).await?;
             }
+            op::DERIVE_AGENT => {
+                derive_agent(&mut stream, &frame.payload).await?;
+            }
             op::KILL => {
                 let _ = cmd_tx.send(Cmd::Kill);
                 protocol::write_frame(&mut stream, &Frame::new(op::OK, Vec::new())).await?;
@@ -534,6 +537,20 @@ async fn derive(
 ) -> Result<()> {
     let result = match serde_json::from_slice::<crate::DerivedLaunch>(payload) {
         Ok(launch) => crate::spawn_derived(environment, &launch).await,
+        Err(error) => Err(error.into()),
+    };
+    let frame = match result {
+        Ok(()) => Frame::new(op::OK, Vec::new()),
+        Err(error) => Frame::new(op::ERR, error.to_string().into_bytes()),
+    };
+    protocol::write_frame(stream, &frame).await
+}
+
+/// The agent-session analogue of [`derive`]: the sibling's environment and
+/// backend come from the caller, never inherited from this supervisor.
+async fn derive_agent(stream: &mut tokio::net::UnixStream, payload: &[u8]) -> Result<()> {
+    let result = match serde_json::from_slice::<crate::AgentSiblingLaunch>(payload) {
+        Ok(launch) => crate::spawn_agent_sibling(&launch).await,
         Err(error) => Err(error.into()),
     };
     let frame = match result {
@@ -1159,6 +1176,9 @@ mod relay {
                 }
                 op::DERIVE => {
                     super::derive(&mut stream, &frame.payload, &environment).await?;
+                }
+                op::DERIVE_AGENT => {
+                    super::derive_agent(&mut stream, &frame.payload).await?;
                 }
                 op::CAPTURE => {
                     let (resp_tx, resp_rx) = oneshot::channel();

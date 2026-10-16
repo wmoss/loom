@@ -65,6 +65,11 @@ pub struct Session {
     /// as terminal.
     #[serde(default = "default_protocol")]
     pub protocol: String,
+    /// Runtime placement override stamped once at create: blank uses the
+    /// deployment's configured runner; `"sibling"` places this session
+    /// beside its launcher instead. See [`Session::runner_is_sibling`].
+    #[serde(default)]
+    pub runner: String,
     /// The agent's own on-disk ACP session id, or `None` for a terminal session
     /// (or an ACP session before setup completes).
     pub acp_session_id: Option<String>,
@@ -148,7 +153,7 @@ const SESSION_COLUMNS: &str = "\
     lifecycle_transition, lifecycle_step, lifecycle_transition_started_at, \
     lifecycle_transition_owner_pid, github_repo, \
     last_activity_at, created_at, parent_branch_id, managed_by, created_by, park, sort_order, \
-    protocol, acp_session_id, acp_ack_seq, acp_driver_epoch, acp_inflight, current_mode, \
+    protocol, runner, acp_session_id, acp_ack_seq, acp_driver_epoch, acp_inflight, current_mode, \
     origin, \
     class, turn_count, tracking_issue_id, profile, launch_mode, profile_revision, \
     profile_lifetime, policy_strict, policy_env_clear, policy_ambient_allowlist, \
@@ -178,6 +183,14 @@ pub const STATUSES: &[&str] = &[
 
 pub fn is_terminal(status: &str) -> bool {
     matches!(status, "done" | "error" | "archived")
+}
+
+impl Session {
+    /// Whether this session was placed beside its launcher, bypassing the
+    /// deployment's configured runner.
+    pub fn runner_is_sibling(&self) -> bool {
+        self.runner.trim() == "sibling"
+    }
 }
 
 pub struct NewSession {
@@ -234,6 +247,10 @@ pub struct SessionLaunchPolicy {
     pub creator_subject: String,
     pub parent_session_id: Option<String>,
     pub automation_run_id: Option<String>,
+    /// Runtime placement override stamped onto the row: blank uses the
+    /// deployment's configured runner; `"sibling"` places this session
+    /// beside its launcher.
+    pub runner: String,
 }
 
 /// Resolved profile/security metadata replaced during an ACP handoff. Creator
@@ -291,6 +308,7 @@ impl SessionLaunchPolicy {
             creator_subject: s.created_by.clone().unwrap_or_else(|| s.origin.clone()),
             parent_session_id: None,
             automation_run_id: None,
+            runner: String::new(),
         }
     }
 }
@@ -554,15 +572,15 @@ pub(crate) async fn insert_with_layout_revision(
     sqlx::query(
         "INSERT INTO sessions
          (id, branch_id, work_dir, term_session, agent_kind, model, effort, status,
-          github_repo, parent_branch_id, managed_by, created_by, protocol,
+          github_repo, parent_branch_id, managed_by, created_by, protocol, runner,
           origin, class, tracking_issue_id, last_activity_at, created_at,
           profile, launch_mode, profile_revision, profile_lifetime, policy_strict,
           policy_env_clear,
           policy_ambient_allowlist, policy_idle_archive_secs, policy_turn_budget,
           policy_prelude, policy_restricted, policy_github_repositories, policy_allowed_tools, policy_mcp_access,
           launch_snapshot, creator_kind, creator_subject, parent_session_id, automation_run_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&s.id)
     .bind(&s.branch_id)
@@ -577,6 +595,7 @@ pub(crate) async fn insert_with_layout_revision(
     .bind(&s.managed_by)
     .bind(&s.created_by)
     .bind(protocol)
+    .bind(policy.runner.trim())
     .bind(&s.origin)
     .bind(&s.class)
     .bind(s.tracking_issue_id)
@@ -645,6 +664,20 @@ pub async fn active_for_branch(db: &Db, branch_id: &str) -> Result<Option<Sessio
         .fetch_optional(db)
         .await?;
     Ok(row)
+}
+
+/// The child sessions launched by `parent_session_id`, oldest first — archived
+/// rows included, so a subtree walk can traverse an already-archived link to
+/// reach descendants it never cascaded to. Ancestry is a tree — a session is
+/// only ever born with its parent, never re-parented — so one level is exact;
+/// whole-subtree walks go through each child recursively.
+pub async fn list_children(db: &Db, parent_session_id: &str) -> Result<Vec<Session>> {
+    let query = select_sessions("WHERE parent_session_id = ? ORDER BY created_at");
+    let rows = sqlx::query_as::<_, Session>(&query)
+        .bind(parent_session_id)
+        .fetch_all(db)
+        .await?;
+    Ok(rows)
 }
 
 /// Every session, ordered newest-first — managed (warm) sessions included. The
@@ -2073,5 +2106,116 @@ mod tests {
         assert_eq!(session.agent_kind, "claude");
         assert_eq!(session.profile, crate::agent_kind::DEFAULT_PROFILE);
         assert_eq!(session.mutation_revision, 3);
+    }
+
+    #[tokio::test]
+    async fn launch_policy_runner_is_stamped_and_read_back() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let mut policy = SessionLaunchPolicy::compatible(&new_session(
+            "configured",
+            &branch_id(&db, "weaver/configured").await,
+            None,
+        ));
+        policy.runner = "sibling".to_string();
+        let sibling_branch = branch_id(&db, "weaver/sibling").await;
+        let sibling = new_session("sibling", &sibling_branch, None);
+        insert_with_policy(&db, &sibling, &policy).await.unwrap();
+
+        let configured_branch = branch_id(&db, "weaver/configured").await;
+        let configured = new_session("configured", &configured_branch, None);
+        insert_with_policy(
+            &db,
+            &configured,
+            &SessionLaunchPolicy::compatible(&configured),
+        )
+        .await
+        .unwrap();
+
+        let sibling = get(&db, "sibling").await.unwrap().unwrap();
+        assert_eq!(sibling.runner, "sibling");
+        assert!(sibling.runner_is_sibling());
+        let configured = get(&db, "configured").await.unwrap().unwrap();
+        assert_eq!(
+            configured.runner, "",
+            "the compatible default follows the configured runner"
+        );
+        assert!(!configured.runner_is_sibling());
+    }
+
+    async fn insert_child_of(
+        db: &Db,
+        id: &str,
+        branch_id: &str,
+        parent_session_id: &str,
+        status: &str,
+    ) {
+        let mut child = new_session(id, branch_id, None);
+        child.origin = "agent".to_string();
+        let mut policy = SessionLaunchPolicy::compatible(&child);
+        policy.parent_session_id = Some(parent_session_id.to_string());
+        let inserted = insert_with_policy(db, &child, &policy).await.unwrap();
+        if inserted.status != status {
+            set_status(db, id, status).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_children_returns_one_launchers_children_archived_links_included() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        let launcher_branch = branch_id(&db, "weaver/launcher").await;
+        insert(&db, &new_session("launcher", &launcher_branch, None))
+            .await
+            .unwrap();
+
+        insert_child_of(
+            &db,
+            "first",
+            &branch_id(&db, "weaver/first").await,
+            "launcher",
+            "done",
+        )
+        .await;
+        insert_child_of(
+            &db,
+            "second",
+            &branch_id(&db, "weaver/second").await,
+            "launcher",
+            "running",
+        )
+        .await;
+        // A grandchild belongs to its own launcher, not the top-level one.
+        insert_child_of(
+            &db,
+            "grandchild",
+            &branch_id(&db, "weaver/grand").await,
+            "first",
+            "done",
+        )
+        .await;
+        // An already-archived child stays listed: a subtree walk traverses the
+        // link to reach descendants it never cascaded to.
+        insert_child_of(
+            &db,
+            "gone",
+            &branch_id(&db, "weaver/gone").await,
+            "launcher",
+            "archived",
+        )
+        .await;
+
+        let children = list_children(&db, "launcher").await.unwrap();
+        let ids: Vec<&str> = children.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["first", "second", "gone"],
+            "one launcher's children oldest first — no grandchildren, archived links included"
+        );
+        assert_eq!(children[0].status, "done");
+        assert_eq!(children[1].status, "running");
+        assert_eq!(children[2].status, "archived");
+        assert!(
+            list_children(&db, "stranger").await.unwrap().is_empty(),
+            "a launcher with no children lists nothing"
+        );
     }
 }

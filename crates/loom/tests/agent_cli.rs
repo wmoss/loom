@@ -95,6 +95,7 @@ fn launch_policy() -> session_mod::SessionLaunchPolicy {
         creator_subject: "test".to_string(),
         parent_session_id: None,
         automation_run_id: None,
+        runner: String::new(),
     }
 }
 

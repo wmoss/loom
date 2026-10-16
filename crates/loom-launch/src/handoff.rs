@@ -703,6 +703,9 @@ async fn handoff_session_inner(
             allowed_tools: &handoff_policy.allowed_tools,
             mcp_access: &handoff_policy.mcp_access,
             custom: plan.custom_agent.as_ref(),
+            // A replacement provider follows the configured placement: the
+            // launcher that hosted this session as a sibling may be gone.
+            owner: None,
         },
         agent::AcpOpen::Fresh,
     )

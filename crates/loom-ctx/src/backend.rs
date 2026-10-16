@@ -167,6 +167,55 @@ pub async fn new_session_on_host(
     new_session_with_placement(name, cwd, script, env, env_clear, 0, SessionPlacement::Host).await
 }
 
+/// Create a detached PTY session as a sibling of `owner`'s supervisor — inside
+/// the owning session's container under the docker runner — for a child agent
+/// launched with `runner: "sibling"`.
+///
+/// The child's environment and credential are its own, delivered out of band
+/// exactly as [`new_session`] delivers them: with `env_clear` set they are the
+/// complete environment, and otherwise they overlay the owning supervisor's
+/// process environment, which under the docker runner is the same container
+/// base environment a freshly placed session receives (the supervisor holds no
+/// session credentials — those live in each agent process). The child's
+/// non-zero `memory_max_gb` is applied through the same cgroup prelude a
+/// configured placement uses. When the owner cannot host a sibling — a
+/// supervisor that predates the agent-sibling protocol, or one that is gone —
+/// the spawn falls back to the configured placement (logged), so the launch
+/// degrades to a normal container instead of failing.
+pub async fn new_session_on_owner(
+    name: &str,
+    cwd: &std::path::Path,
+    script: &str,
+    env: &[(&str, &str)],
+    env_clear: bool,
+    memory_max_gb: u64,
+    owner: &str,
+) -> Result<()> {
+    let launch = agent_sibling_launch(
+        name,
+        cwd,
+        &session_script(name, script, memory_max_gb),
+        tapestry::Mode::Pty,
+        env,
+        env_clear,
+    );
+    match spawn_agent_sibling(name, launch, owner).await {
+        Ok(()) => {
+            tracing::info!(session = %name, owner, "agent session spawned as a sibling");
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!(
+                session = %name,
+                owner,
+                error = %format!("{error:#}"),
+                "owner could not host the sibling; falling back to the configured placement"
+            );
+            new_session(name, cwd, script, env, env_clear, memory_max_gb).await
+        }
+    }
+}
+
 /// Ask `owner`'s Tapestry supervisor to launch a sibling PTY session.
 ///
 /// The sibling inherits the owner's complete materialized environment rather
@@ -277,6 +326,102 @@ pub async fn new_relay_session(
     match &result {
         Ok(()) => tracing::info!(session = %name, "relay session spawned"),
         Err(e) => tracing::warn!(session = %name, error = %e, "failed to spawn relay session"),
+    }
+    result
+}
+
+/// Create a detached relay session as a sibling of `owner`'s supervisor — the
+/// [`new_relay_session`] analogue of [`new_session_on_owner`], for an ACP
+/// child agent launched with `runner: "sibling"`. Falls back to the configured
+/// placement (logged) when the owner cannot host the sibling.
+pub async fn new_relay_session_on_owner(
+    name: &str,
+    script: &str,
+    env: &[(&str, &str)],
+    env_clear: bool,
+    cwd: &std::path::Path,
+    memory_max_gb: u64,
+    owner: &str,
+) -> Result<()> {
+    let launch = agent_sibling_launch(name, cwd, script, tapestry::Mode::Relay, env, env_clear);
+    match spawn_agent_sibling(name, launch, owner).await {
+        Ok(()) => {
+            tracing::info!(session = %name, owner, "relay session spawned as a sibling");
+            Ok(())
+        }
+        Err(error) => {
+            tracing::warn!(
+                session = %name,
+                owner,
+                error = %format!("{error:#}"),
+                "owner could not host the sibling; falling back to the configured placement"
+            );
+            new_relay_session(name, script, env, env_clear, cwd, memory_max_gb).await
+        }
+    }
+}
+
+/// The one sibling-launch request shared by the PTY and relay on-owner spawns.
+fn agent_sibling_launch<'a>(
+    name: &str,
+    cwd: &std::path::Path,
+    script: &str,
+    mode: tapestry::Mode,
+    env: &[(&'a str, &'a str)],
+    env_clear: bool,
+) -> tapestry::AgentSiblingLaunch {
+    tapestry::AgentSiblingLaunch {
+        name: name.to_string(),
+        cwd: cwd.to_path_buf(),
+        script: script.to_string(),
+        cols: 80,
+        rows: 24,
+        mode,
+        env: env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+        env_clear,
+    }
+}
+
+async fn spawn_agent_sibling(
+    name: &str,
+    mut launch: tapestry::AgentSiblingLaunch,
+    owner: &str,
+) -> Result<()> {
+    // A sibling's credentials must match a freshly placed session. A placed
+    // session's ambient environment is the loom server's own process
+    // environment — the one carrying the operator-managed secrets
+    // (CURSOR_API_KEY, provider keys) that a session container never sees.
+    // The owning supervisor's ambient is only the launcher's container base,
+    // so materialize this process's ambient here — where the server's
+    // environment still exists — and pin the overlay: the caller-supplied env
+    // wins on conflicts, and the owner adds nothing further.
+    if !launch.env_clear {
+        let mut materialized: Vec<(String, String)> = std::env::vars().collect();
+        materialized.extend(launch.env.iter().cloned());
+        launch.env = materialized;
+        launch.env_clear = true;
+    }
+    // A sibling joins its launcher's container, so the API URL the configured
+    // runner publishes to placed sessions applies here exactly as
+    // `ContainerRunner::start` publishes it on a normal placement: the
+    // server's own bind address is not routable from inside a session
+    // container.
+    if let Some(url) = runner::session_api_url().await {
+        launch.env.push(("WEAVER_API".to_string(), url));
+    }
+    let result = async {
+        let mut client = tapestry::Client::connect(owner).await?;
+        client.derive_agent(&launch).await
+    }
+    .await;
+    match &result {
+        Ok(()) => tracing::debug!(session = %name, owner, "agent sibling supervisor ready"),
+        Err(e) => {
+            tracing::warn!(session = %name, owner, error = %e, "agent sibling derive failed")
+        }
     }
     result
 }

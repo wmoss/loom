@@ -39,6 +39,12 @@ pub mod op {
     /// Launch a sibling PTY supervisor with this supervisor's exact environment.
     /// Payload: JSON [`crate::DerivedLaunch`].
     pub const DERIVE: u8 = 0x15;
+    /// Launch a sibling supervisor for a full agent session, with the
+    /// environment the caller supplies. Payload: JSON
+    /// [`crate::AgentSiblingLaunch`]. A supervisor that predates agent
+    /// siblings answers `ERR` here, so a version-skewed launch can fall back
+    /// to its configured placement instead of mis-spawning.
+    pub const DERIVE_AGENT: u8 = 0x16;
     /// Switch this connection to the live terminal stream. Payload: `u16` cols,
     /// `u16` rows (the attaching client's initial size).
     pub const ATTACH: u8 = 0x20;
@@ -252,6 +258,9 @@ pub mod req {
     }
     pub fn derive(payload: Vec<u8>) -> Frame {
         Frame::new(op::DERIVE, payload)
+    }
+    pub fn derive_agent(payload: Vec<u8>) -> Frame {
+        Frame::new(op::DERIVE_AGENT, payload)
     }
     pub fn attach(cols: u16, rows: u16) -> Frame {
         Frame::size(op::ATTACH, cols, rows)

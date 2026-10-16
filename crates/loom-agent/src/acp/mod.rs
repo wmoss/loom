@@ -134,6 +134,11 @@ pub struct AcpLaunch {
     /// Maximum time to wait for one ACP setup response. Kept on the launch so
     /// integration tests can exercise a silent adapter without a 30-second wait.
     pub setup_timeout: Duration,
+    /// The launching session's supervisor name, when this relay is placed as
+    /// its sibling (inside the launcher's container under the docker runner)
+    /// instead of using the configured runner. `None` uses the configured
+    /// placement.
+    pub owner: Option<String>,
 }
 
 const ONE_SHOT_INPUT_MAX_BYTES: usize = 128 * 1024;
@@ -239,16 +244,32 @@ pub async fn validate_launch(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    crate::backend::new_relay_session(
-        &relay_name,
-        &launch.adapter_cmd,
-        &env,
-        launch.env_clear,
-        &launch.cwd,
-        crate::backend::memory_max_gb(db).await,
-    )
-    .await
-    .map_err(|error| LaunchValidationError::Relay {
+    let spawned = match launch.owner.as_deref() {
+        Some(owner) => {
+            crate::backend::new_relay_session_on_owner(
+                &relay_name,
+                &launch.adapter_cmd,
+                &env,
+                launch.env_clear,
+                &launch.cwd,
+                crate::backend::memory_max_gb(db).await,
+                owner,
+            )
+            .await
+        }
+        None => {
+            crate::backend::new_relay_session(
+                &relay_name,
+                &launch.adapter_cmd,
+                &env,
+                launch.env_clear,
+                &launch.cwd,
+                crate::backend::memory_max_gb(db).await,
+            )
+            .await
+        }
+    };
+    spawned.map_err(|error| LaunchValidationError::Relay {
         error: error.context("starting ACP validation relay"),
         validation: None,
     })?;
@@ -299,15 +320,32 @@ pub async fn prompt_once(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
-    crate::backend::new_relay_session(
-        &relay_name,
-        &launch.adapter_cmd,
-        &env,
-        launch.env_clear,
-        &launch.cwd,
-        crate::backend::memory_max_gb(db).await,
-    )
-    .await?;
+    let spawn = match launch.owner.as_deref() {
+        Some(owner) => {
+            crate::backend::new_relay_session_on_owner(
+                &relay_name,
+                &launch.adapter_cmd,
+                &env,
+                launch.env_clear,
+                &launch.cwd,
+                crate::backend::memory_max_gb(db).await,
+                owner,
+            )
+            .await
+        }
+        None => {
+            crate::backend::new_relay_session(
+                &relay_name,
+                &launch.adapter_cmd,
+                &env,
+                launch.env_clear,
+                &launch.cwd,
+                crate::backend::memory_max_gb(db).await,
+            )
+            .await
+        }
+    };
+    spawn?;
 
     let operation = async {
         let stream = crate::backend::subscribe_relay(&relay_name, 0).await?;
@@ -1297,15 +1335,32 @@ async fn start_inner(
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    crate::backend::new_relay_session(
-        &relay_name,
-        &launch.adapter_cmd,
-        &env,
-        launch.env_clear,
-        &launch.cwd,
-        crate::backend::memory_max_gb(&state.db).await,
-    )
-    .await?;
+    let spawn = match launch.owner.as_deref() {
+        Some(owner) => {
+            crate::backend::new_relay_session_on_owner(
+                &relay_name,
+                &launch.adapter_cmd,
+                &env,
+                launch.env_clear,
+                &launch.cwd,
+                crate::backend::memory_max_gb(&state.db).await,
+                owner,
+            )
+            .await
+        }
+        None => {
+            crate::backend::new_relay_session(
+                &relay_name,
+                &launch.adapter_cmd,
+                &env,
+                launch.env_clear,
+                &launch.cwd,
+                crate::backend::memory_max_gb(&state.db).await,
+            )
+            .await
+        }
+    };
+    spawn?;
     let (events_tx, _) = broadcast::channel(256);
     // From this point onward the detached relay exists. Any failure must tear it
     // down and clear partially-persisted provider state before returning, or the

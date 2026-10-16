@@ -43,6 +43,14 @@ pub trait Runner: Send + Sync {
     /// Verify that the placement backend is ready to accept launches.
     async fn validate(&self) -> Result<()>;
 
+    /// The URL a session placed by this runner should use to reach the Loom
+    /// API: the docker runner's container-reachable alias. `None` when the
+    /// configured placement is the loom host itself, where the server's own
+    /// bind address already works. See [`session_api_url`].
+    fn session_api_url(&self) -> Option<String> {
+        None
+    }
+
     /// Start or adopt the supervisor described by `opts`.
     async fn start(&self, opts: &tapestry::LaunchOptions<'_>, memory_max_gb: u64) -> Result<()>;
 
@@ -236,6 +244,10 @@ impl ContainerRunner {
 
 #[async_trait]
 impl Runner for ContainerRunner {
+    fn session_api_url(&self) -> Option<String> {
+        Some(self.config.api_url.clone())
+    }
+
     async fn validate(&self) -> Result<()> {
         for volume in [&self.config.home_volume, &self.config.uv_volume] {
             self.docker
@@ -445,8 +457,11 @@ pub async fn spawn(opts: &tapestry::LaunchOptions<'_>, memory_max_gb: u64) -> Re
 ///
 /// The operator scratch shell uses this escape hatch so a Docker-backed Loom
 /// exposes the control-plane container itself rather than creating another
-/// isolated session container. Agent placement keeps using [`spawn`];
-/// per-session shells are derived by the owning Tapestry supervisor.
+/// isolated session container. Agent sessions never take this path — a child
+/// launched with `runner: "local"` joins its launcher's supervisor as a
+/// sibling instead (see `backend::new_session_on_owner`). Per-session shells
+/// are derived by the owning Tapestry supervisor, so they follow either
+/// placement for free.
 pub async fn spawn_on_host(opts: &tapestry::LaunchOptions<'_>) -> Result<()> {
     ProcessRunner.start(opts, 0).await
 }
@@ -454,6 +469,15 @@ pub async fn spawn_on_host(opts: &tapestry::LaunchOptions<'_>) -> Result<()> {
 /// Remove placement resources after a supervisor's socket is gone.
 pub async fn remove(name: &str) -> Result<()> {
     configured_runner().await?.remove(name).await
+}
+
+/// The API URL reachable from inside a runner-placed session: the docker
+/// runner's container-network alias, or `None` when the configured placement
+/// is the loom host itself. A sibling derived from a session's supervisor
+/// joins that session's container, so its `WEAVER_API` must be this URL —
+/// the server's own bind address is not routable from inside the container.
+pub async fn session_api_url() -> Option<String> {
+    configured_runner().await.ok()?.session_api_url()
 }
 
 async fn wait_for_supervisor(name: &str) -> Result<()> {
@@ -527,6 +551,18 @@ mod tests {
             docker: Docker::connect_with_socket_defaults().unwrap(),
             config: container_config_fixture(),
         }
+    }
+
+    /// The docker runner publishes a container-reachable API URL for placed
+    /// sessions; the host placement needs none — the server's own bind
+    /// address works there. Sibling spawns rely on this distinction.
+    #[test]
+    fn the_docker_runner_publishes_a_session_api_url_and_local_does_not() {
+        assert_eq!(
+            container_runner().session_api_url().as_deref(),
+            Some("http://loom:7878")
+        );
+        assert_eq!(ProcessRunner.session_api_url(), None);
     }
 
     fn launch_options<'a>(
