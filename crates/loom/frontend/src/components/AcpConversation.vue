@@ -59,6 +59,7 @@ import { localTime } from '../lib/time';
 import MarkdownView from './MarkdownView.vue';
 import AgentUsage from './AgentUsage.vue';
 import ToolContentPreview from './ToolContentPreview.vue';
+import ScrollToEndButton from './ScrollToEndButton.vue';
 
 // The Conversation surface for an *ACP* session (`protocol='acp'`): typeset
 // dialogue, not chat bubbles. Serif prose for the humans and the agent; the
@@ -1488,7 +1489,10 @@ const progressLabel = computed(() => {
 // ── Follow-the-foot scroll (lib/followFoot.ts): pinned-at-the-newest-exchange. ──
 const convScroll = ref<HTMLElement | null>(null);
 const convBody = ref<HTMLElement | null>(null);
-const { pinned, scrollToBottom, autoFollow, trackPin } = useFollowFoot(convScroll, convBody);
+const { pinned, scrollToBottom, scrollToEnd, autoFollow, trackPin } = useFollowFoot(
+  convScroll,
+  convBody,
+);
 function onScroll() {
   trackPin();
   updateActive();
@@ -1930,6 +1934,7 @@ function goTo(anchor: string) {
               >
             </div>
           </div>
+          <ScrollToEndButton :visible="!pinned" @click="scrollToEnd" />
         </div>
 
         <!-- Right rail: user-turn jump list + the current plan. -->
