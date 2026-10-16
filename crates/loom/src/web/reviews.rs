@@ -2,8 +2,9 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use weaver_api::{
-    ArtifactTextAnchorDto, ChangeAnchorDto, ReviewAnchorDto, ReviewAnchorKindDto, ReviewCommentDto,
-    ReviewDto, ReviewSubjectDto, ReviewSubjectKindDto,
+    ArtifactTextAnchorDto, ChangeAnchorDto, ReviewAnchorDto, ReviewAnchorKindDto,
+    ReviewAuthorKindDto, ReviewCommentDto, ReviewCommentReplyDto, ReviewDto, ReviewSubjectDto,
+    ReviewSubjectKindDto,
 };
 use weaver_core::artifact::{self, Artifact};
 use weaver_core::branch::Branch;
@@ -74,6 +75,21 @@ fn comment_dto(comment: &review::ReviewComment) -> ReviewCommentDto {
         anchor,
         body: comment.body.clone(),
         status: comment.status.clone(),
+        replies: comment
+            .replies
+            .iter()
+            .map(|reply| ReviewCommentReplyDto {
+                id: reply.id,
+                author_kind: if reply.author_kind == "operator" {
+                    ReviewAuthorKindDto::Operator
+                } else {
+                    ReviewAuthorKindDto::Session
+                },
+                author: reply.author.clone(),
+                body: reply.body.clone(),
+                created_at: reply.created_at.clone(),
+            })
+            .collect(),
         created_at: comment.created_at.clone(),
         updated_at: comment.updated_at.clone(),
     }
@@ -110,6 +126,7 @@ fn review_dto(review: &review::Review, current_version: &str) -> ReviewDto {
         delivery_state: review.delivery_state.clone(),
         delivery_error: review.delivery_error.clone(),
         delivery_key: review.delivery_key.clone(),
+        pending_replies: review.pending_replies,
         created_at: review.created_at.clone(),
         updated_at: review.updated_at.clone(),
         submitted_at: review.submitted_at.clone(),
@@ -142,6 +159,21 @@ async fn current_review_version(st: &AppState, item: &review::Review) -> ApiResu
             if item.subject_id != branch.id {
                 return Err(AppError::bad_request("invalid changes review subject"));
             }
+            // The snapshot a version names is the review's truth: one
+            // spelling for a pinned commit (immutable, so the review is its
+            // own current version — never outdated, whatever later happens
+            // to the branch), one for the unstaged working state and one for
+            // the branch change-set (both live, recomputed on read).
+            if crate::changes::commit_for_version(&item.subject_version).is_some() {
+                return Ok(Some(item.subject_version.clone()));
+            }
+            if crate::changes::is_unstaged_version(&item.subject_version) {
+                return Ok(
+                    crate::changes::load_unstaged(std::path::Path::new(&session.work_dir))
+                        .await?
+                        .version,
+                );
+            }
             Ok(
                 crate::changes::load(std::path::Path::new(&session.work_dir), &branch.base_branch)
                     .await?
@@ -172,6 +204,8 @@ fn legacy_review_dto(
             }),
             body: comment.body.clone(),
             status: thread.status.clone(),
+            // Legacy threads predate replies and carry none.
+            replies: Vec::new(),
             created_at: comment.created_at.clone(),
             updated_at: comment.created_at.clone(),
         })
@@ -201,6 +235,7 @@ fn legacy_review_dto(
         delivery_state: "delivered".to_string(),
         delivery_error: None,
         delivery_key: format!("legacy-thread:{}", thread.id),
+        pending_replies: 0,
         created_at: thread.created_at.clone(),
         updated_at: thread
             .comments
@@ -306,10 +341,29 @@ async fn list_for(
         viewer,
     )
     .await?;
-    let mut out: Vec<ReviewDto> = reviews
-        .iter()
-        .map(|item| review_dto(item, &current_version))
-        .collect();
+    let mut out: Vec<ReviewDto> = Vec::with_capacity(reviews.len());
+    for item in &reviews {
+        // A commit-pinned review is its own current version — the snapshot it
+        // names cannot move — while the branch change-set stays one shared
+        // load. The unstaged working state is live like the branch, but has
+        // a snapshot of its own, so each such review recomputes against it.
+        let current = match (
+            q.subject_kind,
+            crate::changes::commit_for_version(&item.subject_version),
+        ) {
+            (ReviewSubjectKindDto::Changes, Some(_)) => item.subject_version.clone(),
+            _ if q.subject_kind == ReviewSubjectKindDto::Changes
+                && crate::changes::is_unstaged_version(&item.subject_version) =>
+            {
+                crate::changes::load_unstaged(std::path::Path::new(&session.work_dir))
+                    .await?
+                    .version
+                    .unwrap_or_else(|| item.subject_version.clone())
+            }
+            _ => current_version.clone(),
+        };
+        out.push(review_dto(item, &current));
+    }
     if q.subject_kind == ReviewSubjectKindDto::Artifact {
         let artifact_id = subject_id
             .parse()
@@ -352,9 +406,13 @@ async fn create_for(
                         "changes review subject_key must be 'changes'",
                     ));
                 }
-                let changes = crate::changes::load(
+                // The snapshot the caller is looking at may be the branch's
+                // whole change-set, one commit's diff, or the unstaged
+                // working state; the version string says which.
+                let changes = crate::changes::load_for_review(
                     std::path::Path::new(&session.work_dir),
                     &branch.base_branch,
+                    crate::changes::rev_for_version(&body.subject_version).as_deref(),
                 )
                 .await?;
                 let version = changes.version.ok_or_else(|| {
@@ -442,9 +500,15 @@ async fn require_anchor(
         }
         ("changes", ReviewAnchorKindDto::Change, ReviewAnchorDto::Change(anchor)) => {
             let (session, branch) = require_session(&st.db, &item.session_id).await?;
-            let changes =
-                crate::changes::load(std::path::Path::new(&session.work_dir), &branch.base_branch)
-                    .await?;
+            // Validate against the exact snapshot the comment's version
+            // names: the branch's change-set, one commit's diff, or the
+            // unstaged working state.
+            let changes = crate::changes::load_for_review(
+                std::path::Path::new(&session.work_dir),
+                &branch.base_branch,
+                crate::changes::rev_for_version(subject_version).as_deref(),
+            )
+            .await?;
             let anchor = crate::changes::validate_anchor(&changes, subject_version, anchor)
                 .map_err(|error| AppError::conflict(error.to_string()))?;
             Ok((
@@ -540,6 +604,9 @@ pub(super) fn bound_operations() -> Vec<Bound> {
         register::<weaver_api::operations::reviews::comments::resolve::Op, _, _>(
             comments_resolve_operation,
         ),
+        register::<weaver_api::operations::reviews::comments::reply::Op, _, _>(
+            comments_reply_operation,
+        ),
         register::<weaver_api::operations::reviews::submit::Op, _, _>(submit_operation),
         register::<weaver_api::operations::reviews::retry_delivery::Op, _, _>(
             retry_delivery_operation,
@@ -576,15 +643,27 @@ async fn update_operation(
             Some(require_artifact_version(&st, &artifact, version, "review").await?)
         }
         Some(version) => {
-            let current = current_review_version(&st, &item)
-                .await?
-                .ok_or_else(|| AppError::conflict("current change-set version is unavailable"))?;
-            if version != &current {
+            // A changes draft retargets onto any snapshot the reviewer can
+            // actually see — the branch's current change-set, any commit's
+            // own diff, or the unstaged working state. The version must be
+            // genuine: reloading its snapshot must reproduce it, which also
+            // rejects stale branch versions.
+            let (session, branch) = require_session(&st.db, &item.session_id).await?;
+            if item.subject_id != branch.id {
+                return Err(AppError::bad_request("invalid changes review subject"));
+            }
+            let changes = crate::changes::load_for_review(
+                std::path::Path::new(&session.work_dir),
+                &branch.base_branch,
+                crate::changes::rev_for_version(version).as_deref(),
+            )
+            .await?;
+            if changes.version.as_deref() != Some(version.as_str()) {
                 return Err(AppError::conflict(
                     "change-set version moved; refresh before retargeting",
                 ));
             }
-            Some(current)
+            Some(version.clone())
         }
         None => None,
     };
@@ -800,6 +879,46 @@ async fn comments_resolve_operation(
             "subject_key": item.subject_key,
         }),
     );
+    Ok(comment_dto(&comment))
+}
+
+async fn comments_reply_operation(
+    context: OperationContext,
+    input: weaver_api::operations::reviews::comments::reply::Input,
+) -> ApiResult<weaver_api::operations::reviews::comments::reply::Output> {
+    let st = context.state;
+    // The credential names the speaker, not the request operand — the scope
+    // check admits ancestor sessions too, and a parent must not append to a
+    // child's review answers in the child's name. The session author is the
+    // token's own session; the core rejects any review that is not its own.
+    let author = match &context.principal.grant {
+        crate::auth::Grant::Session { session_id, .. } => review::ReplyAuthor::Session(session_id),
+        _ => review::ReplyAuthor::Operator(&context.principal.username),
+    };
+    let comment = review::reply_comment(&st.db, input.comment_id, author, &input.body)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let item = review::get(&st.db, comment.review_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("submitted review"))?;
+    if let Some(reply) = comment.replies.last() {
+        events::emit(
+            &st.bus,
+            &item.branch_id,
+            "review_comment_replied",
+            json!({
+                "review_id": item.id,
+                "comment_id": comment.id,
+                "reply_id": reply.id,
+                "session_id": item.session_id,
+                "author_kind": reply.author_kind,
+                "author": reply.author,
+                "subject_kind": item.subject_kind,
+                "subject_key": item.subject_key,
+                "body": reply.body,
+            }),
+        );
+    }
     Ok(comment_dto(&comment))
 }
 

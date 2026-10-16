@@ -18,6 +18,10 @@ use crate::events::Event;
 
 pub const MAX_COMMENTS: i64 = 100;
 pub const MAX_COMMENT_BYTES: usize = 8 * 1024;
+/// Per-comment ceiling on session replies. The review-wide bound that keeps
+/// threads from growing without limit is the shared byte budget over every
+/// reply a review holds, checked in [`reply_comment`].
+pub const MAX_REPLIES_PER_COMMENT: i64 = 100;
 pub const MAX_ANCHOR_BYTES: usize = 8 * 1024;
 pub const MAX_REVIEW_BYTES: i64 = 256 * 1024;
 pub const MAX_SUMMARY_BYTES: usize = 8 * 1024;
@@ -98,6 +102,44 @@ impl fmt::Display for DraftRevisionConflict {
 
 impl std::error::Error for DraftRevisionConflict {}
 
+/// The snapshot a changes-review version names: the oid of the one commit it
+/// pins (`changes-commit-v1:<oid>:<digest>`), or `None` for the other
+/// spellings. A review and all its comments must name the same
+/// one — comments on one commit's diff never ride a branch-scope envelope.
+/// The one parser for this version spelling; `loom_ctx::changes` delegates
+/// its own `commit_for_version` here so the two can never drift.
+pub fn pinned_commit(version: &str) -> Option<&str> {
+    version
+        .strip_prefix("changes-commit-v1:")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(oid, _)| oid)
+        .filter(|oid| !oid.is_empty())
+}
+
+/// True for the unstaged-diff spelling of a changes-review version
+/// (`changes-unstaged-v1:<digest>`): the working tree against the index, a
+/// live snapshot like the branch change-set rather than an immutable commit.
+/// The one parser for this spelling; `loom_ctx::changes` delegates its own
+/// `is_unstaged_version` here so the two can never drift.
+pub fn is_unstaged_version(version: &str) -> bool {
+    version.starts_with("changes-unstaged-v1:")
+}
+
+/// The snapshot scope a changes-review version names, as one comparable key:
+/// a pinned commit, the unstaged working state, or the branch change-set. A
+/// review's envelope and every comment on it must carry the same scope —
+/// the key, not the full version, is what moves within a scope when a live
+/// snapshot changes underneath.
+pub fn changes_scope(version: &str) -> String {
+    if let Some(oid) = pinned_commit(version) {
+        return format!("commit:{oid}");
+    }
+    if is_unstaged_version(version) {
+        return "unstaged".to_string();
+    }
+    "branch".to_string()
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct Review {
     pub id: i64,
@@ -120,6 +162,16 @@ pub struct Review {
     pub created_at: String,
     pub updated_at: String,
     pub submitted_at: Option<String>,
+    /// Follow-up rounds queued so far: 0 means only the initial submission.
+    pub reply_round: i64,
+    /// The watermark of queued operator replies: the greatest reply id
+    /// already included in a round, so the pending ones are exactly those
+    /// past it.
+    pub reply_upto: i64,
+    /// Operator replies still waiting for the next round — computed on read,
+    /// never stored.
+    #[sqlx(default)]
+    pub pending_replies: u32,
     #[sqlx(skip)]
     pub comments: Vec<ReviewComment>,
 }
@@ -135,6 +187,52 @@ pub struct ReviewComment {
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+    #[sqlx(skip)]
+    pub replies: Vec<ReviewCommentReply>,
+}
+
+/// The reviewed session's own response to one review comment. Replies append
+/// after submit and never mutate the comment they answer; resolving stays an
+/// operator action. A comment's replies form one flat, oldest-first
+/// conversation — both the session and operators append, with no
+/// reply-to-reply targeting.
+#[derive(Debug, Clone, FromRow)]
+pub struct ReviewCommentReply {
+    pub id: i64,
+    pub comment_id: i64,
+    /// Who appended: the reviewed session (whose identity is the review's
+    /// own) or an operator, by username.
+    pub author_kind: String,
+    /// The operator's username; empty for the session.
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// Who is appending to a comment's thread.
+#[derive(Debug, Clone, Copy)]
+pub enum ReplyAuthor<'a> {
+    /// The reviewed session — it may answer its own review's comments.
+    Session(&'a str),
+    /// An operator, by username — any operator may join any submitted
+    /// review's threads, the same reach `set_comment_resolved` grants.
+    Operator(&'a str),
+}
+
+impl ReplyAuthor<'_> {
+    fn kind(&self) -> &'static str {
+        match self {
+            ReplyAuthor::Session(_) => "session",
+            ReplyAuthor::Operator(_) => "operator",
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            ReplyAuthor::Session(_) => "",
+            ReplyAuthor::Operator(name) => name,
+        }
+    }
 }
 
 impl ReviewComment {
@@ -203,15 +301,23 @@ pub struct OutboxItem {
 #[derive(Debug, Clone, FromRow)]
 pub struct DeliveryLease {
     pub token: String,
+    /// The follow-up round's reply window: floor and cutoff snapshotted at
+    /// submit, so every retry re-derives the same reply set. (0, 0) is the
+    /// initial submission, which carries comments, not replies.
+    pub reply_from: i64,
+    pub reply_upto: i64,
 }
 
 const SELECT_REVIEW: &str = "SELECT id, repo_root, branch_id, session_id, subject_kind, \
     subject_id, subject_key, subject_label, subject_version, status, summary, draft_revision, created_by, \
     acknowledged_outdated, delivery_state, delivery_error, delivery_key, created_at, \
-    updated_at, submitted_at FROM reviews";
+    updated_at, submitted_at, reply_round, reply_upto FROM reviews";
 
 const SELECT_COMMENT: &str = "SELECT id, review_id, subject_version, anchor_kind, anchor_json, \
     body, status, created_at, updated_at FROM review_comments";
+
+const SELECT_REPLY: &str = "SELECT id, comment_id, author_kind, author, body, created_at \
+    FROM review_comment_replies";
 
 fn validate_anchor(anchor: &ReviewAnchor) -> Result<()> {
     match anchor {
@@ -282,16 +388,51 @@ async fn comments_for<'e, E>(executor: E, review_id: i64) -> Result<Vec<ReviewCo
 where
     E: sqlx::Executor<'e, Database = Sqlite>,
 {
-    Ok(sqlx::query_as::<_, ReviewComment>(&format!(
+    let comments: Vec<ReviewComment> = sqlx::query_as::<_, ReviewComment>(&format!(
         "{SELECT_COMMENT} WHERE review_id = ? ORDER BY id"
     ))
     .bind(review_id)
     .fetch_all(executor)
-    .await?)
+    .await?;
+    Ok(comments)
+}
+
+/// Loads every reply to the given comments in one query and folds each onto
+/// its comment, oldest first.
+async fn attach_replies<'e, E>(executor: E, comments: &mut [ReviewComment]) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    if comments.is_empty() {
+        return Ok(());
+    }
+    let ids = comments
+        .iter()
+        .map(|comment| comment.id)
+        .collect::<Vec<_>>();
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql =
+        format!("{SELECT_REPLY} WHERE comment_id IN ({placeholders}) ORDER BY comment_id, id");
+    let mut query = sqlx::query_as::<_, ReviewCommentReply>(&sql);
+    for id in &ids {
+        query = query.bind(id);
+    }
+    let replies = query.fetch_all(executor).await?;
+    let mut by_comment = std::collections::BTreeMap::<i64, Vec<ReviewCommentReply>>::new();
+    for reply in replies {
+        by_comment.entry(reply.comment_id).or_default().push(reply);
+    }
+    for comment in comments.iter_mut() {
+        comment.replies = by_comment.remove(&comment.id).unwrap_or_default();
+    }
+    Ok(())
 }
 
 async fn attach_comments(db: &Db, mut review: Review) -> Result<Review> {
-    review.comments = comments_for(db, review.id).await?;
+    let mut comments = comments_for(db, review.id).await?;
+    attach_replies(db, &mut comments).await?;
+    review.comments = comments;
+    review.pending_replies = pending_reply_count(db, review.id, review.reply_upto).await?;
     Ok(review)
 }
 
@@ -299,8 +440,50 @@ async fn attach_comments_tx(
     tx: &mut crate::db::DbTransaction<'_>,
     mut review: Review,
 ) -> Result<Review> {
-    review.comments = comments_for(&mut **tx, review.id).await?;
+    let mut comments = comments_for(&mut **tx, review.id).await?;
+    attach_replies(&mut **tx, &mut comments).await?;
+    review.comments = comments;
+    review.pending_replies = pending_reply_count(&mut **tx, review.id, review.reply_upto).await?;
     Ok(review)
+}
+
+/// Operator replies past the queued watermark: the reviewer's words waiting
+/// for the next round to carry them back to the reviewed session.
+async fn pending_reply_count<'e, E>(executor: E, review_id: i64, upto: i64) -> Result<u32>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM review_comment_replies r
+         JOIN review_comments c ON c.id = r.comment_id
+         WHERE c.review_id = ? AND r.author_kind = 'operator' AND r.id > ?",
+    )
+    .bind(review_id)
+    .bind(upto)
+    .fetch_one(executor)
+    .await?;
+    Ok(count.max(0) as u32)
+}
+
+/// The greatest **operator** reply id on a review's threads: the cutoff a
+/// round snapshots so retries derive the same set. Session replies never
+/// extend it — they are the session's own words, and a round that carried
+/// none of the reviewer's would deliver an empty "the reviewer replied"
+/// message into the conversation it answers.
+async fn max_operator_reply_id<'e, E>(executor: E, review_id: i64) -> Result<i64>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let id: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(r.id) FROM review_comment_replies r
+         JOIN review_comments c ON c.id = r.comment_id
+         WHERE c.review_id = ? AND r.author_kind = 'operator'",
+    )
+    .bind(review_id)
+    .fetch_optional(executor)
+    .await?
+    .flatten();
+    Ok(id.unwrap_or(0))
 }
 
 pub async fn get(db: &Db, id: i64) -> Result<Option<Review>> {
@@ -455,7 +638,18 @@ pub async fn add_comment(
     let body = new.body.trim();
     let anchor_json = new.anchor.json()?;
     let mut tx = crate::db::begin_immediate(db).await?;
-    require_creator_draft(&mut tx, review_id, creator, expected_revision).await?;
+    let draft = require_creator_draft(&mut tx, review_id, creator, expected_revision).await?;
+    // A changes draft's comments all target one snapshot spelling — the
+    // branch change-set, one commit's own diff, or the unstaged working
+    // state. A comment naming another spelling would ride an envelope it
+    // disagrees with through submit and delivery.
+    if draft.subject_kind == "changes"
+        && changes_scope(new.subject_version) != changes_scope(&draft.subject_version)
+    {
+        bail!(
+            "this draft is scoped to another snapshot; submit or discard it before commenting on this one"
+        );
+    }
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_comments WHERE review_id = ?")
         .bind(review_id)
         .fetch_one(&mut *tx)
@@ -518,7 +712,7 @@ pub async fn patch_comment(
         }
     }
     let mut tx = crate::db::begin_immediate(db).await?;
-    require_creator_draft(&mut tx, review_id, creator, expected_revision).await?;
+    let draft = require_creator_draft(&mut tx, review_id, creator, expected_revision).await?;
     let current = sqlx::query_as::<_, ReviewComment>(&format!(
         "{SELECT_COMMENT} WHERE id = ? AND review_id = ?"
     ))
@@ -527,6 +721,16 @@ pub async fn patch_comment(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| anyhow!("review comment not found"))?;
+
+    // Re-anchoring may move a comment to a newer version of its snapshot,
+    // never to the other spelling — the same scope the comment was born in.
+    if let Some(subject_version) = patch.subject_version {
+        if draft.subject_kind == "changes"
+            && changes_scope(subject_version) != changes_scope(&draft.subject_version)
+        {
+            bail!("a comment re-anchors within its own snapshot, not onto another one");
+        }
+    }
 
     let subject_version = patch.subject_version.unwrap_or(&current.subject_version);
     let anchor_json = patch
@@ -736,7 +940,7 @@ pub async fn set_comment_resolved(
         bail!("submitted review not found");
     }
     let now = now_iso();
-    let row = sqlx::query_as::<_, ReviewComment>(
+    let mut row = sqlx::query_as::<_, ReviewComment>(
         "UPDATE review_comments SET status = ?, updated_at = ?
          WHERE id = ? AND review_id = ? AND status IN ('submitted', 'resolved')
          RETURNING id, review_id, subject_version, anchor_kind, anchor_json, body, status,
@@ -749,8 +953,92 @@ pub async fn set_comment_resolved(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| anyhow!("submitted review comment not found"))?;
+    // The comment's replies ride along so a resolve does not read as their
+    // disappearance in the response.
+    attach_replies(&mut *tx, std::slice::from_mut(&mut row)).await?;
     tx.commit().await?;
     Ok(row)
+}
+
+/// Append one entry to a comment's reply thread on a submitted review.
+/// Replies never mutate the comment they answer and never touch the draft
+/// revision — that guard tracks operator edits, and a thread append has
+/// nothing to race. A session author must name the review's own session: it
+/// answers feedback on its work, not another session's.
+pub async fn reply_comment(
+    db: &Db,
+    comment_id: i64,
+    author: ReplyAuthor<'_>,
+    body: &str,
+) -> Result<ReviewComment> {
+    let body = body.trim();
+    if body.is_empty() {
+        bail!("reply body must not be empty");
+    }
+    if body.len() > MAX_COMMENT_BYTES {
+        bail!("reply exceeds the 8 KiB comment limit");
+    }
+    let mut tx = crate::db::begin_immediate(db).await?;
+    let review_id: Option<i64> =
+        sqlx::query_scalar("SELECT review_id FROM review_comments WHERE id = ?")
+            .bind(comment_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .flatten();
+    let Some(review_id) = review_id else {
+        bail!("review comment not found");
+    };
+    let (status, review_session): (String, String) =
+        sqlx::query_as("SELECT status, session_id FROM reviews WHERE id = ?")
+            .bind(review_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if status != "submitted" {
+        bail!("replies attach to submitted reviews only; this one is {status}");
+    }
+    if let ReplyAuthor::Session(session_id) = author {
+        if review_session != session_id {
+            bail!("only the reviewed session may reply to this review");
+        }
+    }
+    let replies: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM review_comment_replies WHERE comment_id = ?")
+            .bind(comment_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if replies >= MAX_REPLIES_PER_COMMENT {
+        bail!("this comment already holds its reply cap");
+    }
+    // The review-wide reply budget: every thread on every comment shares the
+    // same bound the review's own comments obey, so a looping conversation
+    // degrades instead of growing without limit.
+    let reply_total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(length(CAST(body AS BLOB))), 0)
+         FROM review_comment_replies
+         WHERE comment_id IN (SELECT id FROM review_comments WHERE review_id = ?)",
+    )
+    .bind(review_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if reply_total + body.len() as i64 > MAX_REVIEW_BYTES {
+        bail!("this review's reply threads exceed the 256 KiB total limit");
+    }
+    sqlx::query(
+        "INSERT INTO review_comment_replies (comment_id, author_kind, author, body) VALUES (?, ?, ?, ?)",
+    )
+    .bind(comment_id)
+    .bind(author.kind())
+    .bind(author.name())
+    .bind(body)
+    .execute(&mut *tx)
+    .await?;
+    let mut comment = sqlx::query_as::<_, ReviewComment>(&format!("{SELECT_COMMENT} WHERE id = ?"))
+        .bind(comment_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    attach_replies(&mut *tx, std::slice::from_mut(&mut comment)).await?;
+    tx.commit().await?;
+    Ok(comment)
 }
 
 pub async fn discard(
@@ -837,7 +1125,7 @@ async fn submit_inner(
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| anyhow!("review not found"))?;
-    let comments = comments_for(&mut *tx, review_id).await?;
+    let mut comments = comments_for(&mut *tx, review_id).await?;
 
     if review.draft_revision != expected_revision {
         return Err(anyhow!(DraftRevisionConflict {
@@ -845,8 +1133,26 @@ async fn submit_inner(
             actual: review.draft_revision,
         }));
     }
-    // A retried submission is a read: never insert another event or outbox row.
+    // A submitted review comes back as a read — a retried submission never
+    // inserts another event or outbox row — unless the reviewer has answered
+    // the session's replies since: then submitting again queues those words
+    // for delivery as a follow-up round, the same queue the initial comments
+    // rode.
     if review.status == "submitted" {
+        let cutoff = max_operator_reply_id(&mut *tx, review_id).await?;
+        if cutoff > review.reply_upto {
+            let event = queue_reply_round(&mut tx, &mut review, &mut comments, cutoff).await?;
+            tx.commit().await?;
+            let review = get(db, review_id)
+                .await?
+                .ok_or_else(|| anyhow!("submitted review vanished"))?;
+            return Ok(Submission {
+                review,
+                event: Some(event),
+            });
+        }
+        // Replies ride along like every other read path.
+        attach_replies(&mut *tx, &mut comments).await?;
         review.comments = comments;
         tx.commit().await?;
         return Ok(Submission {
@@ -975,6 +1281,161 @@ async fn submit_inner(
     })
 }
 
+/// Queue one follow-up round on a submitted review: the operator replies past
+/// the review's watermark go back to the session through the same outbox and
+/// inbox the initial submission rode, under a fresh round key — and the
+/// watermark moves to the round's cutoff so a resubmit cannot double-send the
+/// same words. The outbox row snapshots the round's reply window; a retry
+/// re-derives exactly this set, whatever lands in the meantime.
+async fn queue_reply_round(
+    tx: &mut crate::db::DbTransaction<'_>,
+    review: &mut Review,
+    comments: &mut [ReviewComment],
+    cutoff: i64,
+) -> Result<Event> {
+    let from = review.reply_upto;
+    let round = review.reply_round + 1;
+    let now = now_iso();
+    // The original key never carried a '#': every round appends its own.
+    let base = review.delivery_key.split('#').next().unwrap_or_default();
+    let key = format!("{base}#{round}");
+    attach_replies(&mut **tx, comments).await?;
+    review.reply_round = round;
+    review.reply_upto = cutoff;
+    review.delivery_key = key.clone();
+    review.comments = comments.to_owned();
+    let message = follow_up_message(review, from, cutoff);
+    let updated = sqlx::query(
+        "UPDATE reviews
+         SET reply_round = ?, reply_upto = ?, delivery_key = ?,
+             delivery_state = 'queued', delivery_error = NULL, updated_at = ?
+         WHERE id = ? AND status = 'submitted' AND draft_revision = ?",
+    )
+    .bind(round)
+    .bind(cutoff)
+    .bind(&key)
+    .bind(&now)
+    .bind(review.id)
+    .bind(review.draft_revision)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        bail!("review is not editable");
+    }
+    sqlx::query(
+        "INSERT INTO review_delivery_outbox
+            (review_id, delivery_key, state, attempts, next_attempt_at, reply_from, reply_upto)
+         VALUES (?, ?, 'queued', 0, ?, ?, ?)
+         ON CONFLICT(review_id) DO UPDATE SET
+            delivery_key = excluded.delivery_key, state = 'queued', attempts = 0,
+            next_attempt_at = excluded.next_attempt_at, last_error = NULL,
+            lease_token = NULL, reply_from = excluded.reply_from,
+            reply_upto = excluded.reply_upto",
+    )
+    .bind(review.id)
+    .bind(&key)
+    .bind(&now)
+    .bind(from)
+    .bind(cutoff)
+    .execute(&mut **tx)
+    .await?;
+    let comment_payload: Vec<Value> = comments
+        .iter()
+        .map(|comment| {
+            json!({
+                "id": comment.id,
+                "revision": comment.subject_version,
+                "anchor_kind": comment.anchor_kind,
+                "anchor": comment.anchor().value(),
+                "body": comment.body,
+            })
+        })
+        .collect();
+    let event_data = json!({
+        "review_id": review.id,
+        "delivery_key": key,
+        "created_by": review.created_by,
+        "session_id": review.session_id,
+        "subject": {
+            "kind": review.subject_kind,
+            "id": review.subject_id,
+            "key": review.subject_key,
+            "label": review.subject_label,
+            "revision": review.subject_version,
+            "current_revision": review.subject_version,
+        },
+        "round": round,
+        "summary": review.summary,
+        "comments": comment_payload,
+        "message": message,
+    });
+    let event_row = sqlx::query(
+        "INSERT INTO events (branch_id, kind, data)
+         VALUES (?, 'review_submitted', ?) RETURNING id, created_at",
+    )
+    .bind(&review.branch_id)
+    .bind(event_data.to_string())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(Event {
+        id: event_row.get("id"),
+        branch_id: review.branch_id.clone(),
+        kind: "review_submitted".to_string(),
+        data: event_data,
+        created_at: event_row.get("created_at"),
+    })
+}
+
+/// The message a follow-up round carries: the reviewer's answers to the
+/// session's replies, one block per thread they touched. The replies arrive
+/// verbatim — the reviewer's words are the payload — while the anchors stay
+/// in the durable review, reachable through `review_list`.
+pub fn follow_up_message(review: &Review, from: i64, cutoff: i64) -> String {
+    let subject = if review.subject_kind == "changes" {
+        format!(
+            "The reviewer replied to your responses on changes version `{}`.",
+            review.subject_version
+        )
+    } else {
+        format!(
+            "The reviewer replied to your responses on artifact `{}`, revision {}.",
+            review.subject_label, review.subject_version
+        )
+    };
+    let mut message = subject;
+    for comment in review.comments.iter() {
+        let fresh: Vec<&ReviewCommentReply> = comment
+            .replies
+            .iter()
+            .filter(|reply| {
+                reply.author_kind == "operator" && reply.id > from && reply.id <= cutoff
+            })
+            .collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        message.push_str(&format!(
+            "\n\n{} (comment id {}):\n",
+            comment_location(comment),
+            comment.id
+        ));
+        for reply in fresh {
+            message.push_str(&format!("The reviewer replied:\n{}\n", reply.body));
+        }
+    }
+    message.push_str(&format!(
+        "\n\n[review_id: {}; delivery_key: {}]",
+        review.id, review.delivery_key
+    ));
+    message.push_str(
+        "\n\nContinue the threads with the `review_comment_reply` tool, passing each \
+         comment id and your response. Each comment's full anchor and surrounding \
+         context is served by the `review_list` tool. Resolving a comment is the \
+         reviewer's action, not yours.",
+    );
+    message
+}
+
 pub async fn ready_outbox(db: &Db, limit: i64) -> Result<Vec<OutboxItem>> {
     Ok(sqlx::query_as::<_, OutboxItem>(
         "SELECT review_id, delivery_key, state, attempts, next_attempt_at, last_error,
@@ -1005,7 +1466,7 @@ pub async fn claim_delivery(db: &Db, review_id: i64) -> Result<Option<DeliveryLe
              lease_token = lower(hex(randomblob(16)))
          WHERE review_id = ? AND next_attempt_at <= ?
            AND state IN ('queued', 'retrying', 'delivering')
-         RETURNING lease_token AS token",
+         RETURNING lease_token AS token, reply_from, reply_upto",
     )
     .bind(lease_until)
     .bind(review_id)
@@ -1164,6 +1625,15 @@ pub async fn retry_delivery(db: &Db, review_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// The prompt pasted into the reviewed session's conversation.
+///
+/// Deliberately compact: each comment contributes only its one-line location
+/// — with its id, so the reply tool is callable without a lookup — not its
+/// full anchor. The durable review — complete anchors and context excerpts
+/// included — stays reachable through `reviews.list`, which the reviewed
+/// session's own credential may call. The closing line drives the loop:
+/// act on what is actionable, then answer everything. Resolving stays with
+/// the reviewer.
 pub fn structured_message(review: &Review) -> String {
     let subject = if review.subject_kind == "changes" {
         format!(
@@ -1182,14 +1652,12 @@ pub fn structured_message(review: &Review) -> String {
         message.push_str(review.summary.trim());
     }
     for (index, comment) in review.comments.iter().enumerate() {
-        let anchor = comment.anchor();
-        let anchor_json = anchor.json().unwrap_or_else(|_| "{}".to_string());
         message.push_str(&format!(
-            "\n\n{}. Revision {}, {} anchor {}:\n",
+            "\n\n{}. {} (revision {}, comment id {}):\n",
             index + 1,
+            comment_location(comment),
             comment.subject_version,
-            comment.anchor_kind,
-            anchor_json
+            comment.id
         ));
         message.push_str(&comment.body);
     }
@@ -1197,7 +1665,36 @@ pub fn structured_message(review: &Review) -> String {
         "\n\n[review_id: {}; delivery_key: {}]",
         review.id, review.delivery_key
     ));
+    if !review.comments.is_empty() {
+        message.push_str(
+            "\n\nTake action on any comment that calls for a change, then \
+             respond to every comment with the `review_comment_reply` tool, \
+             passing its comment id and what you did or why you left it. Each \
+             comment's full anchor and surrounding context is served by the \
+             `review_list` tool. Resolving a comment is the reviewer's \
+             action, not yours.",
+        );
+    }
     message
+}
+
+/// A comment's one-line location: just enough for the reviewed agent to find
+/// the spot in its own checkout. The anchor's context excerpts stay in the
+/// durable review and out of the pasted prompt.
+fn comment_location(comment: &ReviewComment) -> String {
+    match comment.anchor() {
+        ReviewAnchor::Text(anchor) => {
+            let block = anchor
+                .block_index
+                .map(|index| format!(", block {index}"))
+                .unwrap_or_default();
+            format!("\"{}\"{block}", anchor.quote)
+        }
+        ReviewAnchor::Change(anchor) => format!(
+            "{} · {} lines {}-{}",
+            anchor.path_display, anchor.side, anchor.start_line, anchor.end_line
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1274,6 +1771,35 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn review_fixture() -> Review {
+        Review {
+            id: 7,
+            repo_root: "/repo".to_string(),
+            branch_id: "branch".to_string(),
+            session_id: "session-1".to_string(),
+            subject_kind: "artifact".to_string(),
+            subject_id: "1".to_string(),
+            subject_key: "design".to_string(),
+            subject_label: "design".to_string(),
+            subject_version: "1".to_string(),
+            status: "submitted".to_string(),
+            summary: String::new(),
+            draft_revision: 1,
+            created_by: "alice".to_string(),
+            acknowledged_outdated: false,
+            delivery_state: "delivered".to_string(),
+            delivery_error: None,
+            delivery_key: "key-7".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            submitted_at: None,
+            reply_round: 0,
+            reply_upto: 0,
+            pending_replies: 0,
+            comments: Vec::new(),
+        }
     }
 
     fn comment<'a>(body: &'a str, anchor: &'a ReviewAnchor) -> NewComment<'a> {
@@ -1405,6 +1931,263 @@ mod tests {
             .await
             .unwrap_err();
         assert!(stale.downcast_ref::<DraftRevisionConflict>().is_some());
+    }
+
+    #[tokio::test]
+    async fn replies_append_after_submit_and_reject_everyone_else() {
+        let (db, artifact) = seeded().await;
+        let draft = draft(&db, &artifact, "alice").await;
+        let draft = add(&db, &draft, "change this").await;
+        let comment_id = draft.comments[0].id;
+
+        // A draft is undelivered; there is nothing to answer yet.
+        assert!(
+            reply_comment(&db, comment_id, ReplyAuthor::Session("session-1"), "on it")
+                .await
+                .is_err()
+        );
+
+        let submitted = submit(&db, draft.id, "alice", draft.draft_revision, false)
+            .await
+            .unwrap();
+
+        // Only the reviewed session may answer as the session.
+        assert!(reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Session("someone-else"),
+            "not mine"
+        )
+        .await
+        .is_err());
+        let comment = reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Session("session-1"),
+            "done in 4f2c",
+        )
+        .await
+        .unwrap();
+        assert_eq!(comment.replies.len(), 1);
+        assert_eq!(comment.replies[0].author_kind, "session");
+        assert_eq!(comment.replies[0].author, "");
+
+        // An operator joins the same thread — any operator, any submitted
+        // review, the reach `set_comment_resolved` grants.
+        let comment = reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Operator("alice"),
+            "thank you — closing after checks",
+        )
+        .await
+        .unwrap();
+        assert_eq!(comment.replies.len(), 2);
+        assert_eq!(comment.replies[1].author_kind, "operator");
+        assert_eq!(comment.replies[1].author, "alice");
+
+        // The conversation reads oldest-first on the durable review.
+        let comment = reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Session("session-1"),
+            "and a follow-up",
+        )
+        .await
+        .unwrap();
+        assert_eq!(comment.replies.len(), 3);
+        assert_eq!(comment.replies[0].body, "done in 4f2c");
+        assert_eq!(comment.replies[2].body, "and a follow-up");
+        let listed = get(&db, submitted.review.id).await.unwrap().unwrap();
+        assert_eq!(listed.comments[0].replies.len(), 3);
+
+        // An empty reply never lands.
+        assert!(
+            reply_comment(&db, comment_id, ReplyAuthor::Session("session-1"), "   ")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reviews_reply_threads_share_one_byte_budget() {
+        let (db, artifact) = seeded().await;
+        let draft = draft(&db, &artifact, "alice").await;
+        let draft = add(&db, &draft, "change this").await;
+        let comment_id = draft.comments[0].id;
+        let _ = submit(&db, draft.id, "alice", draft.draft_revision, false)
+            .await
+            .unwrap();
+
+        // Fill the review-wide reply budget: 8 KiB bodies until the 256 KiB
+        // bound is crossed. Every append lands inside the same transaction
+        // that checks the bound, so the last one over is the one that fails.
+        let body = "x".repeat(MAX_COMMENT_BYTES);
+        let mut appended = 0;
+        loop {
+            let result =
+                reply_comment(&db, comment_id, ReplyAuthor::Operator("alice"), &body).await;
+            appended += 1;
+            if result.is_err() {
+                break;
+            }
+        }
+        assert!(appended > 1, "the budget spans more than one reply");
+        assert!(appended <= MAX_REVIEW_BYTES / MAX_COMMENT_BYTES as i64 + 2);
+        // A small reply still fits nowhere once the budget is spent.
+        assert!(
+            reply_comment(&db, comment_id, ReplyAuthor::Operator("alice"), "tiny")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changes_draft_rejects_comments_from_another_snapshot_spelling() {
+        let (db, artifact) = seeded().await;
+        // A commit-pinned changes draft.
+        let pinned_version = "changes-commit-v1:0123abcd:fededigest";
+        let review = get_or_create(
+            &db,
+            &NewReview {
+                repo_root: &artifact.repo_root,
+                branch_id: artifact.branch_id.as_deref().unwrap(),
+                session_id: "session-1",
+                subject_kind: "changes",
+                subject_id: "branch",
+                subject_key: "changes",
+                subject_label: "changes",
+                subject_version: pinned_version,
+                created_by: "alice",
+            },
+        )
+        .await
+        .unwrap();
+
+        // A comment naming the branch spelling cannot ride the pinned
+        // envelope, and neither can one pinning a different commit or the
+        // unstaged working state.
+        for version in [
+            "changes-v1:digest",
+            "changes-commit-v1:other:digest",
+            "changes-unstaged-v1:digest",
+        ] {
+            let err = add_comment(
+                &db,
+                review.id,
+                "alice",
+                review.draft_revision,
+                &NewComment {
+                    subject_version: version,
+                    anchor: &anchor("beta"),
+                    body: "wrong scope",
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("another snapshot"), "{err}");
+        }
+
+        // The pinned spelling itself is accepted.
+        let review = add_comment(
+            &db,
+            review.id,
+            "alice",
+            review.draft_revision,
+            &NewComment {
+                subject_version: pinned_version,
+                anchor: &anchor("beta"),
+                body: "right scope",
+            },
+        )
+        .await
+        .unwrap();
+        // And a re-anchor cannot carry its comment across spellings either.
+        let err = patch_comment(
+            &db,
+            review.id,
+            review.comments[0].id,
+            "alice",
+            review.draft_revision,
+            &CommentPatch {
+                subject_version: Some("changes-v1:digest"),
+                anchor: Some(&anchor("gamma")),
+                body: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("its own snapshot"), "{err}");
+    }
+
+    #[test]
+    fn the_scope_key_separates_all_three_snapshot_spellings() {
+        use super::changes_scope;
+        assert_eq!(
+            changes_scope("changes-commit-v1:0123abcd:fededigest"),
+            "commit:0123abcd"
+        );
+        assert_eq!(changes_scope("changes-unstaged-v1:fededigest"), "unstaged");
+        assert_eq!(changes_scope("changes-v1:fededigest"), "branch");
+        // The unstaged key is per-spelling, not per-version: a live
+        // snapshot's digest may move within its scope freely.
+        assert_eq!(
+            changes_scope("changes-unstaged-v1:otherdigest"),
+            changes_scope("changes-unstaged-v1:fededigest")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unstaged_scoped_draft_rejects_comments_from_the_other_spellings() {
+        let (db, artifact) = seeded().await;
+        let unstaged_version = "changes-unstaged-v1:fededigest";
+        let review = get_or_create(
+            &db,
+            &NewReview {
+                repo_root: &artifact.repo_root,
+                branch_id: artifact.branch_id.as_deref().unwrap(),
+                session_id: "session-1",
+                subject_kind: "changes",
+                subject_id: "branch",
+                subject_key: "changes",
+                subject_label: "changes",
+                subject_version: unstaged_version,
+                created_by: "alice",
+            },
+        )
+        .await
+        .unwrap();
+        for version in ["changes-v1:digest", "changes-commit-v1:0123abcd:digest"] {
+            let err = add_comment(
+                &db,
+                review.id,
+                "alice",
+                review.draft_revision,
+                &NewComment {
+                    subject_version: version,
+                    anchor: &anchor("beta"),
+                    body: "wrong scope",
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("another snapshot"), "{err}");
+        }
+        // Its own spelling — digest moved by a live edit or not — is home.
+        let review = add_comment(
+            &db,
+            review.id,
+            "alice",
+            review.draft_revision,
+            &NewComment {
+                subject_version: "changes-unstaged-v1:otherdigest",
+                anchor: &anchor("beta"),
+                body: "right scope",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(review.comments.len(), 1);
     }
 
     #[tokio::test]
@@ -1819,6 +2602,79 @@ mod tests {
         assert_eq!((events, outbox), (1, 1));
     }
 
+    #[test]
+    fn structured_message_keeps_anchor_context_out_of_the_prompt() {
+        let text = Review {
+            comments: vec![ReviewComment {
+                id: 1,
+                review_id: 7,
+                subject_version: "2".to_string(),
+                anchor_kind: "text".to_string(),
+                anchor_json: serde_json::to_string(&ArtifactTextAnchor {
+                    quote: "beta".to_string(),
+                    prefix: "Alpha ".to_string(),
+                    suffix: " gamma".to_string(),
+                    block_index: Some(1),
+                })
+                .unwrap(),
+                body: "Explain this.".to_string(),
+                status: "submitted".to_string(),
+                replies: Vec::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            }],
+            subject_kind: "artifact".to_string(),
+            subject_label: "design".to_string(),
+            subject_version: "2".to_string(),
+            ..review_fixture()
+        };
+        let message = structured_message(&text);
+        assert!(message.contains("1. \"beta\", block 1 (revision 2, comment id 1):\nExplain this."));
+        assert!(!message.contains("Alpha "));
+        assert!(!message.contains(" gamma"));
+        assert!(message.contains(
+            "Take action on any comment that calls for a change, then respond to every comment \
+             with the `review_comment_reply` tool"
+        ));
+        assert!(message
+            .contains("full anchor and surrounding context is served by the `review_list` tool"));
+
+        let change = Review {
+            comments: vec![ReviewComment {
+                id: 2,
+                review_id: 7,
+                subject_version: "3".to_string(),
+                anchor_kind: "change".to_string(),
+                anchor_json: serde_json::to_string(&ChangeLineAnchor {
+                    path_bytes: "crates/foo.rs".to_string(),
+                    path_display: "crates/foo.rs".to_string(),
+                    side: "new".to_string(),
+                    start_line: 10,
+                    end_line: 14,
+                    hunk_header: "@@ -9,7 +9,7 @@".to_string(),
+                    context_before: vec!["fn old() {".to_string()],
+                    selected: vec!["    let x = 1;".to_string()],
+                    context_after: vec!["}".to_string()],
+                })
+                .unwrap(),
+                body: "Tighten this.".to_string(),
+                status: "submitted".to_string(),
+                replies: Vec::new(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            }],
+            subject_kind: "changes".to_string(),
+            subject_version: "3".to_string(),
+            ..review_fixture()
+        };
+        let message = structured_message(&change);
+        assert!(message.contains("1. crates/foo.rs · new lines 10-14 (revision 3, comment id 2):"));
+        assert!(!message.contains("fn old()"));
+        assert!(!message.contains("let x = 1;"));
+        assert!(message.contains("[review_id: 7; delivery_key: key-7]"));
+        assert!(message.contains("Resolving a comment is the reviewer's action, not yours."));
+    }
+
     #[tokio::test]
     async fn reanchoring_every_comment_advances_the_truthful_envelope_revision() {
         let (db, artifact) = seeded().await;
@@ -1841,5 +2697,152 @@ mod tests {
         assert_eq!(moved.subject_version, "2");
         assert_eq!(moved.comments[0].subject_version, "2");
         assert!(structured_message(&moved).contains("revision 2"));
+    }
+
+    #[tokio::test]
+    async fn operator_replies_queue_into_follow_up_rounds() {
+        let (db, artifact) = seeded().await;
+        let first = draft(&db, &artifact, "alice").await;
+        let first = add(&db, &first, "change this").await;
+        let submitted = submit(&db, first.id, "alice", first.draft_revision, false)
+            .await
+            .unwrap();
+        assert_eq!(submitted.review.reply_round, 0);
+        assert_eq!(submitted.review.pending_replies, 0);
+        let base_key = submitted.review.delivery_key.clone();
+        let revision = submitted.review.draft_revision;
+
+        // The session answers; the reviewer replies. Nothing delivers yet —
+        // the reply queues on the review itself, like a draft comment does.
+        let comment_id = submitted.review.comments[0].id;
+        reply_comment(&db, comment_id, ReplyAuthor::Session("session-1"), "done")
+            .await
+            .unwrap();
+        reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Operator("alice"),
+            "thanks — one more thing",
+        )
+        .await
+        .unwrap();
+        let queued = get(&db, submitted.review.id).await.unwrap().unwrap();
+        // Session replies never count: only the reviewer's words go back.
+        assert_eq!(queued.pending_replies, 1);
+
+        // Submitting again queues a follow-up round: a fresh delivery key,
+        // the watermark past the reply, the same outbox.
+        let round = submit(&db, queued.id, "alice", revision, false)
+            .await
+            .unwrap();
+        assert_eq!(round.review.reply_round, 1);
+        assert_eq!(round.review.delivery_key, format!("{base_key}#1"));
+        assert_eq!(round.review.delivery_state, "queued");
+        assert_eq!(round.review.pending_replies, 0);
+        assert!(round.event.is_some(), "a round is a real submission event");
+        let (from, upto): (i64, i64) = sqlx::query_as(
+            "SELECT reply_from, reply_upto FROM review_delivery_outbox WHERE review_id = ?",
+        )
+        .bind(round.review.id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        // The outbox window is exactly the queued operator reply, so a
+        // retry re-derives the same set — and the message quotes the
+        // reviewer's words, never the session's own.
+        assert_eq!(from, 0);
+        assert!(upto > 0);
+        let message = follow_up_message(&round.review, from, upto);
+        assert!(message.contains("thanks — one more thing"), "{message}");
+        assert!(!message.contains("done"), "{message}");
+        assert!(
+            message.contains(&format!("comment id {comment_id}")),
+            "{message}"
+        );
+
+        // A resubmit with nothing new stays the read it always was.
+        let read = submit(&db, round.review.id, "alice", revision, false)
+            .await
+            .unwrap();
+        assert!(read.event.is_none());
+        assert_eq!(read.review.delivery_key, round.review.delivery_key);
+
+        // More replies start the next round under their own key, delivering
+        // only what the last round did not carry.
+        reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Operator("alice"),
+            "and this too",
+        )
+        .await
+        .unwrap();
+        let next = submit(&db, round.review.id, "alice", revision, false)
+            .await
+            .unwrap();
+        assert_eq!(next.review.reply_round, 2);
+        assert_eq!(next.review.delivery_key, format!("{base_key}#2"));
+        let (from, upto): (i64, i64) = sqlx::query_as(
+            "SELECT reply_from, reply_upto FROM review_delivery_outbox WHERE review_id = ?",
+        )
+        .bind(next.review.id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            from, 2,
+            "the window opens where the last round closed (the operator reply)"
+        );
+        assert_eq!(upto, from + 1, "the window holds only the one new reply");
+        let message = follow_up_message(&next.review, from, upto);
+        assert!(message.contains("and this too"), "{message}");
+        assert!(!message.contains("thanks — one more thing"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_session_reply_alone_never_queues_a_round() {
+        let (db, artifact) = seeded().await;
+        let first = draft(&db, &artifact, "alice").await;
+        let first = add(&db, &first, "change this").await;
+        let submitted = submit(&db, first.id, "alice", first.draft_revision, false)
+            .await
+            .unwrap();
+        let revision = submitted.review.draft_revision;
+        let comment_id = submitted.review.comments[0].id;
+
+        // The session answers after delivery. Its words are its own —
+        // submitting again must not round-trip them back into the
+        // conversation it answers as an empty "the reviewer replied".
+        reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Session("session-1"),
+            "already fixed",
+        )
+        .await
+        .unwrap();
+        let read = submit(&db, first.id, "alice", revision, false)
+            .await
+            .unwrap();
+        assert!(read.event.is_none(), "a session reply alone is not a round");
+        assert_eq!(read.review.reply_round, 0);
+        assert_eq!(read.review.delivery_key, submitted.review.delivery_key);
+        assert_eq!(read.review.delivery_state, submitted.review.delivery_state);
+        assert_eq!(read.review.pending_replies, 0);
+
+        // The reviewer's words, whenever they arrive, do queue the round.
+        reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Operator("alice"),
+            "one more thing",
+        )
+        .await
+        .unwrap();
+        let round = submit(&db, first.id, "alice", revision, false)
+            .await
+            .unwrap();
+        assert!(round.event.is_some());
+        assert_eq!(round.review.reply_round, 1);
     }
 }

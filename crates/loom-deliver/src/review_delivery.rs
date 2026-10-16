@@ -139,7 +139,13 @@ pub async fn deliver_review(state: &AppState, review_id: i64) -> Result<()> {
         // Another delivery path owns the live lease or already completed it.
         return Ok(());
     };
-    let payload = review::structured_message(&review);
+    // A reply round (a window past zero) carries the reviewer's answers to
+    // the session's replies; the initial submission carries the comments.
+    let payload = if lease.reply_upto > 0 {
+        review::follow_up_message(&review, lease.reply_from, lease.reply_upto)
+    } else {
+        review::structured_message(&review)
+    };
     let result: Result<()> = async {
         if target.protocol == "acp" {
             let appended =
