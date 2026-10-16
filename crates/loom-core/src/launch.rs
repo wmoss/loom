@@ -267,6 +267,11 @@ pub async fn resolve(
         }
         None => (profile.model.clone(), "profile"),
     };
+    let model = if crate::agent::builtin_agent_type(&agent).is_some() {
+        crate::agent::model_successor(db, &agent, &model).await
+    } else {
+        model
+    };
     let (effort, effort_source) = match selected(&overrides.effort) {
         Some(value) => (value.to_string(), "launch_override"),
         None if agent_overridden => (String::new(), "agent_default"),
@@ -516,6 +521,36 @@ mod tests {
         .unwrap();
         assert_eq!(agent_override.view.model, "claude-opus-5-5");
         assert_eq!(agent_override.view.provenance.model, "agent_default");
+    }
+
+    #[tokio::test]
+    async fn a_launch_follows_a_dropped_model_without_rewriting_the_profile() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        sqlx::query(
+            "UPDATE profiles SET agent_kind = 'cursor-agent', model = 'claude-opus-4-8' WHERE name = 'default'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO harness_model_catalog (harness, model_id, label) VALUES
+             ('cursor-agent', 'claude-opus-5-5', 'Opus 5.5'),
+             ('cursor-agent', 'claude-sonnet-5-5', 'Sonnet 5.5')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let resolved = resolve(&db, &LaunchSelection::default(), &ResolveOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(resolved.view.model, "claude-opus-5-5");
+        assert_eq!(resolved.view.provenance.model, "profile");
+        let stored: String =
+            sqlx::query_scalar("SELECT model FROM profiles WHERE name = 'default'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(stored, "claude-opus-4-8");
     }
 
     #[tokio::test]

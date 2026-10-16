@@ -4,13 +4,32 @@ mod probe;
 mod reconcile;
 pub mod selectors;
 mod store;
+mod succession;
 
 pub use probe::LiveSession;
 pub use reconcile::{spawn_refresh, write_through, Trigger};
 pub use selectors::{normalize, NormalizedSelectors};
+pub(crate) use succession::successor;
 
 use crate::agent::AgentChoice;
 use crate::db::Db;
+
+/// The model a launch should use. When the catalogue lists this harness and
+/// the saved id is gone, this is the newest listed id in the same family.
+/// An empty catalogue leaves the saved id alone.
+pub async fn model_successor(db: &Db, harness: &str, model: &str) -> String {
+    if model.is_empty() {
+        return String::new();
+    }
+    let Ok(rows) = store::list(db, harness).await else {
+        return model.to_string();
+    };
+    if rows.is_empty() {
+        return model.to_string();
+    }
+    let listed: Vec<&str> = rows.iter().map(|row| row.model_id.as_str()).collect();
+    successor(model, &listed).unwrap_or_else(|| model.to_string())
+}
 
 /// Replace a builtin's code-shipped model list with the stored catalogue.
 ///
