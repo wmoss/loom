@@ -23,6 +23,7 @@ import {
   retryReviewDelivery,
   retargetReviewToCurrent,
   resolveThread,
+  replyReviewComment,
   setReviewCommentResolution,
   submitReview,
   updateReview,
@@ -959,6 +960,8 @@ function renderCard(entry: ReviewEntry): VNode {
       reanchoring: entry.comment.id === reanchorCommentId.value,
       error: commentErrors.value[entry.comment.id] ?? '',
       deleteAction: removeComment,
+      replyAction: (commentId: number, body: string) =>
+        replyReviewComment(props.id, commentId, body),
       onFocus: focusComment,
       onClose: closeComment,
       onEdit: editComment,
@@ -1156,6 +1159,7 @@ const DocBody = () => {
 
     <ReviewTray
       ref="reviewTrayRef"
+      :floating="true"
       :reviews="reviews"
       :draft="draft"
       :open="trayOpen"

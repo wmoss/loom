@@ -1784,6 +1784,20 @@ impl From<ArtifactTextAnchorDto> for ReviewAnchorDto {
     }
 }
 
+/// One entry in a review comment's reply thread — the reviewed session and
+/// operators converse there, oldest first, with no reply-to-reply targeting.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReviewCommentReplyDto {
+    pub id: i64,
+    /// Who appended: `session` (the reviewed session, named by the review)
+    /// or `operator` (an operator's username in `author`).
+    pub author_kind: String,
+    /// The operator's username; empty for the session.
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReviewCommentDto {
     pub id: i64,
@@ -1792,6 +1806,10 @@ pub struct ReviewCommentDto {
     pub anchor: ReviewAnchorDto,
     pub body: String,
     pub status: String,
+    /// The reviewed session's replies, oldest first. `serde(default)` keeps
+    /// older payloads readable before replies existed.
+    #[serde(default)]
+    pub replies: Vec<ReviewCommentReplyDto>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1890,6 +1908,15 @@ pub struct ChangeFileDto {
     pub content: ChangeContentDto,
     pub hunks: Vec<ChangeHunkDto>,
     pub truncated: bool,
+    /// The full pre-change file text when it fits the content budget — the
+    /// browser feeds it to the diff renderer so hunk expansion has real lines
+    /// to reveal. Absent when the file is binary, oversized, or the budget
+    /// ran out.
+    #[serde(default)]
+    pub old_content: Option<String>,
+    /// The full post-change file text, same bounds as `old_content`.
+    #[serde(default)]
+    pub new_content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1947,6 +1974,38 @@ pub struct ChangeSetDto {
     pub files: Vec<ChangeFileDto>,
     pub truncated: bool,
     pub limits: ChangeLimitsDto,
+}
+
+// ---------------------------------------------------------------------------
+// Commits — the session branch's own commits since its fork point.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCommitDto {
+    pub oid: String,
+    pub author_name: String,
+    pub author_email: String,
+    /// Authoring time, RFC 3339.
+    pub authored_at: String,
+    /// First line of the commit message.
+    pub subject: String,
+    /// The commit message below its subject, when there is one.
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionCommitsDto {
+    /// The same fork-point resolution the Changes surface diffs against, so
+    /// the two never disagree about where the branch's own work starts.
+    pub base: ChangeBaseDto,
+    pub head_oid: Option<String>,
+    /// Newest first.
+    pub commits: Vec<SessionCommitDto>,
+    /// The branch holds more commits than the listing bound.
+    pub truncated: bool,
 }
 
 /// One watch, as the API exposes it. The JSON-bearing columns (`trigger`,
