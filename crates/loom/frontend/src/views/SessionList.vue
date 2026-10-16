@@ -35,9 +35,10 @@ import {
   updateSessionSpace,
 } from '../api';
 import { unmatchedAutomationRuns, unmatchedRunProjection } from '../lib/automationSessions';
-import { effectiveAttention } from '../lib/sessionState';
+import { childSessionsPhrase, effectiveAttention, sessionDescendants } from '../lib/sessionState';
 import { sessionPathSegments } from '../lib/sessionTitle';
 import { useLayoutCommands } from '../lib/layoutCommands';
+import { confirmAction } from '../lib/confirmation';
 import {
   FILTER_PREFERENCE_KEYS as FILTER_PREFERENCES,
   FILTER_QUERY_KEYS,
@@ -1053,22 +1054,51 @@ function moveGroupToSpace(group: SessionGroup) {
   });
 }
 
-const pendingBulkArchive = ref(false);
 const archiveResult = ref('');
-async function confirmBulkArchive() {
-  pendingBulkArchive.value = false;
-  error.value = '';
+// The one archive confirmation the app has (lib/confirmation, rendered by the
+// shell) also carries the optional add-on: children of the selected parents
+// that the selection itself doesn't cover can ride along, checked per dialog.
+function unselectedDescendants(ids: string[]): string[] {
+  const live = sessions.value.filter((session) => session.status !== 'archived');
+  const seen = new Set(ids);
+  const extra: string[] = [];
+  for (const id of ids) {
+    for (const child of sessionDescendants(live, id)) {
+      if (seen.has(child.id)) continue;
+      seen.add(child.id);
+      extra.push(child.id);
+    }
+  }
+  return extra;
+}
+function requestBulkArchive() {
   const ids = [...selected.value];
-  const results = await Promise.allSettled(ids.map(archiveSession));
-  const failed = ids.filter((_, index) => results[index].status === 'rejected');
-  const archived = ids.length - failed.length;
-  selected.value = new Set(failed);
-  announcement.value = `Archived ${archived} session${archived === 1 ? '' : 's'}${
-    failed.length ? `; ${failed.length} failed and remain selected` : ''
-  }`;
-  archiveResult.value = announcement.value;
-  if (failed.length) error.value = announcement.value;
-  await refresh();
+  if (!ids.length) return;
+  const extraChildren = unselectedDescendants(ids);
+  void confirmAction({
+    title: `Archive ${ids.length} selected session${ids.length === 1 ? '' : 's'}?`,
+    description:
+      'Their terminals and worktrees will be removed. Branches, conversations, placement, and Loom history remain recoverable in History. Failures remain selected so they can be retried.',
+    confirmLabel: 'Archive selected',
+    danger: true,
+    option: extraChildren.length
+      ? { label: `Also archive ${childSessionsPhrase(extraChildren.length)}` }
+      : undefined,
+    action: async ({ optionChecked }) => {
+      error.value = '';
+      const targets = [...ids, ...(optionChecked ? extraChildren : [])];
+      const results = await Promise.allSettled(targets.map((target) => archiveSession(target)));
+      const failed = targets.filter((_, index) => results[index].status === 'rejected');
+      const archived = targets.length - failed.length;
+      selected.value = new Set(failed);
+      announcement.value = `Archived ${archived} session${archived === 1 ? '' : 's'}${
+        failed.length ? `; ${failed.length} failed and remain selected` : ''
+      }`;
+      archiveResult.value = announcement.value;
+      if (failed.length) error.value = announcement.value;
+      await refresh();
+    },
+  });
 }
 
 const undoButton = ref<HTMLButtonElement>();
@@ -1628,11 +1658,7 @@ function scrollSpaces(direction: number) {
           >
             Move
           </button>
-          <button
-            class="btn-secondary px-2 py-1 text-xs"
-            type="button"
-            @click="pendingBulkArchive = true"
-          >
+          <button class="btn-secondary px-2 py-1 text-xs" type="button" @click="requestBulkArchive">
             Archive
           </button>
           <button class="btn-secondary px-2 py-1 text-xs" type="button" @click="clearSelection">
@@ -1857,14 +1883,6 @@ function scrollSpaces(direction: number) {
       danger
       @confirm="confirmLayoutDelete"
       @cancel="pendingDelete = null"
-    />
-    <ConfirmDialog
-      :open="pendingBulkArchive"
-      title="Archive selected sessions?"
-      :description="`${selected.size} selected session${selected.size === 1 ? '' : 's'} will be torn down and kept in History. Failures remain selected so they can be retried.`"
-      confirm-label="Archive selected"
-      @confirm="confirmBulkArchive"
-      @cancel="pendingBulkArchive = false"
     />
   </div>
 </template>
