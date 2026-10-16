@@ -218,6 +218,29 @@ async fn notify_parent_of_result(
     };
     let notice_author = Subject::new(SubjectKind::System, "loom");
     deliver_to_subscribers(st, &notice_author, &notice.id, &notice.body).await?;
+    // A committed result is a wake signal for a dormant parent: the notice is
+    // already durable in its inbox, and the respawned task's inbox drain is
+    // what makes it land. A duplicate post must not re-wake — only a genuinely
+    // new result reaches here — so the wake is guarded on `inserted`. Detached
+    // so the child's own request never waits out the parent's respawn.
+    if inserted {
+        if let Some(parent) = crate::session::get(&st.db, &notice.channel_id).await? {
+            if crate::session::is_suspended(&parent.status) {
+                let st = st.clone();
+                let result_id = result.id.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = crate::lifecycle::wake(&st, &parent).await {
+                        tracing::warn!(
+                            parent = %parent.id,
+                            result = %result_id,
+                            %error,
+                            "child result: waking suspended parent failed; the notice stays queued for the next wake"
+                        );
+                    }
+                });
+            }
+        }
+    }
     record_channel_message_event(st, &notice.channel_id, &notice_author, &notice, inserted).await;
     Ok(())
 }
