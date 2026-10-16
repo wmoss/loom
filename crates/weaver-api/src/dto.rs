@@ -619,6 +619,10 @@ pub struct ProfileView {
     pub agent_kind: String,
     pub model: String,
     pub effort: String,
+    #[serde(default)]
+    pub fast: String,
+    #[serde(default)]
+    pub thinking: String,
     pub protocol: String,
     pub mode: String,
     pub class: String,
@@ -937,6 +941,10 @@ pub struct LaunchOverrides {
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]
+    pub fast: Option<String>,
+    #[serde(default)]
+    pub thinking: Option<String>,
+    #[serde(default)]
     pub protocol: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
@@ -969,6 +977,10 @@ pub struct LaunchProvenanceView {
     pub agent: String,
     pub model: String,
     pub effort: String,
+    #[serde(default)]
+    pub fast: String,
+    #[serde(default)]
+    pub thinking: String,
     pub protocol: String,
     pub mode: String,
     pub class: String,
@@ -1021,6 +1033,10 @@ pub struct ResolvedLaunchView {
     pub agent: String,
     pub model: String,
     pub effort: String,
+    #[serde(default)]
+    pub fast: String,
+    #[serde(default)]
+    pub thinking: String,
     pub protocol: String,
     pub mode: String,
     pub class: String,
@@ -2600,6 +2616,17 @@ pub struct ShellRestartResult {
 pub struct AgentChoiceView {
     pub id: String,
     pub label: String,
+    /// Effort choices for this model. Empty when the model has no effort
+    /// option or its options have not been fetched — the picker then offers
+    /// only "Agent default".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<AgentChoiceView>,
+    /// Canonical fast choices (`true` / `false`) for this model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fast: Vec<AgentChoiceView>,
+    /// Canonical thinking-toggle choices for this model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking: Vec<AgentChoiceView>,
 }
 
 /// One agent runtime the picker offers — a builtin (`claude`, `codex`) or an
@@ -2619,6 +2646,9 @@ pub struct AgentMetadataView {
     pub supports_acp: bool,
     /// The agent's declared execution backend: `"terminal"` or `"acp"`.
     pub protocol: String,
+    /// Whether the agent binary is available on the system PATH. The UI hides
+    /// unavailable harnesses (e.g. when `codex` is not installed).
+    pub available: Option<bool>,
 }
 
 /// One operator-defined custom agent definition — a row of the

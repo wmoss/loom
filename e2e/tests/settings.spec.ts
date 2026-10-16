@@ -11,11 +11,13 @@ test.describe('settings · profiles', () => {
     ).json()) as {
       agents: {
         kind: string;
-        models: { id: string; label: string }[];
-        efforts: { id: string; label: string }[];
+        models: {
+          id: string;
+          label: string;
+          efforts?: { id: string; label: string }[];
+        }[];
       }[];
     };
-    const claude = registry.agents.find((agent) => agent.kind === 'claude')!;
     const codex = registry.agents.find((agent) => agent.kind === 'codex')!;
     await page.goto(`${weaver.baseUrl}/settings`);
     await page.getByTestId('settings-category-agents').click();
@@ -23,24 +25,34 @@ test.describe('settings · profiles', () => {
     const agent = page.getByTestId('profile-agent');
     const model = page.getByTestId('profile-model');
     const effort = page.getByTestId('profile-effort');
+    const fast = page.getByTestId('profile-fast');
+    const thinking = page.getByTestId('profile-thinking');
     await expect(agent.locator('option')).toContainText(['Claude', 'Codex', 'Shell']);
+    await expect(fast).toBeVisible();
+    await expect(thinking).toBeVisible();
 
     await agent.selectOption('claude');
-    await model.click();
-    await model.fill(claude.models[0].id);
-    await page.keyboard.press('Enter');
+    await expect(model.locator('option').first()).toHaveText('Agent default');
     await agent.selectOption('codex');
     await expect(model).toHaveValue('');
     await expect(model.locator('option')).toContainText([
       'Agent default',
       ...codex.models.map((choice) => choice.label),
     ]);
-    await expect(effort.locator('option')).toContainText([
-      'Agent default',
-      ...codex.efforts.map((choice) => choice.label),
-    ]);
-    await model.selectOption(codex.models[0].id);
-    await effort.selectOption(codex.efforts[0].id);
+    const selectedModel = codex.models[0];
+    if (selectedModel) {
+      await model.selectOption(selectedModel.id);
+      const efforts = selectedModel.efforts ?? [];
+      await expect(effort.locator('option')).toContainText([
+        'Agent default',
+        ...efforts.map((choice) => choice.label),
+      ]);
+      if (efforts[0]) await effort.selectOption(efforts[0].id);
+    } else {
+      await expect(effort.locator('option')).toHaveText(['Agent default']);
+      await expect(fast.locator('option')).toHaveText(['Agent default']);
+      await expect(thinking.locator('option')).toHaveText(['Agent default']);
+    }
     await page.getByTestId('profile-save').click();
     await expect(page.getByText('Saved default.')).toBeVisible();
 
@@ -57,8 +69,8 @@ test.describe('settings · profiles', () => {
     };
     expect(saved).toMatchObject({
       agent_kind: 'codex',
-      model: codex.models[0].id,
-      effort: codex.efforts[0].id,
+      model: selectedModel?.id ?? '',
+      effort: selectedModel?.efforts?.[0]?.id ?? '',
     });
 
     await expect(page.getByText('Fleet concierge runtime', { exact: true })).toHaveCount(0);

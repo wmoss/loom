@@ -7,7 +7,7 @@ import type {
   ProfileEnv,
   ProfileInput,
 } from '../types';
-import ModelCombobox from './ModelCombobox.vue';
+import { agentOptionsWithCurrent, isAgentAvailable } from '../lib/agentAvailability';
 
 const props = withDefaults(
   defineProps<{
@@ -26,9 +26,18 @@ const envName = ref('');
 const envValue = ref('');
 const envKind = ref<'literal' | 'gcp_secret'>('literal');
 
+// The profile's own agent stays selectable even when its harness is missing,
+// so opening an existing profile never silently rewrites its agent.
+const agentOptions = computed(() => agentOptionsWithCurrent(props.agents, draft.value.agent_kind));
 const selectedAgent = computed(() =>
   props.agents.find((agent) => agent.kind === draft.value.agent_kind),
 );
+const selectedModel = computed(() =>
+  selectedAgent.value?.models.find((model) => model.id === draft.value.model),
+);
+const effortChoices = computed(() => selectedModel.value?.efforts ?? []);
+const fastChoices = computed(() => selectedModel.value?.fast ?? []);
+const thinkingChoices = computed(() => selectedModel.value?.thinking ?? []);
 const mcpGroups = computed(() => {
   const groups = new Map<string, boolean>();
   for (const set of props.mcpRegistry?.capability_sets ?? []) groups.set(set.group, true);
@@ -90,15 +99,8 @@ const selectedMcpSummary = computed(() => {
 
 function normalizeAgentChoices(metadata = selectedAgent.value) {
   if (!metadata) return;
-  if (
-    draft.value.model &&
-    !metadata.accepts_raw_model &&
-    !metadata.models.some((choice) => choice.id === draft.value.model)
-  ) {
-    draft.value.model = '';
-  }
-  if (draft.value.effort && !metadata.efforts.some((choice) => choice.id === draft.value.effort)) {
-    draft.value.effort = '';
+  if (draft.value.protocol === 'acp' && metadata.supports_acp === false) {
+    draft.value.protocol = '';
   }
 }
 
@@ -135,7 +137,14 @@ function setEnvironment() {
   envValue.value = '';
 }
 
-watch(selectedAgent, normalizeAgentChoices);
+watch(selectedAgent, () => normalizeAgentChoices());
+
+function onAgentChange() {
+  draft.value.model = '';
+  draft.value.effort = '';
+  draft.value.fast = '';
+  draft.value.thinking = '';
+}
 watch(
   () => draft.value.restricted,
   (restricted) => {
@@ -179,9 +188,10 @@ watch(
         data-testid="profile-agent"
         :disabled="disabled"
         class="min-w-0 rounded bg-input px-2 py-1.5"
+        @change="onAgentChange"
       >
-        <option v-for="agent in agents" :key="agent.kind" :value="agent.kind">
-          {{ agent.label }}
+        <option v-for="agent in agentOptions" :key="agent.kind" :value="agent.kind">
+          {{ agent.label }}{{ isAgentAvailable(agent) ? '' : ' — unavailable' }}
         </option>
       </select>
     </div>
@@ -215,45 +225,67 @@ watch(
       </p>
     </div>
 
-    <div class="grid min-w-0 gap-1">
-      <label class="text-xs" :for="`${uid}-model`">Model</label>
-      <ModelCombobox
-        v-if="selectedAgent?.accepts_raw_model"
-        :id="`${uid}-model`"
-        v-model="draft.model"
-        :choices="selectedAgent.models"
-        :disabled="disabled"
-        field-class="bg-input"
-        testid="profile-model"
-      />
-      <select
-        v-else
-        :id="`${uid}-model`"
-        v-model="draft.model"
-        data-testid="profile-model"
-        :disabled="disabled"
-        class="min-w-0 w-full rounded bg-input px-2 py-1.5"
-      >
-        <option value="">Agent default</option>
-        <option v-for="model in selectedAgent?.models ?? []" :key="model.id" :value="model.id">
-          {{ model.label }}
-        </option>
-      </select>
-    </div>
-    <div class="grid min-w-0 gap-1">
-      <label class="text-xs" :for="`${uid}-effort`">Effort</label>
-      <select
-        :id="`${uid}-effort`"
-        v-model="draft.effort"
-        data-testid="profile-effort"
-        :disabled="disabled"
-        class="min-w-0 rounded bg-input px-2 py-1.5"
-      >
-        <option value="">Agent default</option>
-        <option v-for="effort in selectedAgent?.efforts ?? []" :key="effort.id" :value="effort.id">
-          {{ effort.label }}
-        </option>
-      </select>
+    <div class="grid min-w-0 gap-3" data-testid="profile-selectors">
+      <div class="grid min-w-0 gap-1">
+        <label class="text-xs" :for="`${uid}-model`">Model</label>
+        <select
+          :id="`${uid}-model`"
+          v-model="draft.model"
+          data-testid="profile-model"
+          :disabled="disabled"
+          class="min-w-0 w-full rounded bg-input px-2 py-1.5"
+        >
+          <option value="">Agent default</option>
+          <option v-for="model in selectedAgent?.models ?? []" :key="model.id" :value="model.id">
+            {{ model.label }}
+          </option>
+        </select>
+      </div>
+      <div class="grid min-w-0 gap-1">
+        <label class="text-xs" :for="`${uid}-effort`">Effort</label>
+        <select
+          :id="`${uid}-effort`"
+          v-model="draft.effort"
+          data-testid="profile-effort"
+          :disabled="disabled"
+          class="min-w-0 rounded bg-input px-2 py-1.5"
+        >
+          <option value="">Agent default</option>
+          <option v-for="effort in effortChoices" :key="effort.id" :value="effort.id">
+            {{ effort.label }}
+          </option>
+        </select>
+      </div>
+      <div class="grid min-w-0 gap-1">
+        <label class="text-xs" :for="`${uid}-fast`">Fast</label>
+        <select
+          :id="`${uid}-fast`"
+          v-model="draft.fast"
+          data-testid="profile-fast"
+          :disabled="disabled"
+          class="min-w-0 rounded bg-input px-2 py-1.5"
+        >
+          <option value="">Agent default</option>
+          <option v-for="choice in fastChoices" :key="choice.id" :value="choice.id">
+            {{ choice.label }}
+          </option>
+        </select>
+      </div>
+      <div class="grid min-w-0 gap-1">
+        <label class="text-xs" :for="`${uid}-thinking`">Thinking</label>
+        <select
+          :id="`${uid}-thinking`"
+          v-model="draft.thinking"
+          data-testid="profile-thinking"
+          :disabled="disabled"
+          class="min-w-0 rounded bg-input px-2 py-1.5"
+        >
+          <option value="">Agent default</option>
+          <option v-for="choice in thinkingChoices" :key="choice.id" :value="choice.id">
+            {{ choice.label }}
+          </option>
+        </select>
+      </div>
     </div>
 
     <div class="grid min-w-0 gap-1">
@@ -265,7 +297,7 @@ watch(
         class="min-w-0 rounded bg-input px-2 py-1.5"
       >
         <option value="">Agent default</option>
-        <option value="acp">ACP</option>
+        <option v-if="selectedAgent?.supports_acp !== false" value="acp">ACP</option>
         <option value="terminal">Terminal</option>
       </select>
     </div>

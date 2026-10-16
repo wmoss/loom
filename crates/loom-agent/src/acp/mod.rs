@@ -128,6 +128,13 @@ pub struct AcpLaunch {
     pub initial_model: Option<String>,
     /// The matching reasoning-effort selector, when the launch pinned one.
     pub initial_effort: Option<String>,
+    /// Canonical fast selector (`true` / `false`). Empty leaves the adapter's default.
+    pub initial_fast: Option<String>,
+    /// Canonical thinking-toggle selector (`true` / `false`).
+    pub initial_thinking: Option<String>,
+    /// Builtin harness id, so a launch can write the observed options back
+    /// into the catalogue. Empty for a custom adapter.
+    pub harness: String,
     /// The session's goal, sent as the first `session/prompt` (journaled as the
     /// first `user_message`). `None` waits for the first REST prompt.
     pub goal: Option<String>,
@@ -397,24 +404,22 @@ impl AcpPromptClient {
         let opened = self.open_new_session(launch).await?;
         let mut options = opened.config_options.unwrap_or_default();
 
-        for (kind, desired) in [
-            ("model", launch.initial_model.as_deref()),
-            ("effort", launch.initial_effort.as_deref()),
-        ] {
-            let Some(desired) = desired.map(str::trim).filter(|value| !value.is_empty()) else {
-                continue;
-            };
+        // `validate` only runs for a fresh session (asserted above).
+        for (kind, desired) in launch_config_steps(launch) {
             let Some(details) = config_option_details(&options, kind) else {
                 // Some adapters apply launch selectors out of band and do not
                 // advertise a matching ACP control. session/new is authoritative
                 // for those runtimes, just as it is during the durable handshake.
                 continue;
             };
-            if details.current.as_deref() == Some(desired) {
+            let Some(desired) = resolve_desired_value(kind, &desired, &details.available) else {
+                continue;
+            };
+            if details.current.as_deref() == Some(desired.as_str()) {
                 continue;
             }
             options = self
-                .set_config_option(&details.id, Value::String(desired.to_string()))
+                .set_config_option(&details.id, Value::String(desired.clone()))
                 .await
                 .with_context(|| {
                     if details.available.is_empty() {
@@ -637,10 +642,51 @@ fn is_config_option_kind(option: &Value, kind: &str) -> bool {
     let category = option.get("category").and_then(Value::as_str).unwrap_or("");
     match kind {
         "model" => category == "model" || id == "model",
-        "effort" => category == "thought_level" || id == "effort" || id.contains("reasoning"),
+        // The reasoning-effort scale, explicitly *not* the `thinking` toggle:
+        // some Cursor models advertise both under `thought_level` and each is
+        // reconciled on its own (see `launch_config_steps`).
+        "effort" => {
+            id != "thinking"
+                && (category == "thought_level" || id == "effort" || id.contains("reasoning"))
+        }
+        "thinking" => id == "thinking",
+        "fast" => id == "fast",
         "mode" => category == "mode" || id == "mode",
         _ => false,
     }
+}
+
+fn launch_selector(kind: &str) -> Option<crate::catalog::selectors::Selector> {
+    match kind {
+        "model" => Some(crate::catalog::selectors::Selector::Model),
+        "effort" => Some(crate::catalog::selectors::Selector::Effort),
+        "fast" => Some(crate::catalog::selectors::Selector::Fast),
+        "thinking" => Some(crate::catalog::selectors::Selector::Thinking),
+        _ => None,
+    }
+}
+
+fn launch_config_steps(launch: &AcpLaunch) -> Vec<(&'static str, String)> {
+    let trimmed = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let mut steps = Vec::new();
+    if let Some(model) = trimmed(launch.initial_model.as_deref()) {
+        steps.push(("model", model));
+    }
+    if let Some(effort) = trimmed(launch.initial_effort.as_deref()) {
+        steps.push(("effort", effort));
+    }
+    if let Some(fast) = trimmed(launch.initial_fast.as_deref()) {
+        steps.push(("fast", fast));
+    }
+    if let Some(thinking) = trimmed(launch.initial_thinking.as_deref()) {
+        steps.push(("thinking", thinking));
+    }
+    steps
 }
 
 fn config_option_details(config_options: &[Value], kind: &str) -> Option<ConfigOptionDetails> {
@@ -670,6 +716,32 @@ fn config_option_details(config_options: &[Value], kind: &str) -> Option<ConfigO
             }
         })
     })
+}
+
+/// For a boolean kind (`fast`, `thinking`), map Loom's `"true"`/`"false"` onto
+/// whichever of the adapter's advertised `available` values actually spells
+/// that boolean (e.g. `on`/`off`); `None` if none match. `model`/`effort` ids
+/// must match `desired` literally.
+fn resolve_desired_value(kind: &str, desired: &str, available: &[String]) -> Option<String> {
+    if available.iter().any(|value| value == desired) {
+        return Some(desired.to_string());
+    }
+    if !matches!(kind, "fast" | "thinking") {
+        return Some(desired.to_string());
+    }
+    let aliases: &[&str] = match desired {
+        "true" => &["on", "1", "yes"],
+        "false" => &["off", "0", "no"],
+        _ => &[],
+    };
+    available
+        .iter()
+        .find(|value| {
+            aliases
+                .iter()
+                .any(|alias| value.eq_ignore_ascii_case(alias))
+        })
+        .cloned()
 }
 
 fn mode_ids(modes: &[Value]) -> Vec<String> {
@@ -2012,44 +2084,20 @@ impl Task {
         launch: &AcpLaunch,
         cmd_rx: &mut mpsc::Receiver<Command>,
     ) -> Result<()> {
-        for (kind, desired) in [
-            ("model", launch.initial_model.as_deref()),
-            ("effort", launch.initial_effort.as_deref()),
-        ] {
-            let Some(desired) = desired.map(str::trim).filter(|value| !value.is_empty()) else {
+        for (kind, desired) in launch_config_steps(launch) {
+            let Some(selector) = launch_selector(kind) else {
                 continue;
             };
-            let option = {
-                let metadata = self.metadata.lock().unwrap();
-                metadata.config_options.iter().find_map(|option| {
-                    let id = option.get("id").and_then(Value::as_str)?;
-                    let category = option.get("category").and_then(Value::as_str);
-                    let matches = match kind {
-                        "model" => category == Some("model") || id == "model",
-                        "effort" => {
-                            category == Some("thought_level")
-                                || id == "effort"
-                                || id.contains("reasoning")
-                        }
-                        _ => false,
-                    };
-                    matches.then(|| {
-                        (
-                            id.to_string(),
-                            option
-                                .get("currentValue")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        )
-                    })
-                })
-            };
-            let Some((config_id, current)) = option else {
-                // Older/custom adapters may not expose this selector. The
-                // launch channel still owns the runtime value in that case.
+            let options = self.metadata.lock().unwrap().config_options.clone();
+            let Some(matched) = crate::catalog::selectors::find(&options, selector) else {
+                // The live session does not advertise this selector.
                 continue;
             };
-            if current.as_deref() == Some(desired) {
+            let Some(raw) = crate::catalog::selectors::raw_value(&options, selector, &desired)
+            else {
+                continue;
+            };
+            if matched.current.as_deref() == Some(desired.as_str()) {
                 continue;
             }
 
@@ -2058,11 +2106,7 @@ impl Task {
                 .write(&wire::request_line(
                     id,
                     method::SESSION_SET_CONFIG_OPTION,
-                    wire::set_config_option_params(
-                        &self.acp_session_id,
-                        &config_id,
-                        Value::String(desired.to_string()),
-                    ),
+                    wire::set_config_option_params(&self.acp_session_id, &matched.id, raw),
                 ))
                 .await?;
             let (result, error) = self
@@ -2085,6 +2129,10 @@ impl Task {
                     )
                 })?;
             self.replace_config_options(updated.config_options, false);
+        }
+        let options = self.metadata.lock().unwrap().config_options.clone();
+        if let Some(model) = crate::catalog::selectors::current_model(&options) {
+            crate::catalog::write_through(&self.db, &launch.harness, &model, &options).await;
         }
         Ok(())
     }
@@ -3963,8 +4011,9 @@ fn is_compaction_prompt(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_choice, deny_choice, is_compaction_prompt, preferred_config_value, preferred_mode,
-        queued_prompt_text, LiveTool, PermissionOption,
+        auto_choice, deny_choice, is_compaction_prompt, is_config_option_kind, launch_config_steps,
+        preferred_config_value, preferred_mode, queued_prompt_text, resolve_desired_value,
+        AcpLaunch, LiveTool, NewOrLoad, PermissionOption,
     };
     use crate::acp::wire::{ContentBlock, ToolCallContent};
     use serde_json::json;
@@ -4006,6 +4055,88 @@ mod tests {
         assert!(is_compaction_prompt("  /compact preserve the test context"));
         assert!(!is_compaction_prompt("/compaction"));
         assert!(!is_compaction_prompt("explain /compact"));
+    }
+
+    #[test]
+    fn effort_kind_excludes_the_thinking_toggle() {
+        let thinking = json!({ "id": "thinking", "category": "thought_level" });
+        let scale = json!({ "id": "effort", "category": "thought_level" });
+        assert!(!is_config_option_kind(&thinking, "effort"));
+        assert!(is_config_option_kind(&thinking, "thinking"));
+        assert!(is_config_option_kind(&scale, "effort"));
+        assert!(!is_config_option_kind(&scale, "thinking"));
+    }
+
+    #[test]
+    fn launch_config_steps_lists_each_set_selector() {
+        let launch = |model: &str, effort: &str, fast: &str, thinking: &str| AcpLaunch {
+            adapter_cmd: String::new(),
+            cwd: std::path::PathBuf::new(),
+            env: Vec::new(),
+            env_clear: false,
+            mcp_servers: Vec::new(),
+            additional_directories: Vec::new(),
+            new_or_load: NewOrLoad::New {
+                cwd: std::path::PathBuf::new(),
+                meta: None,
+            },
+            mode: None,
+            initial_model: (!model.is_empty()).then(|| model.to_string()),
+            initial_effort: (!effort.is_empty()).then(|| effort.to_string()),
+            initial_fast: (!fast.is_empty()).then(|| fast.to_string()),
+            initial_thinking: (!thinking.is_empty()).then(|| thinking.to_string()),
+            harness: String::new(),
+            goal: None,
+            setup_timeout: std::time::Duration::from_secs(1),
+        };
+
+        assert_eq!(
+            launch_config_steps(&launch("grok-4.6", "low", "true", "true")),
+            [
+                ("model", "grok-4.6".to_string()),
+                ("effort", "low".to_string()),
+                ("fast", "true".to_string()),
+                ("thinking", "true".to_string()),
+            ]
+        );
+        assert_eq!(
+            launch_config_steps(&launch("", "high", "", "")),
+            [("effort", "high".to_string())]
+        );
+        assert_eq!(launch_config_steps(&launch("", "", "", "")), []);
+    }
+
+    #[test]
+    fn resolve_desired_value_maps_boolean_kinds_onto_the_adapters_own_spelling() {
+        let strs = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+
+        // Literal match wins even when aliases are also present.
+        assert_eq!(
+            resolve_desired_value("fast", "false", &strs(&["true", "false"])),
+            Some("false".to_string())
+        );
+        // Claude's `fast` toggle spells booleans `on`/`off`, not `true`/`false`.
+        assert_eq!(
+            resolve_desired_value("fast", "false", &strs(&["on", "off"])),
+            Some("off".to_string())
+        );
+        assert_eq!(
+            resolve_desired_value("thinking", "true", &strs(&["on", "off"])),
+            Some("on".to_string())
+        );
+        // A vocabulary with no recognizable boolean spelling at all: give up
+        // rather than force a value the adapter doesn't advertise.
+        assert_eq!(
+            resolve_desired_value("fast", "false", &strs(&["turbo", "normal"])),
+            None
+        );
+        // Non-boolean kinds (model/effort ids) are never remapped — an
+        // unmatched value here is a real "unknown model/effort", not a
+        // boolean-spelling mismatch, and must still reach the bail-out path.
+        assert_eq!(
+            resolve_desired_value("model", "opus", &strs(&["sonnet", "haiku"])),
+            Some("opus".to_string())
+        );
     }
 
     #[tokio::test]

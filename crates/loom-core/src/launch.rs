@@ -134,6 +134,8 @@ fn has_override(overrides: &LaunchOverrides) -> bool {
         &overrides.agent,
         &overrides.model,
         &overrides.effort,
+        &overrides.fast,
+        &overrides.thinking,
         &overrides.protocol,
         &overrides.mode,
         &overrides.class,
@@ -154,6 +156,8 @@ fn normalized_selection(selection: &LaunchSelection) -> LaunchSelection {
             agent: nonempty(&selection.overrides.agent),
             model: trim(&selection.overrides.model),
             effort: trim(&selection.overrides.effort),
+            fast: trim(&selection.overrides.fast),
+            thinking: trim(&selection.overrides.thinking),
             protocol: trim(&selection.overrides.protocol),
             mode: trim(&selection.overrides.mode),
             class: trim(&selection.overrides.class),
@@ -269,8 +273,20 @@ pub async fn resolve(
         None if profile.effort.is_empty() => (String::new(), "agent_default"),
         None => (profile.effort.clone(), "profile"),
     };
+    let (fast, fast_source) = match selected(&overrides.fast) {
+        Some(value) => (value.to_string(), "launch_override"),
+        None if agent_overridden => (String::new(), "agent_default"),
+        None if profile.fast.is_empty() => (String::new(), "agent_default"),
+        None => (profile.fast.clone(), "profile"),
+    };
+    let (thinking, thinking_source) = match selected(&overrides.thinking) {
+        Some(value) => (value.to_string(), "launch_override"),
+        None if agent_overridden => (String::new(), "agent_default"),
+        None if profile.thinking.is_empty() => (String::new(), "agent_default"),
+        None => (profile.thinking.clone(), "profile"),
+    };
     crate::agent::validate_model(&metadata, &model).map_err(|error| anyhow!(error))?;
-    crate::agent::validate_effort(&metadata, &effort).map_err(|error| anyhow!(error))?;
+    crate::agent::validate_effort(&metadata, &model, &effort).map_err(|error| anyhow!(error))?;
 
     let protocol_requested = selected(&overrides.protocol).or_else(|| {
         (!agent_overridden && !profile.protocol.trim().is_empty())
@@ -352,10 +368,12 @@ pub async fn resolve(
     let turn_budget = profile.turn_budget.unwrap_or(defaults.1);
     let resolver_revision = resolver_revision(db, &metadata, &custom_agents, defaults).await?;
     let locked_fields = if profile.strict {
-        ["agent", "model", "effort", "protocol", "mode", "class"]
-            .into_iter()
-            .map(str::to_string)
-            .collect()
+        [
+            "agent", "model", "effort", "fast", "thinking", "protocol", "mode", "class",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
     } else {
         Vec::new()
     };
@@ -370,6 +388,8 @@ pub async fn resolve(
         agent,
         model,
         effort,
+        fast,
+        thinking,
         protocol,
         mode,
         class,
@@ -382,6 +402,8 @@ pub async fn resolve(
             },
             model: model_source.to_string(),
             effort: effort_source.to_string(),
+            fast: fast_source.to_string(),
+            thinking: thinking_source.to_string(),
             protocol: protocol_source.to_string(),
             mode: mode_source.to_string(),
             class: class_source.to_string(),

@@ -113,6 +113,9 @@ async fn start_new_with_env(
         mode: mode.map(str::to_string),
         initial_model: None,
         initial_effort: None,
+        initial_fast: None,
+        initial_thinking: None,
+        harness: String::new(),
         goal: goal.map(str::to_string),
         setup_timeout: Duration::from_secs(5),
     };
@@ -134,6 +137,9 @@ fn transient_launch(ts: &TestServer, env: Vec<(String, String)>) -> AcpLaunch {
         mode: None,
         initial_model: None,
         initial_effort: None,
+        initial_fast: None,
+        initial_thinking: None,
+        harness: String::new(),
         goal: None,
         setup_timeout: Duration::from_secs(5),
     }
@@ -161,6 +167,9 @@ async fn silent_setup_stage_times_out_and_cleans_provider_state() {
         mode: None,
         initial_model: None,
         initial_effort: None,
+        initial_fast: None,
+        initial_thinking: None,
+        harness: String::new(),
         goal: Some("say:never starts".to_string()),
         setup_timeout: Duration::from_millis(150),
     };
@@ -669,6 +678,9 @@ async fn launch_model_and_effort_replace_adapter_config_defaults() {
         mode: None,
         initial_model: Some("fake-deep".to_string()),
         initial_effort: Some("high".to_string()),
+        initial_fast: None,
+        initial_thinking: None,
+        harness: String::new(),
         goal: None,
         setup_timeout: Duration::from_secs(5),
     };
@@ -708,6 +720,9 @@ async fn load_preserves_adapter_restored_model_and_effort() {
         mode: None,
         initial_model: None,
         initial_effort: None,
+        initial_fast: None,
+        initial_thinking: None,
+        harness: String::new(),
         goal: None,
         setup_timeout: Duration::from_secs(5),
     };
@@ -5447,6 +5462,8 @@ async fn codex_acp_launch_maps_the_adapter_contract() {
         server_addr: &addr,
         model: "gpt-5.3-codex",
         effort: "high",
+        fast: "",
+        thinking: "",
         goal_file,
         primer_file: Some(primer.as_path()),
         extra_env,
