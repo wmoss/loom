@@ -8,6 +8,7 @@ import type {
   ProfileInput,
 } from '../types';
 import { agentOptionsWithCurrent, isAgentAvailable } from '../lib/agentAvailability';
+import ModelCombobox from './ModelCombobox.vue';
 
 const props = withDefaults(
   defineProps<{
@@ -29,6 +30,12 @@ const envKind = ref<'literal' | 'gcp_secret'>('literal');
 // The profile's own agent stays selectable even when its harness is missing,
 // so opening an existing profile never silently rewrites its agent.
 const agentOptions = computed(() => agentOptionsWithCurrent(props.agents, draft.value.agent_kind));
+const agentChoices = computed(() =>
+  agentOptions.value.map((agent) => ({
+    id: agent.kind,
+    label: `${agent.label}${isAgentAvailable(agent) ? '' : ' — unavailable'}`,
+  })),
+);
 const selectedAgent = computed(() =>
   props.agents.find((agent) => agent.kind === draft.value.agent_kind),
 );
@@ -36,6 +43,14 @@ const selectedModel = computed(() =>
   selectedAgent.value?.models.find((model) => model.id === draft.value.model),
 );
 const effortChoices = computed(() => selectedModel.value?.efforts ?? []);
+const modeChoices = ['auto', 'default', 'acceptEdits', 'plan', 'bypassPermissions'].map((mode) => ({
+  id: mode,
+  label: mode,
+}));
+const protocolChoices = computed(() => [
+  ...(selectedAgent.value?.supports_acp !== false ? [{ id: 'acp', label: 'ACP' }] : []),
+  { id: 'terminal', label: 'Terminal' },
+]);
 const fastChoices = computed(() => selectedModel.value?.fast ?? []);
 const thinkingChoices = computed(() => selectedModel.value?.thinking ?? []);
 const mcpGroups = computed(() => {
@@ -145,6 +160,12 @@ function onAgentChange() {
   draft.value.fast = '';
   draft.value.thinking = '';
 }
+
+function onAgentPick(kind: string) {
+  if (kind === draft.value.agent_kind) return;
+  draft.value.agent_kind = kind;
+  onAgentChange();
+}
 watch(
   () => draft.value.restricted,
   (restricted) => {
@@ -182,18 +203,16 @@ watch(
     </div>
     <div class="grid min-w-0 gap-1">
       <label class="text-xs" :for="`${uid}-agent`">Agent</label>
-      <select
+      <ModelCombobox
         :id="`${uid}-agent`"
-        v-model="draft.agent_kind"
-        data-testid="profile-agent"
+        :choices="agentChoices"
+        :model-value="draft.agent_kind"
         :disabled="disabled"
-        class="min-w-0 rounded bg-input px-2 py-1.5"
-        @change="onAgentChange"
-      >
-        <option v-for="agent in agentOptions" :key="agent.kind" :value="agent.kind">
-          {{ agent.label }}{{ isAgentAvailable(agent) ? '' : ' — unavailable' }}
-        </option>
-      </select>
+        placeholder="Select an agent"
+        field-class="bg-input"
+        testid="profile-agent"
+        @update:model-value="onAgentPick"
+      />
     </div>
 
     <div class="grid min-w-0 gap-1 sm:col-span-2">
@@ -225,98 +244,85 @@ watch(
       </p>
     </div>
 
-    <div class="grid min-w-0 gap-3" data-testid="profile-selectors">
+    <div class="grid min-w-0 gap-3 sm:col-span-2 sm:grid-cols-2" data-testid="profile-selectors">
       <div class="grid min-w-0 gap-1">
         <label class="text-xs" :for="`${uid}-model`">Model</label>
-        <select
+        <ModelCombobox
           :id="`${uid}-model`"
-          v-model="draft.model"
-          data-testid="profile-model"
+          :choices="selectedAgent?.models ?? []"
+          :model-value="draft.model"
           :disabled="disabled"
-          class="min-w-0 w-full rounded bg-input px-2 py-1.5"
-        >
-          <option value="">Agent default</option>
-          <option v-for="model in selectedAgent?.models ?? []" :key="model.id" :value="model.id">
-            {{ model.label }}
-          </option>
-        </select>
+          :allow-custom="selectedAgent?.accepts_raw_model === true"
+          empty-label="Agent default"
+          field-class="bg-input"
+          testid="profile-model"
+          @update:model-value="draft.model = $event"
+        />
       </div>
       <div class="grid min-w-0 gap-1">
         <label class="text-xs" :for="`${uid}-effort`">Effort</label>
-        <select
+        <ModelCombobox
           :id="`${uid}-effort`"
-          v-model="draft.effort"
-          data-testid="profile-effort"
+          :choices="effortChoices"
+          :model-value="draft.effort"
           :disabled="disabled"
-          class="min-w-0 rounded bg-input px-2 py-1.5"
-        >
-          <option value="">Agent default</option>
-          <option v-for="effort in effortChoices" :key="effort.id" :value="effort.id">
-            {{ effort.label }}
-          </option>
-        </select>
-      </div>
-      <div class="grid min-w-0 gap-1">
-        <label class="text-xs" :for="`${uid}-fast`">Fast</label>
-        <select
-          :id="`${uid}-fast`"
-          v-model="draft.fast"
-          data-testid="profile-fast"
-          :disabled="disabled"
-          class="min-w-0 rounded bg-input px-2 py-1.5"
-        >
-          <option value="">Agent default</option>
-          <option v-for="choice in fastChoices" :key="choice.id" :value="choice.id">
-            {{ choice.label }}
-          </option>
-        </select>
+          empty-label="Agent default"
+          field-class="bg-input"
+          testid="profile-effort"
+          @update:model-value="draft.effort = $event"
+        />
       </div>
       <div class="grid min-w-0 gap-1">
         <label class="text-xs" :for="`${uid}-thinking`">Thinking</label>
-        <select
+        <ModelCombobox
           :id="`${uid}-thinking`"
-          v-model="draft.thinking"
-          data-testid="profile-thinking"
+          :choices="thinkingChoices"
+          :model-value="draft.thinking"
           :disabled="disabled"
-          class="min-w-0 rounded bg-input px-2 py-1.5"
-        >
-          <option value="">Agent default</option>
-          <option v-for="choice in thinkingChoices" :key="choice.id" :value="choice.id">
-            {{ choice.label }}
-          </option>
-        </select>
+          empty-label="Agent default"
+          field-class="bg-input"
+          testid="profile-thinking"
+          @update:model-value="draft.thinking = $event"
+        />
       </div>
-    </div>
-
-    <div class="grid min-w-0 gap-1">
-      <label class="text-xs" :for="`${uid}-protocol`">Protocol</label>
-      <select
-        :id="`${uid}-protocol`"
-        v-model="draft.protocol"
-        :disabled="disabled"
-        class="min-w-0 rounded bg-input px-2 py-1.5"
-      >
-        <option value="">Agent default</option>
-        <option v-if="selectedAgent?.supports_acp !== false" value="acp">ACP</option>
-        <option value="terminal">Terminal</option>
-      </select>
-    </div>
-    <div class="grid min-w-0 gap-1">
-      <label class="text-xs" :for="`${uid}-mode`">Mode</label>
-      <select
-        :id="`${uid}-mode`"
-        v-model="draft.mode"
-        data-testid="profile-mode"
-        :disabled="disabled"
-        class="min-w-0 rounded bg-input px-2 py-1.5"
-      >
-        <option
-          v-for="mode in ['auto', 'default', 'acceptEdits', 'plan', 'bypassPermissions']"
-          :key="mode"
-        >
-          {{ mode }}
-        </option>
-      </select>
+      <div class="grid min-w-0 gap-1">
+        <label class="text-xs" :for="`${uid}-fast`">Fast</label>
+        <ModelCombobox
+          :id="`${uid}-fast`"
+          :choices="fastChoices"
+          :model-value="draft.fast"
+          :disabled="disabled"
+          empty-label="Agent default"
+          field-class="bg-input"
+          testid="profile-fast"
+          @update:model-value="draft.fast = $event"
+        />
+      </div>
+      <div class="grid min-w-0 gap-1">
+        <label class="text-xs" :for="`${uid}-mode`">Mode</label>
+        <ModelCombobox
+          :id="`${uid}-mode`"
+          :choices="modeChoices"
+          :model-value="draft.mode"
+          :disabled="disabled"
+          placeholder=""
+          field-class="bg-input"
+          testid="profile-mode"
+          @update:model-value="draft.mode = $event"
+        />
+      </div>
+      <div class="grid min-w-0 gap-1">
+        <label class="text-xs" :for="`${uid}-protocol`">Protocol</label>
+        <ModelCombobox
+          :id="`${uid}-protocol`"
+          :choices="protocolChoices"
+          :model-value="draft.protocol"
+          :disabled="disabled"
+          empty-label="Agent default"
+          field-class="bg-input"
+          @update:model-value="draft.protocol = $event"
+        />
+      </div>
     </div>
 
     <div class="grid min-w-0 gap-1">

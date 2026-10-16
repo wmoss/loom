@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::acp::{AcpLaunch, NewOrLoad};
 use crate::backend;
+pub use crate::catalog::model_successor;
 use crate::custom_agents::CustomAgent;
 use crate::db::Db;
 use weaver_core::agent::{hooks_json, HookMode};

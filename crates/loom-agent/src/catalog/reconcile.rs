@@ -161,6 +161,9 @@ pub async fn reconcile_open<S: ProbeSession>(
         }
     }
     store::stamp_fingerprint(db, harness, fingerprint).await?;
+    // Both scopes prune ids the harness no longer lists. Profiles that saved
+    // one of those ids follow the newest remaining id in the same family.
+    super::succession::upgrade_profiles(db, harness, &keep).await?;
     Ok(())
 }
 
@@ -524,5 +527,39 @@ mod tests {
             ..fresh
         };
         assert!(rows_are_stale(&[old], 7, now));
+    }
+
+    #[tokio::test]
+    async fn a_full_refresh_moves_a_dropped_profile_model_to_its_family() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+        sqlx::query(
+            "UPDATE profiles SET agent_kind = 'cursor-agent', model = 'claude-opus-4-8', revision = 3 WHERE name = 'default'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let mut session = ScriptedSession {
+            handshake: Handshake {
+                version: "1".into(),
+                models: vec![model("claude-opus-5-5"), model("claude-sonnet-5-5")],
+                default_model: Some("claude-opus-5-5".into()),
+                default_options: options_for("claude-opus-5-5"),
+                model_config_id: "model".into(),
+            },
+            fetched: HashMap::from([(
+                "claude-sonnet-5-5".into(),
+                Ok(options_for("claude-sonnet-5-5")),
+            )]),
+        };
+        reconcile_open(&db, "cursor-agent", Scope::Full, "fp", &mut session)
+            .await
+            .unwrap();
+        let (model, revision): (String, i64) =
+            sqlx::query_as("SELECT model, revision FROM profiles WHERE name = 'default'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(model, "claude-opus-5-5");
+        assert_eq!(revision, 4);
     }
 }
