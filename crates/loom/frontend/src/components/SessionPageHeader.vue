@@ -568,6 +568,7 @@ async function submitHandoff() {
                     :agents="handoffAgents"
                     :resolved="handoffResolved"
                     :fallback="lastHandoffResolved"
+                    menu-placement="left"
                     :disabled="
                       handoffBusy || handoffResolving || Boolean(handoffResolved?.policy.strict)
                     "

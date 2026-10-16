@@ -27,31 +27,45 @@ test.describe('settings · profiles', () => {
     const effort = page.getByTestId('profile-effort');
     const fast = page.getByTestId('profile-fast');
     const thinking = page.getByTestId('profile-thinking');
-    await expect(agent.locator('option')).toContainText(['Claude', 'Codex', 'Shell']);
     await expect(fast).toBeVisible();
     await expect(thinking).toBeVisible();
 
-    await agent.selectOption('claude');
-    await expect(model.locator('option').first()).toHaveText('Agent default');
-    await agent.selectOption('codex');
+    await agent.click();
+    await expect(page.getByRole('listbox')).toContainText(['Claude', 'Codex', 'Shell']);
+    await page.getByRole('option', { name: 'Claude', exact: true }).click();
+    await model.click();
+    await expect(page.getByRole('option').first()).toHaveText('Agent default');
+    await page.keyboard.press('Escape');
+
+    await agent.click();
+    await page.getByRole('option', { name: 'Codex', exact: true }).click();
     await expect(model).toHaveValue('');
-    await expect(model.locator('option')).toContainText([
+    await model.click();
+    await expect(page.getByRole('listbox')).toContainText([
       'Agent default',
       ...codex.models.map((choice) => choice.label),
     ]);
     const selectedModel = codex.models[0];
     if (selectedModel) {
-      await model.selectOption(selectedModel.id);
+      await page.getByRole('option', { name: selectedModel.label }).click();
       const efforts = selectedModel.efforts ?? [];
-      await expect(effort.locator('option')).toContainText([
+      await effort.click();
+      await expect(page.getByRole('listbox')).toContainText([
         'Agent default',
         ...efforts.map((choice) => choice.label),
       ]);
-      if (efforts[0]) await effort.selectOption(efforts[0].id);
+      if (efforts[0]) {
+        await page.getByRole('option', { name: efforts[0].label }).click();
+      } else {
+        await page.keyboard.press('Escape');
+      }
     } else {
-      await expect(effort.locator('option')).toHaveText(['Agent default']);
-      await expect(fast.locator('option')).toHaveText(['Agent default']);
-      await expect(thinking.locator('option')).toHaveText(['Agent default']);
+      await page.keyboard.press('Escape');
+      for (const field of [effort, fast, thinking]) {
+        await field.click();
+        await expect(page.getByRole('listbox')).toContainText('Agent default');
+        await page.keyboard.press('Escape');
+      }
     }
     await page.getByTestId('profile-save').click();
     await expect(page.getByText('Saved default.')).toBeVisible();
@@ -81,7 +95,8 @@ test.describe('settings · profiles', () => {
     await page.getByTestId('settings-category-agents').click();
     const mode = page.getByTestId('profile-mode');
     await expect(mode).toHaveValue('auto');
-    await mode.selectOption('bypassPermissions');
+    await mode.click();
+    await page.getByRole('option', { name: 'bypassPermissions', exact: true }).click();
     await page.getByTestId('profile-save').click();
     await expect(page.getByText('Saved default.')).toBeVisible();
 
@@ -172,8 +187,10 @@ for line in sys.stdin:
     });
 
     await page.reload();
-    await page.getByTestId('profile-agent').selectOption('codex');
-    await page.getByLabel('Protocol').selectOption('acp');
+    await page.getByTestId('profile-agent').click();
+    await page.getByRole('option', { name: 'Codex', exact: true }).click();
+    await page.getByLabel('Protocol').click();
+    await page.getByRole('option', { name: 'ACP', exact: true }).click();
     const access = page.getByRole('group', { name: 'MCP access' });
     await access.getByRole('radio', { name: 'groups' }).check();
     await access.getByLabel('docs').check();
