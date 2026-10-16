@@ -606,7 +606,11 @@ export const listArtifactReviews = (id: string, name: string) =>
     session: id,
   });
 
-export const getChanges = (id: string) => invokeOperation('sessions.changes', { session: id });
+export const getChanges = (id: string, rev?: string) =>
+  invokeOperation('sessions.changes', { session: id, ...(rev ? { rev } : {}) });
+
+export const getSessionCommits = (id: string) =>
+  invokeOperation('sessions.commits', { session: id });
 
 export const listChangesReviews = (id: string) =>
   invokeOperation('reviews.list', {
@@ -641,6 +645,13 @@ export const updateReview = (
   reviewId: number,
   body: Omit<OperationInput<'reviews.update'>, 'id'>,
 ) => invokeOperation('reviews.update', { id: reviewId, ...body });
+
+export const replyReviewComment = (session: string, commentId: number, body: string) =>
+  invokeOperation('reviews.comments.reply', {
+    session,
+    comment_id: commentId,
+    body,
+  });
 
 export const deleteReviewComment = (
   reviewId: number,

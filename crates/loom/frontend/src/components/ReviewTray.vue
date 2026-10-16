@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, useId } from 'vue';
+import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue';
 import type { Review } from '../types';
 import InlineConfirm from './InlineConfirm.vue';
 
@@ -15,8 +15,19 @@ const props = defineProps<{
   submitting: boolean;
   discarding: boolean;
   deliveryErrors: Record<number, string>;
+  /** The signed-in operator's username: only a review's creator may send
+   *  its queued replies back to the session. */
+  operator: string;
+  /** A reply round is in flight from this surface. */
+  sendingReplies: boolean;
   subjectLabel: string;
   discardAction: () => Promise<void>;
+  /** Floats bottom-right and expands upward. Set false to sit inline (e.g.
+   *  in a header) with its panel popping down below it instead; that pop-down
+   *  panel overlays page content and minimizes on outside clicks, while the
+   *  floating dock stays put. Pass it at every call site: an absent Boolean
+   *  prop casts to false, never undefined. */
+  floating?: boolean;
 }>();
 const emit = defineEmits<{
   'update:open': [value: boolean];
@@ -28,10 +39,50 @@ const emit = defineEmits<{
   retarget: [];
   submit: [];
   retry: [review: Review];
+  sendReplies: [review: Review];
 }>();
 const toggleEl = ref<HTMLButtonElement | null>(null);
+const rootEl = ref<HTMLElement | null>(null);
+const overallInput = ref<HTMLTextAreaElement | null>(null);
 const overallId = `review-overall-${useId()}`;
 defineExpose({ focusToggle: () => toggleEl.value?.focus() });
+
+const isFloating = computed(() => props.floating !== false);
+
+// The pop-down panel overlays page content, so a pointerdown outside the tray
+// minimizes it back to its toggle. The textarea's blur never fires when its
+// v-if removal unfocuses it, so flush the note through the save handler first.
+function closeTray() {
+  emit('saveOverall');
+  emit('update:open', false);
+}
+
+function onDocPointerDown(event: PointerEvent) {
+  if (rootEl.value?.contains(event.target as Node)) return;
+  closeTray();
+}
+
+watch(
+  () => props.open,
+  (open) => {
+    document.removeEventListener('pointerdown', onDocPointerDown);
+    if (open && !isFloating.value) document.addEventListener('pointerdown', onDocPointerDown);
+    // Focus the note once the tray opens — retried over the next half-second
+    // because a single nextTick+rAF attempt silently no-ops whenever the
+    // textarea mounts or re-renders a frame later (the reopen path under
+    // load), and nothing else ever retries.
+    if (open)
+      void nextTick(() => {
+        const attempt = (remaining: number) => {
+          const input = overallInput.value;
+          if (input && document.activeElement !== input) input.focus();
+          if (remaining > 0) requestAnimationFrame(() => attempt(remaining - 1));
+        };
+        requestAnimationFrame(() => attempt(30));
+      });
+  },
+);
+onBeforeUnmount(() => document.removeEventListener('pointerdown', onDocPointerDown));
 
 const failed = computed(() =>
   props.reviews.filter(
@@ -45,19 +96,54 @@ const recent = computed(
       .filter((review) => review.status === 'submitted' && !review.legacy)
       .sort((a, b) => b.id - a.id)[0] ?? null,
 );
+
+// Submitted reviews whose operator replies have not been sent back to the
+// session yet — the reviewer's answers waiting for the next round.
+const replyQueues = computed(() =>
+  props.reviews.filter(
+    (review) => review.status === 'submitted' && !review.legacy && review.pending_replies > 0,
+  ),
+);
+
+// Cmd/Ctrl+Enter in the overall note submits without requiring a blur first —
+// `submit` (via the draft controller's freeze) already flushes any dirty note
+// before it actually submits, so this only guards the conditions that would
+// make the request invalid outright, not "unsaved" itself.
+function submitShortcut() {
+  if (props.layoutBusy || props.submitting || props.discarding) return;
+  if (props.draft) {
+    if (
+      (!props.draft.comments.length && !props.overallNote.trim()) ||
+      (props.draft.outdated && !props.acknowledgeOutdated)
+    ) {
+      return;
+    }
+  } else if (!props.overallNote.trim()) {
+    return;
+  }
+  emit('submit');
+}
 </script>
 
 <template>
   <aside
-    class="absolute bottom-3 right-3 z-20 w-[min(28rem,calc(100%-1.5rem))] rounded-lg border border-line bg-surface shadow-xl"
+    ref="rootEl"
+    :class="
+      isFloating
+        ? 'absolute bottom-3 right-3 z-20 w-[min(28rem,calc(100%-1.5rem))] rounded-lg border border-line bg-surface shadow-xl'
+        : 'relative shrink-0'
+    "
     data-testid="review-tray"
     aria-label="Review tray"
   >
-    <div class="flex min-h-10 items-center gap-1.5 px-2">
+    <div
+      class="flex min-h-8 items-center gap-1.5"
+      :class="isFloating ? 'min-h-10 px-2' : 'rounded border border-line bg-surface px-1.5'"
+    >
       <button
         ref="toggleEl"
         type="button"
-        class="min-w-0 flex-1 px-1 py-2 text-left text-xs font-semibold text-fg"
+        class="min-w-0 flex-1 px-1 py-1.5 text-left text-xs font-semibold text-fg"
         data-testid="review-tray-toggle"
         :aria-expanded="open"
         @click="emit('update:open', !open)"
@@ -68,8 +154,14 @@ const recent = computed(
           <span v-if="failed.length" class="ml-1 text-block">
             · {{ failed.length }} delivery failed
           </span>
+          <span v-if="replyQueues.length" class="ml-1 text-block">
+            · {{ replyQueues.length }} replies to send
+          </span>
         </template>
         <template v-else-if="failed.length">Review delivery · {{ failed.length }} failed</template>
+        <template v-else-if="replyQueues.length">
+          Replies to send · {{ replyQueues.length }} review{{ replyQueues.length === 1 ? '' : 's' }}
+        </template>
         <template v-else-if="recent">Review submitted · {{ recent.delivery_state }}</template>
         <template v-else>Review {{ subjectLabel }}</template>
       </button>
@@ -101,7 +193,47 @@ const recent = computed(
       </button>
     </div>
 
-    <div v-if="open" class="max-h-[min(60vh,34rem)] overflow-auto border-t border-line p-3">
+    <div
+      v-if="open"
+      class="max-h-[min(60vh,34rem)] overflow-auto p-3"
+      :class="
+        isFloating
+          ? 'border-t border-line'
+          : 'absolute right-0 top-full z-30 mt-1 w-[min(28rem,calc(100vw-1.5rem))] rounded-lg border border-line bg-surface shadow-xl'
+      "
+    >
+      <div
+        v-if="replyQueues.length"
+        class="mb-3 space-y-2"
+        aria-label="Replies waiting to reach the session"
+      >
+        <div
+          v-for="item in replyQueues"
+          :key="item.id"
+          class="rounded border border-line bg-subtle/50 p-2 text-xs"
+          :data-testid="`review-reply-queue-${item.id}`"
+        >
+          <p class="font-medium">
+            Review {{ item.id }} · {{ item.pending_replies }} repl{{
+              item.pending_replies === 1 ? 'y' : 'ies'
+            }}
+            waiting to reach the session
+          </p>
+          <p class="mt-1 text-muted">
+            Sending delivers them to the reviewed session, like the original comments.
+          </p>
+          <button
+            v-if="item.created_by === operator"
+            type="button"
+            class="btn-primary mt-2 px-2 py-1 text-xs"
+            :disabled="sendingReplies"
+            :data-testid="`review-send-replies-${item.id}`"
+            @click="emit('sendReplies', item)"
+          >
+            Send replies
+          </button>
+        </div>
+      </div>
       <div v-if="failed.length" class="mb-3 space-y-2" aria-label="Failed review deliveries">
         <div
           v-for="item in failed"
@@ -172,6 +304,7 @@ const recent = computed(
         </label>
         <textarea
           :id="overallId"
+          ref="overallInput"
           :value="overallNote"
           rows="3"
           class="mt-1 w-full resize-y rounded border border-line bg-input p-2 text-xs text-fg outline-none focus:border-accent"
@@ -180,6 +313,9 @@ const recent = computed(
           :disabled="layoutBusy || submitting || discarding"
           @input="emit('update:overallNote', ($event.target as HTMLTextAreaElement).value)"
           @blur="emit('saveOverall')"
+          @keydown.esc.prevent="closeTray"
+          @keydown.ctrl.enter.prevent="submitShortcut"
+          @keydown.meta.enter.prevent="submitShortcut"
         ></textarea>
         <p v-if="summarySaving" class="mt-1 text-2xs text-faint" aria-live="polite">
           Saving overall note…
@@ -234,7 +370,6 @@ const recent = computed(
               submitting ||
               layoutBusy ||
               discarding ||
-              summarySaving ||
               (!draft.comments.length && !overallNote.trim()) ||
               (draft.outdated && !acknowledgeOutdated)
             "
@@ -260,6 +395,7 @@ const recent = computed(
         </label>
         <textarea
           :id="overallId"
+          ref="overallInput"
           :value="overallNote"
           rows="3"
           class="mt-1 w-full resize-y rounded border border-line bg-input p-2 text-xs text-fg outline-none focus:border-accent"
@@ -268,6 +404,9 @@ const recent = computed(
           :disabled="layoutBusy || submitting || discarding"
           @input="emit('update:overallNote', ($event.target as HTMLTextAreaElement).value)"
           @blur="emit('saveOverall')"
+          @keydown.esc.prevent="closeTray"
+          @keydown.ctrl.enter.prevent="submitShortcut"
+          @keydown.meta.enter.prevent="submitShortcut"
         ></textarea>
         <p v-if="summarySaving" class="mt-1 text-2xs text-faint" aria-live="polite">
           Saving overall note…

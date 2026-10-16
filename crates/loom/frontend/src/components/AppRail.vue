@@ -139,7 +139,9 @@ const mobileMoreMain = computed(() => mobileMain.value.filter((item) => item.to 
 const mobileMoreActive = computed(
   () =>
     (sessionMode.value &&
-      ['terminal', 'changes', 'shells'].includes(mobileSessionNavigation.value?.active ?? '')) ||
+      ['terminal', 'commits', 'changes', 'shells'].includes(
+        mobileSessionNavigation.value?.active ?? '',
+      )) ||
     (!sessionMode.value && (route.path.startsWith('/settings') || route.path.startsWith('/shell'))),
 );
 
@@ -246,6 +248,15 @@ onBeforeUnmount(() => closeMore());
           >
             <span class="block font-medium">Details & actions</span>
             <span class="block text-2xs text-faint">Status, links, lifecycle</span>
+          </button>
+          <button
+            type="button"
+            class="min-h-11 rounded border border-line bg-input px-3 py-2 text-left text-sm text-fg"
+            data-testid="mobile-session-commits"
+            @click="selectSessionSurface('commits')"
+          >
+            <span class="block font-medium">Commits</span>
+            <span class="block text-2xs text-faint">The branch's own commits</span>
           </button>
           <button
             type="button"
