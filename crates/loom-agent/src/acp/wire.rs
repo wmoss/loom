@@ -450,10 +450,18 @@ pub struct SteeringCapability {
 pub const PROTOCOL_VERSION: u16 = 1;
 
 /// `initialize` params.
-pub fn initialize_params() -> Value {
+///
+/// Cursor only splits its bundled `model[effort=…,fast=…]` value into separate
+/// `model`/`effort`/`fast` config options once the client opts into
+/// `parameterizedModelPicker`. That `_meta` is sent only for the Cursor harness.
+pub fn initialize_params(harness: &str) -> Value {
+    let mut client_capabilities = serde_json::Map::new();
+    if let Some(meta) = crate::catalog::selectors::initialize_meta(harness) {
+        client_capabilities.insert("_meta".to_string(), meta);
+    }
     serde_json::json!({
         "protocolVersion": PROTOCOL_VERSION,
-        "clientCapabilities": {},
+        "clientCapabilities": client_capabilities,
     })
 }
 
@@ -865,12 +873,20 @@ mod tests {
 
     #[test]
     fn builds_request_and_response_lines() {
-        let line = request_line(1, method::INITIALIZE, initialize_params());
+        let line = request_line(1, method::INITIALIZE, initialize_params("claude"));
         assert!(line.ends_with(b"\n"));
         let v: Value = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
         assert_eq!(v["method"], "initialize");
         assert_eq!(v["id"], 1);
         assert_eq!(v["params"]["protocolVersion"], 1);
+        assert!(v["params"]["clientCapabilities"].get("_meta").is_none());
+
+        let cursor = request_line(1, method::INITIALIZE, initialize_params("cursor-agent"));
+        let cursor: Value = serde_json::from_slice(&cursor[..cursor.len() - 1]).unwrap();
+        assert_eq!(
+            cursor["params"]["clientCapabilities"]["_meta"]["parameterizedModelPicker"],
+            true
+        );
 
         let resource = json!({
             "type": "resource_link",
