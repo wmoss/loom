@@ -19,9 +19,6 @@ const props = withDefaults(
     emptyLabel?: string;
     /** Commit text that matches no choice. Model fields do; the others revert. */
     allowCustom?: boolean;
-    /** Show the choice id beside its label. Agent fields hide it; the id is
-     *  the stored kind, and the label is the name the operator picks. */
-    showId?: boolean;
     /** Which way the option list prefers to grow. It flips when that side
      *  would leave the viewport, so a field on the screen edge opens inward. */
     placement?: 'left' | 'right';
@@ -33,7 +30,6 @@ const props = withDefaults(
     placeholder: 'Agent default',
     emptyLabel: '',
     allowCustom: false,
-    showId: true,
     placement: 'right',
   },
 );
@@ -70,15 +66,6 @@ const listed = computed<Choice[]>(() => {
     (choice) => choice.id.toLowerCase().includes(q) || choice.label.toLowerCase().includes(q),
   );
 });
-
-/** Whether `choice.id` is just the label plus a bracketed parameter list
- *  (Cursor's `grok-4.6[effort=high,fast=true]`) — a launch detail the id
- *  badge would otherwise surface for no reason, since it adds nothing the
- *  label doesn't already say. An id that only restates the label is the same. */
-function idIsRedundant(choice: Choice): boolean {
-  if (!choice.id || choice.id.toLowerCase() === choice.label.toLowerCase()) return true;
-  return choice.id.startsWith(`${choice.label}[`) && choice.id.endsWith(']');
-}
 
 function placeMenu() {
   const input = anchor.value;
@@ -238,6 +225,7 @@ function commit() {
       autocomplete="off"
       spellcheck="false"
       :placeholder="placeholder"
+      :title="modelValue || undefined"
       class="min-w-0 w-full rounded px-2 py-1.5 text-fg outline-none focus:ring-1 ring-accent disabled:opacity-60"
       :class="fieldClass"
       @focus="onFocus"
@@ -262,16 +250,12 @@ function commit() {
             role="option"
             :aria-selected="activeOption === index"
             data-testid="model-option"
+            :title="choice.id"
             @mousedown.prevent="pick(choice)"
-            class="flex w-full min-w-0 items-baseline gap-2 px-2 py-1.5 text-left text-fg hover:bg-subtle"
+            class="block w-full min-w-0 whitespace-nowrap px-2 py-1.5 text-left text-sm text-fg hover:bg-subtle"
             :class="{ 'bg-subtle': activeOption === index }"
           >
-            <span class="whitespace-nowrap text-sm">{{ choice.label }}</span>
-            <code
-              v-if="showId && !idIsRedundant(choice)"
-              class="truncate font-mono text-xs text-muted"
-              >{{ choice.id }}</code
-            >
+            {{ choice.label }}
           </button>
         </li>
       </ul>

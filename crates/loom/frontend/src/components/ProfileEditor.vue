@@ -208,7 +208,6 @@ watch(
         :model-value="draft.agent_kind"
         :disabled="disabled"
         placeholder="Select an agent"
-        :show-id="false"
         field-class="bg-input"
         testid="profile-agent"
         @update:model-value="onAgentPick"

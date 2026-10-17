@@ -97,7 +97,6 @@ function locked(field: keyof LaunchOverrides): boolean {
           :disabled="locked('agent')"
           :placement="menuPlacement"
           placeholder="Select an agent"
-          :show-id="false"
           field-class="bg-surface"
           testid="override-agent"
           @update:model-value="set('agent', $event)"
