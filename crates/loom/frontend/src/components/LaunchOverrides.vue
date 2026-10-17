@@ -211,14 +211,14 @@ function locked(field: keyof LaunchOverrides): boolean {
 
         <label class="text-xs">
           <span class="mb-1 flex items-center justify-between gap-2">
-            <span class="font-medium text-fg">Session type</span>
+            <span class="font-medium text-fg">Class</span>
             <span :class="changed('class') ? 'text-accent' : 'text-faint'">
               {{ changed('class') ? 'changed' : 'from profile' }}
             </span>
           </span>
           <select
             :id="`${uid}-class`"
-            aria-label="Session type"
+            aria-label="Class"
             :value="value('class')"
             :disabled="locked('class')"
             data-testid="override-class"

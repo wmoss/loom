@@ -310,20 +310,20 @@ watch(
           @update:model-value="draft.protocol = $event"
         />
       </div>
+      <div class="grid min-w-0 gap-1">
+        <label class="text-xs" :for="`${uid}-class`">Class</label>
+        <select
+          :id="`${uid}-class`"
+          v-model="draft.class"
+          :disabled="disabled"
+          class="min-w-0 rounded bg-input px-2 py-1.5"
+        >
+          <option value="interactive">Interactive</option>
+          <option value="automation">Automation</option>
+        </select>
+      </div>
     </div>
 
-    <div class="grid min-w-0 gap-1">
-      <label class="text-xs" :for="`${uid}-class`">Class</label>
-      <select
-        :id="`${uid}-class`"
-        v-model="draft.class"
-        :disabled="disabled"
-        class="min-w-0 rounded bg-input px-2 py-1.5"
-      >
-        <option value="interactive">Interactive</option>
-        <option value="automation">Automation</option>
-      </select>
-    </div>
     <div class="grid min-w-0 gap-1">
       <label class="text-xs" :for="`${uid}-prelude`">Prelude</label>
       <select
