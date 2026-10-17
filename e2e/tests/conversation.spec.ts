@@ -231,10 +231,14 @@ test.describe('conversation view', () => {
     });
     await expect(button).toBeVisible();
 
-    // Clicking scrolls all the way to the end and hides the button again.
+    // Clicking scrolls all the way to the end — exact landing, not merely inside
+    // the pin's 120px "near the foot" window — and hides the button again.
     await button.click();
-    await expect.poll(() => footDistance(conv)).toBeLessThan(120);
+    await expect.poll(() => footDistance(conv)).toBeLessThan(2);
+    await expect(page.getByText('Progress note 40', { exact: false })).toBeVisible();
     await expect(button).toBeHidden();
+    // The button unmounts on activation; focus stays in the conversation.
+    await expect(conv).toBeFocused();
   });
 
   test('folds tool activity and run-length collapses repeated calls', async ({ page, weaver }) => {

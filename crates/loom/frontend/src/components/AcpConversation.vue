@@ -1497,6 +1497,12 @@ function onScroll() {
   trackPin();
   updateActive();
 }
+// Activating the floating button unmounts it. Hand focus to the transcript so a
+// keyboard reader stays in the conversation instead of falling back to <body>.
+function jumpToEnd() {
+  scrollToEnd();
+  convScroll.value?.focus({ preventScroll: true });
+}
 
 // ── Jump-list scroll-spy ─────────────────────────────────────────────────────
 const activeAnchor = ref('');
@@ -1550,6 +1556,7 @@ function goTo(anchor: string) {
           ref="convScroll"
           data-testid="acp-conversation"
           class="acp-scroll min-h-0 flex-1 overflow-auto pb-6 pr-1"
+          tabindex="-1"
           @scroll.passive="onScroll"
         >
           <div ref="convBody">
@@ -1934,7 +1941,7 @@ function goTo(anchor: string) {
               >
             </div>
           </div>
-          <ScrollToEndButton :visible="!pinned" @click="scrollToEnd" />
+          <ScrollToEndButton :visible="!pinned" @click="jumpToEnd" />
         </div>
 
         <!-- Right rail: user-turn jump list + the current plan. -->
