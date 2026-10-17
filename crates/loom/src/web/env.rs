@@ -17,12 +17,12 @@ async fn env_vars(db: &Db) -> ApiResult<Vec<AgentEnvVarView>> {
     Ok(agent_env::list(db).await?)
 }
 
-/// A harness API key lives in the default profile's environment. Changing it
-/// is a full catalogue refresh for the harness that reads that key.
+/// A harness credential lives in the default profile's environment. Changing it
+/// is a full catalogue refresh for the harness that reads that credential.
 pub(super) fn invalidate_cursor_catalog_if_credential(db: &crate::db::Db, name: &str) {
     let harness = match name {
         "CURSOR_API_KEY" | "CURSOR_AUTH_TOKEN" => "cursor-agent",
-        "ANTHROPIC_API_KEY" => "claude",
+        "ANTHROPIC_API_KEY" | "CLAUDE_CODE_OAUTH_TOKEN" => "claude",
         "OPENAI_API_KEY" => "codex",
         "OPENCODE_AUTH_JSON" | "OPENCODE_CONFIG_JSON" => "opencode",
         _ => return,

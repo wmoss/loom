@@ -109,7 +109,8 @@ and why; you don't hand-edit `.env` itself.
 | `LOOM_GITHUB_APP_ID` / `_PRIVATE_KEY` | **yes** | GitHub App identity Loom uses to mint repository-scoped installation tokens for clones, polling, replies, server-side GitHub tools, and profile-approved interactive sessions. |
 | `LOOM_GITHUB_WEBHOOK_SECRET` | for `@loom` | Shared secret for the inbound webhook; must match the secret on the GitHub webhook. Until set, the webhook rejects every delivery. |
 | `LOOM_SLACK_APP_TOKEN` / `LOOM_SLACK_BOT_TOKEN` | for `/marinbot` | App-level and bot OAuth tokens for the Slack Socket Mode trigger. Both unset (the default) leaves it off. See [docs/slack-trigger.md](../docs/slack-trigger.md). |
-| `ANTHROPIC_API_KEY` | for Claude | API key for the Claude agents. Alternatively log in interactively (see [first-run](#agent-authentication)). |
+| `ANTHROPIC_API_KEY` | for Claude | API key for the Claude agents. Alternatively set `CLAUDE_CODE_OAUTH_TOKEN` or log in interactively (see [first-run](#agent-authentication)). |
+| `CLAUDE_CODE_OAUTH_TOKEN` | for Claude | Long-lived OAuth token from `claude setup-token`, as an alternative to `ANTHROPIC_API_KEY`. Claude uses the API key when both are set. The token is not refreshed; run `claude setup-token` again and replace it when it expires. |
 | `OPENAI_API_KEY` | for Codex | API key for the Codex agents; only needed if you launch the `codex` runtime. Alternatively log in interactively (see [first-run](#agent-authentication)). |
 | `LOOM_AGENTS` | no (`claude,codex`) | Comma-separated subset of `claude,codex,opencode,cursor-agent` for `loom-entrypoint` to install into the container. Add `opencode` and/or `cursor-agent` to enable those runtimes; see [Agent runtime](#agent-runtime--client-packages). |
 | `CURSOR_API_KEY` | for Cursor | User API key for the `cursor-agent` CLI (Cursor Dashboard → API Keys). Alternatively log in interactively or set `CURSOR_AUTH_TOKEN` (see [first-run](#agent-authentication)). Only relevant if `cursor-agent` is in `LOOM_AGENTS`. |
@@ -140,9 +141,10 @@ model-provider keys. Run
 `loom setup secrets --config /home/app/loom.toml` via `docker compose exec loom`
 against the running deploy, or as part of the [Quick start](#quick-start)
 sequence before first start. It prompts for `ANTHROPIC_API_KEY`,
-`OPENAI_API_KEY`, `CURSOR_API_KEY`, `CURSOR_AUTH_TOKEN`, `OPENCODE_AUTH_JSON`,
-and `OPENCODE_CONFIG_JSON`, and stores the first four as operator environment
-variables, live for every session from then on, no restart.
+`CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `CURSOR_API_KEY`,
+`CURSOR_AUTH_TOKEN`, `OPENCODE_AUTH_JSON`, and `OPENCODE_CONFIG_JSON`, and
+stores the first five as operator environment variables, live for every
+session from then on, no restart.
 `OPENCODE_AUTH_JSON` and `OPENCODE_CONFIG_JSON` only ever land in `loom.toml` —
 they're files Opencode reads, not env vars, so they need a restart (see
 [Agent authentication](#agent-authentication)). Leave
@@ -341,9 +343,20 @@ login — e.g. `docker compose exec loom loom token add ci`.
 ### Agent authentication
 
 Loom intentionally shares one Claude account and one Codex account across
-sessions. If you did not set `ANTHROPIC_API_KEY`, log in to Claude once
-interactively; the credentials persist in `~/.claude.json` on the `loom_home`
-volume:
+sessions. Claude accepts an API key, a long-lived OAuth token, or an
+interactive login.
+
+`ANTHROPIC_API_KEY` bills the Anthropic Console. `CLAUDE_CODE_OAUTH_TOKEN` is
+the token `claude setup-token` prints; generate it on a machine that can
+complete the browser login, then paste it with `loom setup secrets` or set
+`claude_code_oauth_token` in `loom.toml`. Claude Code does not refresh that
+token, so replace it when it expires. When both are set, Claude uses the API
+key. `loom setup secrets` stores either value on the default profile. An
+env-cleared profile uses it only when that profile carries the variable or
+names it in the ambient allowlist.
+
+With neither value set, log in to Claude once interactively; the credentials
+persist in `~/.claude.json` on the `loom_home` volume:
 
 ```sh
 docker compose exec loom claude    # follow the prompts, then exit

@@ -190,7 +190,7 @@ pub async fn credential_fingerprint(db: &Db, harness: &str) -> String {
     let keys: &[&str] = match harness {
         "cursor-agent" => &["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"],
         "opencode" => &["OPENCODE_AUTH_JSON", "OPENCODE_CONFIG_JSON"],
-        "claude" => &["ANTHROPIC_API_KEY"],
+        "claude" => &["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"],
         "codex" => &["OPENAI_API_KEY"],
         _ => &[],
     };

@@ -739,6 +739,10 @@ pub(crate) async fn cmd_setup_secrets(opts: SecretsOpts) -> Result<()> {
         "ANTHROPIC_API_KEY",
         existing_names.contains("ANTHROPIC_API_KEY"),
     )?;
+    let claude_oauth = prompt_secret(
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        existing_names.contains("CLAUDE_CODE_OAUTH_TOKEN"),
+    )?;
     let openai = prompt_secret("OPENAI_API_KEY", existing_names.contains("OPENAI_API_KEY"))?;
     let cursor = prompt_secret("CURSOR_API_KEY", existing_names.contains("CURSOR_API_KEY"))?;
     let cursor_auth_token = prompt_secret(
@@ -755,6 +759,7 @@ pub(crate) async fn cmd_setup_secrets(opts: SecretsOpts) -> Result<()> {
     )?;
 
     if anthropic.is_none()
+        && claude_oauth.is_none()
         && openai.is_none()
         && cursor.is_none()
         && cursor_auth_token.is_none()
@@ -769,6 +774,10 @@ pub(crate) async fn cmd_setup_secrets(opts: SecretsOpts) -> Result<()> {
     if let Some(v) = &anthropic {
         crate::agent_env::set(&db, "ANTHROPIC_API_KEY", v).await?;
         stored.push("ANTHROPIC_API_KEY");
+    }
+    if let Some(v) = &claude_oauth {
+        crate::agent_env::set(&db, "CLAUDE_CODE_OAUTH_TOKEN", v).await?;
+        stored.push("CLAUDE_CODE_OAUTH_TOKEN");
     }
     if let Some(v) = &openai {
         crate::agent_env::set(&db, "OPENAI_API_KEY", v).await?;
@@ -793,6 +802,9 @@ pub(crate) async fn cmd_setup_secrets(opts: SecretsOpts) -> Result<()> {
     let mut updates: Vec<(&str, &str)> = Vec::new();
     if let Some(v) = &anthropic {
         updates.push(("ANTHROPIC_API_KEY", v.as_str()));
+    }
+    if let Some(v) = &claude_oauth {
+        updates.push(("CLAUDE_CODE_OAUTH_TOKEN", v.as_str()));
     }
     if let Some(v) = &openai {
         updates.push(("OPENAI_API_KEY", v.as_str()));

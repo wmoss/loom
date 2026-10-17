@@ -57,6 +57,10 @@ pub struct LoomConfig {
     pub github_client_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anthropic_api_key: Option<String>,
+    /// Long-lived token from `claude setup-token`. Claude uses
+    /// `anthropic_api_key` when both are set, and does not refresh this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_oauth_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +204,12 @@ pub static FIELDS: &[FieldSpec] = &[
         secret: true,
         get_fn: |c| c.anthropic_api_key.as_deref(),
         set_fn: |c, v| c.anthropic_api_key = Some(v),
+    },
+    FieldSpec {
+        env_name: "CLAUDE_CODE_OAUTH_TOKEN",
+        secret: true,
+        get_fn: |c| c.claude_code_oauth_token.as_deref(),
+        set_fn: |c, v| c.claude_code_oauth_token = Some(v),
     },
     FieldSpec {
         env_name: "OPENAI_API_KEY",
@@ -521,6 +531,7 @@ mod tests {
                 "LOOM_GITHUB_WEBHOOK_SECRET",
                 "LOOM_GITHUB_CLIENT_SECRET",
                 "ANTHROPIC_API_KEY",
+                "CLAUDE_CODE_OAUTH_TOKEN",
                 "OPENAI_API_KEY",
                 "CURSOR_API_KEY",
                 "CURSOR_AUTH_TOKEN",

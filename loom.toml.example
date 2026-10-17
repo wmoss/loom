@@ -36,7 +36,10 @@ owner_github = "your-github-login"
 # the Claude runtime, openai_api_key the Codex runtime, cursor_api_key the
 # cursor-agent runtime; set only the ones you use (each can also be an
 # interactive `claude` / `codex login` / `cursor-agent login` instead).
+# claude_code_oauth_token is the long-lived token from `claude setup-token`.
+# Claude uses anthropic_api_key when both are set, and does not refresh the token.
 # anthropic_api_key = ""
+# claude_code_oauth_token = ""
 # openai_api_key = ""
 # cursor_api_key = ""
 # cursor_auth_token = ""  # long-lived Cursor session token, as an alternative to cursor_api_key
