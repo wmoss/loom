@@ -467,26 +467,29 @@ The agent tooling the image ships splits by how it updates:
   deploy is unaffected) into the persisted `loom_home` volume (`~/.local/bin`,
   or `~/.opencode/bin` for Opencode), where updates land without a rebuild and
   survive `up`/`down`/recreate.
-  - **Claude and Codex are pinned and required whenever `LOOM_AGENTS` selects
-    them.** On every server start, the entrypoint checks the installed
-    versions against `CLAUDE_CODE_VERSION` (default `2.1.280`) and
-    `CODEX_CLI_VERSION` (default `0.159.1`), installs a mismatched version
-    before starting Loom, and **fails startup** if either pinned version is
-    unavailable — a new image update therefore updates an existing volume's
-    installs too. The ACP adapters are checked and installed the same way, at
-    `CLAUDE_ACP_VERSION=0.81.1` and `CODEX_ACP_VERSION=1.13.1` by default.
+  - **Claude, Codex, and Opencode are pinned and required whenever
+    `LOOM_AGENTS` selects them.** On every server start, the entrypoint checks
+    the installed versions against `CLAUDE_CODE_VERSION` (default `2.1.280`),
+    `CODEX_CLI_VERSION` (default `0.159.1`), and `OPENCODE_VERSION` (default
+    `2.0.31`), installs a mismatched version before starting Loom, and
+    **fails startup** if a pinned version is unavailable — a new image update
+    therefore updates an existing volume's installs too. Claude and Codex also
+    install separate ACP adapters the same way, at `CLAUDE_ACP_VERSION=0.81.1`
+    and `CODEX_ACP_VERSION=1.13.1` by default. Opencode's ACP server is the
+    `opencode acp` subcommand of the pinned CLI, so it has no adapter pin.
     Override a version in the `loom` service's `environment:` in
     [`docker-compose.yml`](standalone/docker-compose.yml).
-  - **Opencode and Cursor are opt-in and best-effort.** Add `opencode`
-    and/or `cursor-agent` to `LOOM_AGENTS` to have `loom-entrypoint` install
-    them; see [Agent authentication](#agent-authentication) for their
-    credentials. Unlike Claude/Codex, a failed or missing install here only
-    warns — the daemon still starts, just without that runtime until a later
-    networked boot. Each updates on demand: remove its binary
-    (`~/.opencode/bin/opencode`, `~/.local/bin/cursor-agent`) and restart the
-    service to reinstall it.
+  - **Cursor is opt-in and updated on boot.** Add `cursor-agent` to
+    `LOOM_AGENTS` to have `loom-entrypoint` install it; see
+    [Agent authentication](#agent-authentication) for its credentials. The
+    installer publishes no version argument. When
+    `~/.local/bin/cursor-agent` is missing, boot runs
+    `https://cursor.com/install`. When it is already there, boot runs
+    `cursor-agent update`. A failed install or update stops startup.
 
-  Set `LOOM_AGENTS` and any version pin in the `loom` service's `environment:`
+  A selected agent's install or update has to succeed or the server does not
+  start. Take that agent out of `LOOM_AGENTS` to boot without it. Set
+  `LOOM_AGENTS` and any version pin in the `loom` service's `environment:`
   in [`docker-compose.yml`](standalone/docker-compose.yml), or as a
   `loom.toml` field rendered into `.env`. `LOOM_AGENTS` only ever *installs* —
   dropping an agent from it doesn't remove a binary a previous boot (with a

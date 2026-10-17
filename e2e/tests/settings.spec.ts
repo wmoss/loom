@@ -26,9 +26,7 @@ test.describe('settings · profiles', () => {
     const model = page.getByTestId('profile-model');
     const effort = page.getByTestId('profile-effort');
     const fast = page.getByTestId('profile-fast');
-    const thinking = page.getByTestId('profile-thinking');
     await expect(fast).toBeVisible();
-    await expect(thinking).toBeVisible();
 
     await agent.click();
     await expect(page.getByRole('listbox')).toContainText(['Claude', 'Codex', 'Shell']);
@@ -61,7 +59,7 @@ test.describe('settings · profiles', () => {
       }
     } else {
       await page.keyboard.press('Escape');
-      for (const field of [effort, fast, thinking]) {
+      for (const field of [effort, fast]) {
         await field.click();
         await expect(page.getByRole('listbox')).toContainText('Agent default');
         await page.keyboard.press('Escape');

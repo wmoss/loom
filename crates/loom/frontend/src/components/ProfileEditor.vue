@@ -52,7 +52,6 @@ const protocolChoices = computed(() => [
   { id: 'terminal', label: 'Terminal' },
 ]);
 const fastChoices = computed(() => selectedModel.value?.fast ?? []);
-const thinkingChoices = computed(() => selectedModel.value?.thinking ?? []);
 const mcpGroups = computed(() => {
   const groups = new Map<string, boolean>();
   for (const set of props.mcpRegistry?.capability_sets ?? []) groups.set(set.group, true);
@@ -209,6 +208,7 @@ watch(
         :model-value="draft.agent_kind"
         :disabled="disabled"
         placeholder="Select an agent"
+        :show-id="false"
         field-class="bg-input"
         testid="profile-agent"
         @update:model-value="onAgentPick"
@@ -270,19 +270,6 @@ watch(
           field-class="bg-input"
           testid="profile-effort"
           @update:model-value="draft.effort = $event"
-        />
-      </div>
-      <div class="grid min-w-0 gap-1">
-        <label class="text-xs" :for="`${uid}-thinking`">Thinking</label>
-        <ModelCombobox
-          :id="`${uid}-thinking`"
-          :choices="thinkingChoices"
-          :model-value="draft.thinking"
-          :disabled="disabled"
-          empty-label="Agent default"
-          field-class="bg-input"
-          testid="profile-thinking"
-          @update:model-value="draft.thinking = $event"
         />
       </div>
       <div class="grid min-w-0 gap-1">

@@ -19,6 +19,9 @@ const props = withDefaults(
     emptyLabel?: string;
     /** Commit text that matches no choice. Model fields do; the others revert. */
     allowCustom?: boolean;
+    /** Show the choice id beside its label. Agent fields hide it; the id is
+     *  the stored kind, and the label is the name the operator picks. */
+    showId?: boolean;
     /** Which way the option list prefers to grow. It flips when that side
      *  would leave the viewport, so a field on the screen edge opens inward. */
     placement?: 'left' | 'right';
@@ -30,6 +33,7 @@ const props = withDefaults(
     placeholder: 'Agent default',
     emptyLabel: '',
     allowCustom: false,
+    showId: true,
     placement: 'right',
   },
 );
@@ -234,7 +238,7 @@ function commit() {
       autocomplete="off"
       spellcheck="false"
       :placeholder="placeholder"
-      class="min-w-0 w-full rounded px-2 py-1.5 outline-none focus:ring-1 ring-accent disabled:opacity-60"
+      class="min-w-0 w-full rounded px-2 py-1.5 text-fg outline-none focus:ring-1 ring-accent disabled:opacity-60"
       :class="fieldClass"
       @focus="onFocus"
       @input="onInput"
@@ -259,13 +263,15 @@ function commit() {
             :aria-selected="activeOption === index"
             data-testid="model-option"
             @mousedown.prevent="pick(choice)"
-            class="flex w-full min-w-0 items-baseline gap-2 px-2 py-1.5 text-left hover:bg-subtle"
-            :class="{ 'bg-subtle text-fg': activeOption === index }"
+            class="flex w-full min-w-0 items-baseline gap-2 px-2 py-1.5 text-left text-fg hover:bg-subtle"
+            :class="{ 'bg-subtle': activeOption === index }"
           >
             <span class="whitespace-nowrap text-sm">{{ choice.label }}</span>
-            <code v-if="!idIsRedundant(choice)" class="truncate font-mono text-xs text-muted">{{
-              choice.id
-            }}</code>
+            <code
+              v-if="showId && !idIsRedundant(choice)"
+              class="truncate font-mono text-xs text-muted"
+              >{{ choice.id }}</code
+            >
           </button>
         </li>
       </ul>

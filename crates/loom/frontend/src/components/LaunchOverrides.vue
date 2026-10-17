@@ -54,7 +54,6 @@ const protocolChoices = computed(() => [
   { id: 'terminal', label: 'Terminal' },
 ]);
 const fastChoices = computed(() => selectedModel.value?.fast ?? []);
-const thinkingChoices = computed(() => selectedModel.value?.thinking ?? []);
 
 function value(field: keyof LaunchOverrides): string {
   return props.modelValue[field] ?? (settings.value?.[field] as string | undefined) ?? '';
@@ -98,6 +97,7 @@ function locked(field: keyof LaunchOverrides): boolean {
           :disabled="locked('agent')"
           :placement="menuPlacement"
           placeholder="Select an agent"
+          :show-id="false"
           field-class="bg-surface"
           testid="override-agent"
           @update:model-value="set('agent', $event)"
@@ -149,26 +149,6 @@ function locked(field: keyof LaunchOverrides): boolean {
     <details class="rounded border border-line bg-input">
       <summary class="cursor-pointer px-2 py-1.5 text-xs text-muted">Advanced runtime</summary>
       <div class="grid gap-3 border-t border-line p-2 sm:grid-cols-2">
-        <label class="text-xs">
-          <span class="mb-1 flex items-center justify-between gap-2">
-            <span class="font-medium text-fg">Thinking</span>
-            <span :class="changed('thinking') ? 'text-accent' : 'text-faint'">
-              {{ changed('thinking') ? 'changed' : 'from profile' }}
-            </span>
-          </span>
-          <ModelCombobox
-            :id="`${uid}-thinking`"
-            :choices="thinkingChoices"
-            :model-value="value('thinking')"
-            :disabled="locked('thinking')"
-            :placement="menuPlacement"
-            empty-label="Agent default"
-            field-class="bg-surface"
-            testid="override-thinking"
-            @update:model-value="set('thinking', $event)"
-          />
-        </label>
-
         <label class="text-xs">
           <span class="mb-1 flex items-center justify-between gap-2">
             <span class="font-medium text-fg">Fast</span>

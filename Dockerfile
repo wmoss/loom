@@ -542,13 +542,24 @@ if [ "${1:-}" = loom ] && [ "${2:-}" = server ]; then
     fi
   fi
 
-  if want_agent opencode && [ ! -x "$HOME/.opencode/bin/opencode" ]; then
-    echo "loom: installing Opencode CLI into $HOME/.opencode ..." >&2
-    # Native installer; lands on the persisted home volume, at the fixed path
-    # the image's PATH already includes. Non-fatal, like the CLIs above.
-    curl -fsSL https://opencode.ai/install | bash || true
-    [ -x "$HOME/.opencode/bin/opencode" ] \
-      || echo "loom: WARNING: Opencode install failed (offline?); agents lack 'opencode' until a later boot installs it" >&2
+  if want_agent opencode; then
+    opencode_version="${OPENCODE_VERSION:-2.0.31}"
+    # `opencode acp` is this CLI. The v2 installer takes the same kind of
+    # version argument as Claude's and writes ~/.opencode/bin/opencode.
+    opencode_installed="$("$HOME/.opencode/bin/opencode" --version 2>/dev/null || true)"
+    opencode_installed="$(printf '%s\n' "$opencode_installed" | head -n 1)"
+    opencode_installed="${opencode_installed##* }"
+    opencode_installed="${opencode_installed#v}"
+    if [ "$opencode_installed" != "$opencode_version" ]; then
+      echo "loom: installing Opencode $opencode_version into $HOME/.opencode ..." >&2
+      curl -fsSL https://opencode.ai/v2/install | bash -s -- --version "$opencode_version" --no-modify-path
+    fi
+    opencode_installed="$("$HOME/.opencode/bin/opencode" --version 2>/dev/null || true)"
+    opencode_installed="$(printf '%s\n' "$opencode_installed" | head -n 1)"
+    opencode_installed="${opencode_installed##* }"
+    opencode_installed="${opencode_installed#v}"
+    [ "$opencode_installed" = "$opencode_version" ] \
+      || { echo "loom: Opencode $opencode_version is required" >&2; exit 1; }
   fi
   if want_agent opencode && [ -n "${OPENCODE_AUTH_JSON:-}" ]; then
     # Materializes the operator-configured provider credentials (loom_config's
@@ -566,15 +577,21 @@ if [ "${1:-}" = loom ] && [ "${2:-}" = server ]; then
     printf '%s' "$OPENCODE_CONFIG_JSON" > "$HOME/.config/opencode/opencode.json"
     chmod 600 "$HOME/.config/opencode/opencode.json"
   fi
-  if want_agent cursor-agent && [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
-    echo "loom: installing Cursor CLI into $HOME/.local ..." >&2
-    # Native installer; drops `cursor-agent` (plus an `agent` alias) straight
-    # into $HOME/.local/bin, already on PATH. Cursor is useless without
-    # CURSOR_API_KEY (loom_config) or an interactive `cursor-agent login`, but
-    # installing the CLI needs neither. Non-fatal, like the CLIs above.
-    curl -fsS https://cursor.com/install | bash || true
+  if want_agent cursor-agent; then
+    # The installer takes no version. An existing binary updates in place;
+    # a missing one is installed. Either failure stops boot. Drop
+    # cursor-agent from LOOM_AGENTS to start without it.
+    if [ -x "$HOME/.local/bin/cursor-agent" ]; then
+      echo "loom: updating Cursor CLI ..." >&2
+      "$HOME/.local/bin/cursor-agent" update \
+        || { echo "loom: Cursor CLI update failed" >&2; exit 1; }
+    else
+      echo "loom: installing Cursor CLI into $HOME/.local ..." >&2
+      curl -fsS https://cursor.com/install | bash \
+        || { echo "loom: Cursor CLI install failed" >&2; exit 1; }
+    fi
     [ -x "$HOME/.local/bin/cursor-agent" ] \
-      || echo "loom: WARNING: Cursor CLI install failed (offline?); agents lack 'cursor-agent' until a later boot installs it" >&2
+      || { echo "loom: Cursor CLI is required" >&2; exit 1; }
   fi
   # LOOM_AGENTS only ever installs — dropping an agent from it doesn't remove
   # a binary a previous boot (with a different LOOM_AGENTS) already installed
