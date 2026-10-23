@@ -182,6 +182,90 @@ async fn silent_setup_stage_times_out_and_cleans_provider_state() {
     assert!(!backend::has_session(&session.term_session).await);
 }
 
+/// A setup request rejected while the adapter's location plugins are still
+/// activating is retried in place instead of failing the session start.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_setup_error_retries_until_the_adapter_is_ready() {
+    let ts = TestServer::start().await;
+    start_new_with_env(
+        &ts,
+        "acp-readiness-retry",
+        None,
+        None,
+        vec![("FAKE_ACP_UNAVAILABLE_ATTEMPTS".to_string(), "1".to_string())],
+    )
+    .await;
+    assert!(ts.state.acp.is_live("acp-readiness-retry"));
+    ts.client
+        .post(
+            "/api/sessions/prompt/create",
+            json!({ "text": "say:ready", "session": "acp-readiness-retry" }),
+        )
+        .await
+        .unwrap();
+    let chat = poll_chat(
+        &ts,
+        "acp-readiness-retry",
+        Duration::from_secs(5),
+        |blocks| {
+            blocks.iter().any(|block| {
+                block["kind"] == "agent_message" && block["payload"]["text"] == "ready"
+            }) && blocks.iter().any(|block| {
+                block["kind"] == "turn_end" && block["payload"]["stop_reason"] == "end_turn"
+            })
+        },
+    )
+    .await;
+    assert!(!chat["blocks"].as_array().unwrap().is_empty());
+}
+
+/// An exhausted transient setup failure must not erase the loadable session id:
+/// the next wake/adoption needs it to `session/load` instead of opening fresh
+/// and re-sending the goal.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_setup_failure_preserves_the_acp_session_id() {
+    let ts = TestServer::start().await;
+    make_session(&ts, "acp-readiness-keep").await;
+    session_mod::set_acp(&ts.state.db, "acp-readiness-keep", "ses-existing")
+        .await
+        .unwrap();
+    let cwd = ts.repo_path().to_path_buf();
+    let launch = AcpLaunch {
+        additional_directories: Vec::new(),
+        adapter_cmd: agent_cmd(),
+        cwd,
+        env: vec![(
+            "FAKE_ACP_UNAVAILABLE_ATTEMPTS".to_string(),
+            "99".to_string(),
+        )],
+        env_clear: false,
+        mcp_servers: vec![],
+        new_or_load: NewOrLoad::Load {
+            acp_session_id: "ses-existing".to_string(),
+            meta: None,
+        },
+        mode: None,
+        initial_model: None,
+        initial_effort: None,
+        goal: None,
+        setup_timeout: Duration::from_millis(200),
+    };
+    let error = acp::start(&ts.state.acp_ctx(), "acp-readiness-keep", launch)
+        .await
+        .expect_err("an unavailable adapter still fails after the retries");
+    assert!(error.to_string().contains("session/load"), "{error}");
+    let session = session_mod::get(&ts.state.db, "acp-readiness-keep")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.acp_session_id.as_deref(), Some("ses-existing"));
+    assert!(session.acp_inflight.is_none());
+    assert!(!ts.state.acp.is_live("acp-readiness-keep"));
+    assert!(!backend::has_session(&session.term_session).await);
+}
+
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transient_prompt_uses_acp_and_cleans_its_relay() {
@@ -2698,6 +2782,61 @@ async fn prompt_send_now_restarts_an_unsteerable_live_turn() {
             && block["kind"] == "user_message"
             && block["payload"]["text"] == "say:replacement"
     }));
+}
+
+/// A replacement prompt must wait for the adapter to acknowledge the cancelled
+/// prompt. Dispatched too early, an adapter with a single active prompt rejects
+/// it and the replacement turn dies before the model runs.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_now_waits_for_the_cancelled_prompt_before_dispatching() {
+    let ts = TestServer::start().await;
+    start_new_with_env(
+        &ts,
+        "acp-prompt-race",
+        None,
+        None,
+        vec![("FAKE_ACP_SINGLE_PROMPT".to_string(), "1".to_string())],
+    )
+    .await;
+
+    ts.client
+        .post(
+            "/api/sessions/prompt/create",
+            json!({ "text": "wait:3000|say:stale", "session": "acp-prompt-race" }),
+        )
+        .await
+        .unwrap();
+    let sent = ts
+        .client
+        .post(
+            "/api/sessions/prompt/create",
+            json!({ "text": "say:replacement", "send_now": true, "session": "acp-prompt-race" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent["queued"], false, "response: {sent}");
+
+    let chat = poll_chat(&ts, "acp-prompt-race", Duration::from_secs(10), |blocks| {
+        blocks.iter().any(|block| {
+            block["kind"] == "agent_message" && block["payload"]["text"] == "replacement"
+        })
+    })
+    .await;
+    let blocks = chat["blocks"].as_array().unwrap();
+    assert!(blocks.iter().any(|block| {
+        block["turn"] == 0
+            && block["kind"] == "turn_end"
+            && block["payload"]["stop_reason"] == "cancelled"
+    }));
+    assert!(
+        !blocks.iter().any(|block| {
+            block["turn"] == 1
+                && block["kind"] == "turn_end"
+                && block["payload"]["stop_reason"] == "error"
+        }),
+        "the replacement raced the cancelled prompt: {chat}"
+    );
 }
 
 /// Compaction mutates provider-owned conversation state and must finish at its

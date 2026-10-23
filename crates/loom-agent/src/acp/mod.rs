@@ -81,6 +81,30 @@ const ACK_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 /// chatty adapter doesn't turn every delta into a write.
 const ACTIVITY_TOUCH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Setup requests retry this many times when the adapter reports that its
+/// location plugins are still activating.
+const SETUP_READINESS_RETRIES: u32 = 2;
+
+/// Base backoff between setup readiness retries, multiplied by the attempt.
+const SETUP_READINESS_BACKOFF: Duration = Duration::from_millis(500);
+
+/// How long a cancelled turn waits for the adapter's prompt response before
+/// Loom settles the turn locally. Matches opencode's cancel-drain budget.
+const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Whether an adapter's setup error is the transient "not ready yet" class.
+fn retryable_setup_error(error: &Value) -> bool {
+    let text = error.to_string();
+    text.contains("ServiceUnavailableError")
+        || text.contains("Location plugins did not finish activating")
+}
+
+fn retryable_setup_error_anyhow(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("ServiceUnavailableError")
+        || text.contains("Location plugins did not finish activating")
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -1364,7 +1388,15 @@ async fn start_inner(
             if let Some(turn) = latest.as_ref().and_then(session::acp_inflight_turn) {
                 let _ = chat::close_abandoned_turn(&state.db, session_id, turn).await;
             }
-            let _ = session::clear_acp_state(&state.db, session_id).await;
+            if retryable_setup_error_anyhow(&error) {
+                // An adapter that is still activating is not an invalid session
+                // id: keep it so the next attempt can session/load instead of
+                // opening a fresh conversation and re-sending the goal.
+                let _ = session::set_ack_seq(&state.db, session_id, 0).await;
+                let _ = session::set_inflight(&state.db, session_id, None).await;
+            } else {
+                let _ = session::clear_acp_state(&state.db, session_id).await;
+            }
             if let Err(cleanup) = crate::backend::kill_session_and_wait(&relay_name).await {
                 return Err(anyhow!(
                     "{error}; failed to clean up ACP relay after setup error: {cleanup}"
@@ -2183,19 +2215,31 @@ impl Task {
 
         match &launch.new_or_load {
             NewOrLoad::New { cwd, meta } => {
-                let id = self.next_id();
                 let params = wire::new_session_params(
                     &cwd.to_string_lossy(),
                     &launch.mcp_servers,
                     &launch.additional_directories,
                     meta.as_ref(),
                 );
-                self.stream
-                    .write(&wire::request_line(id, method::SESSION_NEW, params))
-                    .await?;
-                let (res, err) = self
-                    .recv_until_response(id, method::SESSION_NEW, launch.setup_timeout, cmd_rx)
-                    .await?;
+                let mut attempts = 0;
+                let (res, err) = loop {
+                    let id = self.next_id();
+                    self.stream
+                        .write(&wire::request_line(id, method::SESSION_NEW, params.clone()))
+                        .await?;
+                    let (res, err) = self
+                        .recv_until_response(id, method::SESSION_NEW, launch.setup_timeout, cmd_rx)
+                        .await?;
+                    if res.is_none()
+                        && err.as_ref().is_some_and(retryable_setup_error)
+                        && attempts < SETUP_READINESS_RETRIES
+                    {
+                        attempts += 1;
+                        tokio::time::sleep(SETUP_READINESS_BACKOFF * attempts).await;
+                        continue;
+                    }
+                    break (res, err);
+                };
                 let res = res.ok_or_else(|| anyhow!("session/new failed: {err:?}"))?;
                 let ns: wire::NewSessionResult = serde_json::from_value(res)?;
                 self.acp_session_id = ns.session_id.clone();
@@ -2225,7 +2269,6 @@ impl Task {
                 // notifications during the load — we already hold it — so suppress
                 // re-journaling for the duration of the call.
                 self.suppress_journal = true;
-                let id = self.next_id();
                 let params = wire::load_session_params(
                     acp_session_id,
                     &launch.cwd.to_string_lossy(),
@@ -2233,14 +2276,35 @@ impl Task {
                     &launch.additional_directories,
                     meta.as_ref(),
                 );
-                self.stream
-                    .write(&wire::request_line(id, method::SESSION_LOAD, params))
-                    .await?;
                 // Full history replays synchronously before the response, so allow more time.
                 let load_timeout = launch.setup_timeout.saturating_mul(4);
-                let (res, err) = self
-                    .recv_until_response(id, method::SESSION_LOAD, load_timeout, cmd_rx)
-                    .await?;
+                let mut attempts = 0;
+                let (res, err) = loop {
+                    let id = self.next_id();
+                    self.stream
+                        .write(&wire::request_line(
+                            id,
+                            method::SESSION_LOAD,
+                            params.clone(),
+                        ))
+                        .await?;
+                    let (res, err) = self
+                        .recv_until_response(id, method::SESSION_LOAD, load_timeout, cmd_rx)
+                        .await?;
+                    if res.is_none()
+                        && err.as_ref().is_some_and(retryable_setup_error)
+                        && attempts < SETUP_READINESS_RETRIES
+                    {
+                        attempts += 1;
+                        // The failed attempt may have streamed part of the replay.
+                        self.message_buf = None;
+                        self.thought_buf = None;
+                        self.tools.clear();
+                        tokio::time::sleep(SETUP_READINESS_BACKOFF * attempts).await;
+                        continue;
+                    }
+                    break (res, err);
+                };
                 self.suppress_journal = false;
                 // Drop any consolidation the suppressed replay left half-open
                 // so it can't flush stale history into a later turn.
@@ -3633,9 +3697,16 @@ impl Task {
             // suppression to that turn and its successor so later prose is
             // never mistaken for adapter chrome.
             self.pending_interrupt_notice_through = Some(self.current_turn + 1);
-            // Cancellation is a client-owned boundary. Some adapters do not
-            // answer the cancelled prompt, so settle loom's journal and
-            // lifecycle immediately after the notification lands.
+            // Answer pending permissions first: the adapter may block the
+            // cancelled prompt's response until they are settled.
+            self.cancel_pending_permissions().await;
+            // Give the adapter a chance to answer the cancelled prompt before
+            // settling locally. A replacement prompt dispatched before that
+            // response can be rejected as "already has an active prompt".
+            self.await_cancelled_prompt().await;
+            // Cancellation is a client-owned boundary. Some adapters still do
+            // not answer the cancelled prompt, so settle the journal and
+            // lifecycle after the response or the settle timeout.
             self.on_turn_end(
                 self.current_turn,
                 Some(json!({ "stopReason": "cancelled" })),
@@ -3646,7 +3717,14 @@ impl Task {
         }
         // ACP requires the client to answer every pending permission request
         // with the `cancelled` outcome when it cancels a turn.
-        for (_, pp) in self.pending_perms.drain() {
+        self.cancel_pending_permissions().await;
+        result
+    }
+
+    /// Answer every pending permission with the `cancelled` outcome.
+    async fn cancel_pending_permissions(&mut self) {
+        let pending: Vec<_> = self.pending_perms.drain().map(|(_, pp)| pp).collect();
+        for pp in pending {
             let _ = self
                 .stream
                 .write(&wire::response_line(
@@ -3655,7 +3733,44 @@ impl Task {
                 ))
                 .await;
         }
-        result
+    }
+
+    /// Wait up to [`CANCEL_SETTLE_TIMEOUT`] for the cancelled prompt's
+    /// response. Frames keep flowing (notifications and permission requests),
+    /// but the matching response is consumed here so the later synthetic
+    /// `on_turn_end` is the only boundary.
+    async fn await_cancelled_prompt(&mut self) {
+        let Some((want, _)) = self.inflight_prompt.take() else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + CANCEL_SETTLE_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                event = self.stream.recv() => match event {
+                    Some(RelayEvent::Frame { seq, payload }) => {
+                        self.highest_seq = seq;
+                        self.touch_activity().await;
+                        if let Ok(inc) = serde_json::from_slice::<Incoming>(&payload) {
+                            let target = inc.kind() == IncomingKind::Response
+                                && inc.id.as_ref().and_then(Value::as_u64) == Some(want);
+                            if target {
+                                break;
+                            }
+                            self.dispatch_frame(seq, inc).await;
+                        }
+                        self.cancel_pending_permissions().await;
+                        let _ = self.maybe_ack().await;
+                    }
+                    Some(RelayEvent::Exit { .. }) | None => break,
+                },
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        let _ = self.maybe_ack().await;
     }
 
     fn resume_automatic_dispatch_on<T>(&mut self, explicit_send: &Result<T>) {
