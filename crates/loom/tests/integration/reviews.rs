@@ -1409,7 +1409,7 @@ async fn an_unstaged_scoped_review_anchors_against_its_own_snapshot() {
 }
 
 #[tokio::test]
-async fn an_operator_reply_round_requeues_the_review_for_delivery() {
+async fn a_follow_up_round_sends_new_comments_and_replies_together() {
     let ts = TestServer::start().await;
     let session = insert_api_session(&ts, "reply-round-delivery").await;
     seed_artifact(&ts, &session).await;
@@ -1428,10 +1428,12 @@ async fn an_operator_reply_round_requeues_the_review_for_delivery() {
     assert_eq!(submitted.delivery_state, "queued");
     assert_eq!(submitted.pending_replies, 0);
     let base_key = submitted.delivery_key.clone();
-
-    // The session answers, and the reviewer replies from the UI. That reply
-    // used to dead-end in the database; now it queues on the review.
     let comment_id = submitted.comments[0].id;
+
+    // The session answers, the reviewer replies, and the reviewer also
+    // writes a brand-new comment on the submitted review: the create op
+    // resolves to the same envelope, and the comment queues there exactly
+    // like a draft comment does.
     ts.client
         .invoke::<reviews::comments::reply::Op>(&reviews::comments::reply::Input {
             comment_id,
@@ -1451,6 +1453,24 @@ async fn an_operator_reply_round_requeues_the_review_for_delivery() {
         .unwrap();
     assert_eq!(answered.replies.len(), 2);
 
+    // A brand-new comment attaches to the still-open envelope directly —
+    // composing a fresh draft stays a separate, CLI-style workflow.
+    let with_new_comment = ts
+        .client
+        .invoke::<reviews::comments::create::Op>(&comment(
+            submitted.id,
+            submitted.draft_revision,
+            "1",
+            "a brand-new follow-up comment",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        with_new_comment.id, submitted.id,
+        "one envelope, still open"
+    );
+    assert_eq!(with_new_comment.comments.last().unwrap().status, "pending");
+
     let listed = ts
         .client
         .invoke::<reviews::list::Op>(&reviews::list::Input {
@@ -1465,40 +1485,86 @@ async fn an_operator_reply_round_requeues_the_review_for_delivery() {
         "the operator replies are waiting"
     );
 
-    // Submitting again queues the round: a fresh delivery key under the same
-    // review, the watermark past the reply, the same outbox.
+    // One submission sends both kinds as one round. The frozen payload
+    // quotes the new comment and the reviewer's reply, never the session's
+    // own words, and the pending comment joins the delivered set.
     let round = ts
         .client
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: submitted.id,
-            expected_revision: submitted.draft_revision,
+            expected_revision: with_new_comment.draft_revision,
             acknowledge_outdated: false,
         })
         .await
         .unwrap();
     assert_eq!(round.delivery_key, format!("{base_key}#1"));
     assert_eq!(round.delivery_state, "queued");
-    assert_eq!(round.pending_replies, 0, "the words are on their way");
+    assert_eq!(
+        round.comments.last().unwrap().status,
+        "submitted",
+        "the round owns the pending comment now"
+    );
+    assert_eq!(
+        round.pending_replies, 2,
+        "undelivered until the transport succeeds — the cursors have not moved"
+    );
+    let payload: String =
+        sqlx::query_scalar("SELECT payload FROM review_delivery_outbox WHERE review_id = ?")
+            .bind(submitted.id)
+            .fetch_one(&ts.state.db)
+            .await
+            .unwrap();
+    assert!(
+        payload.contains("a brand-new follow-up comment"),
+        "{payload}"
+    );
+    assert!(payload.contains("Thanks — one more thing."), "{payload}");
+    // Both replies are the reviewer's words here, so both ride; and the
+    // initial submission never delivered in this fixture, so its comment
+    // rides too — the batch is everything past the delivered cursors.
+    assert!(
+        payload.contains("Fixed in the follow-up commit."),
+        "{payload}"
+    );
+    assert!(payload.contains("change this"), "{payload}");
 
-    // The outbox carries the round's window, so a retry re-derives the same
-    // reply and only the reviewer's words ride the message.
-    let (from, upto): (i64, i64) = sqlx::query_as(
-        "SELECT reply_from, reply_upto FROM review_delivery_outbox WHERE review_id = ?",
-    )
-    .bind(submitted.id)
-    .fetch_one(&ts.state.db)
-    .await
-    .unwrap();
-    assert_eq!(from, 0);
-    assert!(upto > 0);
-    let queued = weaver_core::review::get(&ts.state.db, submitted.id)
+    // The round delivers: the cursors advance past everything it carried,
+    // and a resubmit with nothing new is the read it always was.
+    let lease = weaver_core::review::claim_delivery(&ts.state.db, submitted.id)
         .await
         .unwrap()
-        .unwrap();
-    let message = weaver_core::review::follow_up_message(&queued, from, upto);
-    assert!(message.contains("Thanks — one more thing."), "{message}");
+        .expect("the queued round is claimable");
     assert!(
-        message.contains("Fixed in the follow-up commit."),
-        "{message}"
+        weaver_core::review::mark_delivered(&ts.state.db, submitted.id, &lease.token)
+            .await
+            .unwrap()
+    );
+    let read = ts
+        .client
+        .invoke::<reviews::submit::Op>(&reviews::submit::Input {
+            id: submitted.id,
+            expected_revision: round.draft_revision,
+            acknowledge_outdated: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(read.pending_replies, 0);
+    let listed = ts
+        .client
+        .invoke::<reviews::list::Op>(&reviews::list::Input {
+            subject_kind: "artifact".parse().unwrap(),
+            subject_key: "design".to_string(),
+            session: session.id.to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed[0].pending_replies, 0);
+    assert_eq!(
+        listed[0]
+            .comments
+            .iter()
+            .filter(|comment| comment.status == "pending")
+            .count(),
+        0
     );
 }

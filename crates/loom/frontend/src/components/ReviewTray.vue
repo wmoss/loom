@@ -15,11 +15,11 @@ const props = defineProps<{
   submitting: boolean;
   discarding: boolean;
   deliveryErrors: Record<number, string>;
-  /** The signed-in operator's username: only a review's creator may send
-   *  its queued replies back to the session. */
-  operator: string;
-  /** A reply round is in flight from this surface. */
-  sendingReplies: boolean;
+  /** The creator's submitted review with undelivered follow-up work: its
+   *  pending comments and replies queue beside a draft's — one surface, one
+   *  submit. Null when a draft is open (the draft is the surface) or when
+   *  nothing is pending. */
+  continuation: Review | null;
   subjectLabel: string;
   discardAction: () => Promise<void>;
   /** Floats bottom-right and expands upward. Set false to sit inline (e.g.
@@ -39,7 +39,6 @@ const emit = defineEmits<{
   retarget: [];
   submit: [];
   retry: [review: Review];
-  sendReplies: [review: Review];
 }>();
 const toggleEl = ref<HTMLButtonElement | null>(null);
 const rootEl = ref<HTMLElement | null>(null);
@@ -97,13 +96,41 @@ const recent = computed(
       .sort((a, b) => b.id - a.id)[0] ?? null,
 );
 
-// Submitted reviews whose operator replies have not been sent back to the
-// session yet — the reviewer's answers waiting for the next round.
-const replyQueues = computed(() =>
-  props.reviews.filter(
-    (review) => review.status === 'submitted' && !review.legacy && review.pending_replies > 0,
-  ),
-);
+// The open surface — a draft, or a submitted review carrying undelivered
+// follow-up work. Pending rows render identically for both: a new comment
+// and a reply look the same because they are the same thing here, words the
+// session has not received yet, queued until one submit sends them.
+const surface = computed(() => props.draft ?? props.continuation);
+
+const pendingRows = computed(() => {
+  const review = surface.value;
+  if (!review) return [];
+  const rows = review.comments
+    .filter((comment) => comment.status === 'pending')
+    .map((comment) => ({
+      key: `c${comment.id}`,
+      body: comment.body,
+      reply: false,
+      focusId: comment.id,
+      stale: comment.subject_version !== review.subject.current_version,
+    }));
+  // Replies only exist on submitted reviews; the ones past the delivered
+  // cursor are still the reviewer's side of the loop.
+  for (const comment of review.comments) {
+    for (const reply of comment.replies) {
+      if (reply.author_kind === 'operator' && reply.id > review.reply_upto) {
+        rows.push({
+          key: `r${reply.id}`,
+          body: reply.body,
+          reply: true,
+          focusId: comment.id,
+          stale: false,
+        });
+      }
+    }
+  }
+  return rows;
+});
 
 // Cmd/Ctrl+Enter in the overall note submits without requiring a blur first —
 // `submit` (via the draft controller's freeze) already flushes any dirty note
@@ -118,8 +145,8 @@ function submitShortcut() {
     ) {
       return;
     }
-  } else if (!props.overallNote.trim()) {
-    return;
+  } else if (!props.continuation || !pendingRows.value.length) {
+    if (!props.overallNote.trim()) return;
   }
   emit('submit');
 }
@@ -148,20 +175,14 @@ function submitShortcut() {
         :aria-expanded="open"
         @click="emit('update:open', !open)"
       >
-        <template v-if="draft">
-          Review · {{ draft.comments.length }} pending
-          <span v-if="draft.outdated" class="ml-1 text-block">· stale</span>
+        <template v-if="surface">
+          Review · {{ pendingRows.length }} pending
+          <span v-if="draft?.outdated" class="ml-1 text-block">· stale</span>
           <span v-if="failed.length" class="ml-1 text-block">
             · {{ failed.length }} delivery failed
           </span>
-          <span v-if="replyQueues.length" class="ml-1 text-block">
-            · {{ replyQueues.length }} replies to send
-          </span>
         </template>
         <template v-else-if="failed.length">Review delivery · {{ failed.length }} failed</template>
-        <template v-else-if="replyQueues.length">
-          Replies to send · {{ replyQueues.length }} review{{ replyQueues.length === 1 ? '' : 's' }}
-        </template>
         <template v-else-if="recent">Review submitted · {{ recent.delivery_state }}</template>
         <template v-else>Review {{ subjectLabel }}</template>
       </button>
@@ -202,38 +223,6 @@ function submitShortcut() {
           : 'absolute right-0 top-full z-30 mt-1 w-[min(28rem,calc(100vw-1.5rem))] rounded-lg border border-line bg-surface shadow-xl'
       "
     >
-      <div
-        v-if="replyQueues.length"
-        class="mb-3 space-y-2"
-        aria-label="Replies waiting to reach the session"
-      >
-        <div
-          v-for="item in replyQueues"
-          :key="item.id"
-          class="rounded border border-line bg-subtle/50 p-2 text-xs"
-          :data-testid="`review-reply-queue-${item.id}`"
-        >
-          <p class="font-medium">
-            Review {{ item.id }} · {{ item.pending_replies }} repl{{
-              item.pending_replies === 1 ? 'y' : 'ies'
-            }}
-            waiting to reach the session
-          </p>
-          <p class="mt-1 text-muted">
-            Sending delivers them to the reviewed session, like the original comments.
-          </p>
-          <button
-            v-if="item.created_by === operator"
-            type="button"
-            class="btn-primary mt-2 px-2 py-1 text-xs"
-            :disabled="sendingReplies"
-            :data-testid="`review-send-replies-${item.id}`"
-            @click="emit('sendReplies', item)"
-          >
-            Send replies
-          </button>
-        </div>
-      </div>
       <div v-if="failed.length" class="mb-3 space-y-2" aria-label="Failed review deliveries">
         <div
           v-for="item in failed"
@@ -260,9 +249,9 @@ function submitShortcut() {
         </div>
       </div>
 
-      <template v-if="draft">
+      <template v-if="surface">
         <p
-          v-if="draft.outdated"
+          v-if="draft?.outdated"
           class="mb-3 rounded border border-block-line bg-block-soft p-2 text-xs text-block"
           data-testid="review-stale-warning"
         >
@@ -270,7 +259,7 @@ function submitShortcut() {
           are preserved; re-anchor them, or acknowledge the older context before submitting.
         </p>
         <button
-          v-if="draft.outdated && !draft.comments.length"
+          v-if="draft?.outdated && !draft.comments.length"
           type="button"
           class="btn-secondary mb-3 px-2 py-1 text-xs"
           data-testid="review-retarget-current"
@@ -282,24 +271,25 @@ function submitShortcut() {
 
         <div class="space-y-1.5" aria-label="Pending comments">
           <button
-            v-for="(comment, index) in draft.comments"
-            :key="comment.id"
+            v-for="(row, index) in pendingRows"
+            :key="row.key"
             type="button"
             class="flex w-full items-center gap-2 rounded border border-line px-2 py-1.5 text-left text-xs hover:border-accent"
-            @click="emit('focusComment', comment.id)"
+            :data-testid="
+              row.reply ? `pending-reply-row-${row.key}` : `pending-comment-row-${row.key}`
+            "
+            @click="emit('focusComment', row.focusId)"
           >
             <span class="shrink-0 font-mono text-2xs text-faint">{{ index + 1 }}</span>
-            <span class="min-w-0 flex-1 truncate text-fg">{{ comment.body }}</span>
-            <span
-              v-if="comment.subject_version !== draft.subject.current_version"
-              class="shrink-0 text-2xs text-block"
-            >
-              stale
+            <span class="min-w-0 flex-1 truncate text-fg">
+              <span v-if="row.reply" class="mr-1 text-faint" aria-hidden="true">↳</span
+              >{{ row.body }}
             </span>
+            <span v-if="row.stale" class="shrink-0 text-2xs text-block"> stale </span>
           </button>
         </div>
 
-        <label class="mt-3 block text-xs font-medium text-muted" :for="overallId">
+        <label v-if="draft" class="mt-3 block text-xs font-medium text-muted" :for="overallId">
           Overall note <span class="font-normal text-faint">(optional)</span>
         </label>
         <textarea
@@ -322,7 +312,7 @@ function submitShortcut() {
         </p>
 
         <label
-          v-if="draft.outdated"
+          v-if="draft?.outdated"
           class="mt-2 flex cursor-pointer items-start gap-2 rounded bg-subtle/50 p-2 text-xs text-muted"
         >
           <input
@@ -337,7 +327,7 @@ function submitShortcut() {
           Submit against the captured version intentionally.
         </label>
 
-        <div class="mt-3 border-t border-line pt-3">
+        <div v-if="draft" class="mt-3 border-t border-line pt-3">
           <p class="mb-2 text-2xs font-semibold uppercase tracking-wide text-faint">
             Conversation feedback preview
           </p>
@@ -355,6 +345,7 @@ function submitShortcut() {
             {{ error }}
           </p>
           <InlineConfirm
+            v-if="draft"
             label="Discard draft"
             :message="`Discard the overall note and all ${draft.comments.length} pending comments?`"
             confirm-label="Discard draft"
@@ -370,8 +361,8 @@ function submitShortcut() {
               submitting ||
               layoutBusy ||
               discarding ||
-              (!draft.comments.length && !overallNote.trim()) ||
-              (draft.outdated && !acknowledgeOutdated)
+              (!pendingRows.length && !(draft && overallNote.trim())) ||
+              (draft?.outdated && !acknowledgeOutdated)
             "
             @click="emit('submit')"
           >
@@ -380,7 +371,7 @@ function submitShortcut() {
         </div>
       </template>
 
-      <template v-else>
+      <template v-else-if="!continuation">
         <div
           v-if="recent && !failed.some((review) => review.id === recent?.id)"
           class="mb-3 text-xs text-muted"

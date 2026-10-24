@@ -168,6 +168,10 @@ pub struct Review {
     /// already included in a round, so the pending ones are exactly those
     /// past it.
     pub reply_upto: i64,
+    /// The delivered-comment cursor: the greatest comment id whose body has
+    /// reached the session. Comments past it are the round batch's half of
+    /// everything not yet delivered.
+    pub comment_upto: i64,
     /// Operator replies still waiting for the next round — computed on read,
     /// never stored.
     #[sqlx(default)]
@@ -301,17 +305,22 @@ pub struct OutboxItem {
 #[derive(Debug, Clone, FromRow)]
 pub struct DeliveryLease {
     pub token: String,
-    /// The follow-up round's reply window: floor and cutoff snapshotted at
-    /// submit, so every retry re-derives the same reply set. (0, 0) is the
-    /// initial submission, which carries comments, not replies.
+    /// The round's reply window: floor and cutoff snapshotted at submit.
+    /// (0, 0) is the initial submission, which carries comments, not
+    /// replies.
     pub reply_from: i64,
     pub reply_upto: i64,
+    /// The greatest comment id the round's payload covers.
+    pub comment_upto: i64,
+    /// The round's frozen payload; the initial submission carries none and
+    /// builds from the durable review at delivery time.
+    pub payload: Option<String>,
 }
 
 const SELECT_REVIEW: &str = "SELECT id, repo_root, branch_id, session_id, subject_kind, \
     subject_id, subject_key, subject_label, subject_version, status, summary, draft_revision, created_by, \
     acknowledged_outdated, delivery_state, delivery_error, delivery_key, created_at, \
-    updated_at, submitted_at, reply_round, reply_upto FROM reviews";
+    updated_at, submitted_at, reply_round, reply_upto, comment_upto FROM reviews";
 
 const SELECT_COMMENT: &str = "SELECT id, review_id, subject_version, anchor_kind, anchor_json, \
     body, status, created_at, updated_at FROM review_comments";
@@ -539,8 +548,12 @@ pub async fn list_visible(
     Ok(reviews)
 }
 
-/// Return the creator's existing draft for this exact session/subject, or
-/// create it. The partial unique index is the concurrency guard.
+/// Return the creator's open draft for this exact session/subject, or
+/// create it. The partial unique index is the concurrency guard. (A
+/// submitted review stays open to its reviewer at the comment level — new
+/// comments attach to it directly — but it is not resolved here: composing a
+/// fresh draft is the CLI's round-by-round workflow, while the review UI
+/// continues the submitted envelope.)
 pub async fn get_or_create(db: &Db, new: &NewReview<'_>) -> Result<Review> {
     let now = now_iso();
     sqlx::query(
@@ -601,6 +614,79 @@ async fn require_creator_draft(
     Ok(review)
 }
 
+/// The review a comment may be added to, or a pending comment edited on:
+/// the creator's draft, or their submitted review — a submitted review
+/// stays open to its reviewer, and a comment the session has not received
+/// yet is as editable as a draft comment. A delivered comment is immutable
+/// history: it can be replied to or resolved, never rewritten.
+async fn require_comment_surface(
+    tx: &mut crate::db::DbTransaction<'_>,
+    review_id: i64,
+    creator: &str,
+    expected_revision: i64,
+    // When set, the named comment must itself be pending to edit or delete.
+    pending_comment_id: Option<i64>,
+) -> Result<Review> {
+    let review = sqlx::query_as::<_, Review>(&format!(
+        "{SELECT_REVIEW} WHERE id = ? AND created_by = ? AND status IN ('draft', 'submitted')"
+    ))
+    .bind(review_id)
+    .bind(creator)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| anyhow!("review not found"))?;
+    if review.draft_revision != expected_revision {
+        return Err(anyhow!(DraftRevisionConflict {
+            expected: expected_revision,
+            actual: review.draft_revision,
+        }));
+    }
+    if review.status == "submitted" {
+        if let Some(comment_id) = pending_comment_id {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM review_comments WHERE id = ? AND review_id = ?",
+            )
+            .bind(comment_id)
+            .bind(review_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+            if status.as_deref() != Some("pending") {
+                bail!("this comment was already delivered; reply to it or resolve it instead");
+            }
+        }
+    }
+    Ok(review)
+}
+
+/// Bump the optimistic revision on an open comment surface — a draft, or a
+/// submitted review taking on pending comments — and return the fresh view.
+async fn finish_surface_mutation(
+    tx: &mut crate::db::DbTransaction<'_>,
+    review_id: i64,
+    expected_revision: i64,
+    now: &str,
+) -> Result<Review> {
+    let updated = sqlx::query(
+        "UPDATE reviews
+         SET draft_revision = draft_revision + 1, updated_at = ?
+         WHERE id = ? AND status IN ('draft', 'submitted') AND draft_revision = ?",
+    )
+    .bind(now)
+    .bind(review_id)
+    .bind(expected_revision)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        bail!("review changed while applying the mutation");
+    }
+    let review = sqlx::query_as::<_, Review>(&format!("{SELECT_REVIEW} WHERE id = ?"))
+        .bind(review_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    attach_comments_tx(tx, review).await
+}
+
 async fn finish_draft_mutation(
     tx: &mut crate::db::DbTransaction<'_>,
     review_id: i64,
@@ -638,8 +724,9 @@ pub async fn add_comment(
     let body = new.body.trim();
     let anchor_json = new.anchor.json()?;
     let mut tx = crate::db::begin_immediate(db).await?;
-    let draft = require_creator_draft(&mut tx, review_id, creator, expected_revision).await?;
-    // A changes draft's comments all target one snapshot spelling — the
+    let draft =
+        require_comment_surface(&mut tx, review_id, creator, expected_revision, None).await?;
+    // A changes review's comments all target one snapshot spelling — the
     // branch change-set, one commit's own diff, or the unstaged working
     // state. A comment naming another spelling would ride an envelope it
     // disagrees with through submit and delivery.
@@ -669,6 +756,9 @@ pub async fn add_comment(
     if total + body.len() as i64 + anchor_json.len() as i64 > MAX_REVIEW_BYTES {
         bail!("review comments and anchors exceed the 256 KiB total limit");
     }
+    // Comments are born pending on either surface: on a draft they await
+    // the first submission, on a submitted review they await the follow-up
+    // round, and the round flips them to delivered alongside the replies.
     let now = now_iso();
     sqlx::query(
         "INSERT INTO review_comments
@@ -684,7 +774,7 @@ pub async fn add_comment(
     .bind(&now)
     .execute(&mut *tx)
     .await?;
-    let review = finish_draft_mutation(&mut tx, review_id, expected_revision, &now).await?;
+    let review = finish_surface_mutation(&mut tx, review_id, expected_revision, &now).await?;
     tx.commit().await?;
     Ok(review)
 }
@@ -712,7 +802,14 @@ pub async fn patch_comment(
         }
     }
     let mut tx = crate::db::begin_immediate(db).await?;
-    let draft = require_creator_draft(&mut tx, review_id, creator, expected_revision).await?;
+    let draft = require_comment_surface(
+        &mut tx,
+        review_id,
+        creator,
+        expected_revision,
+        Some(comment_id),
+    )
+    .await?;
     let current = sqlx::query_as::<_, ReviewComment>(&format!(
         "{SELECT_COMMENT} WHERE id = ? AND review_id = ?"
     ))
@@ -803,7 +900,7 @@ pub async fn patch_comment(
                 .await?;
         }
     }
-    let review = finish_draft_mutation(&mut tx, review_id, expected_revision, &now).await?;
+    let review = finish_surface_mutation(&mut tx, review_id, expected_revision, &now).await?;
     tx.commit().await?;
     Ok(review)
 }
@@ -816,7 +913,14 @@ pub async fn delete_comment(
     expected_revision: i64,
 ) -> Result<Review> {
     let mut tx = crate::db::begin_immediate(db).await?;
-    require_creator_draft(&mut tx, review_id, creator, expected_revision).await?;
+    require_comment_surface(
+        &mut tx,
+        review_id,
+        creator,
+        expected_revision,
+        Some(comment_id),
+    )
+    .await?;
     let removed = sqlx::query("DELETE FROM review_comments WHERE id = ? AND review_id = ?")
         .bind(comment_id)
         .bind(review_id)
@@ -828,7 +932,7 @@ pub async fn delete_comment(
         bail!("review comment not found");
     }
     let now = now_iso();
-    let review = finish_draft_mutation(&mut tx, review_id, expected_revision, &now).await?;
+    let review = finish_surface_mutation(&mut tx, review_id, expected_revision, &now).await?;
     tx.commit().await?;
     Ok(review)
 }
@@ -1133,15 +1237,17 @@ async fn submit_inner(
             actual: review.draft_revision,
         }));
     }
-    // A submitted review comes back as a read — a retried submission never
-    // inserts another event or outbox row — unless the reviewer has answered
-    // the session's replies since: then submitting again queues those words
-    // for delivery as a follow-up round, the same queue the initial comments
-    // rode.
+    // A submitted review stays open to its reviewer. New comments queue on
+    // it exactly like draft comments queue on a draft, thread replies queue
+    // past the delivered cursor, and submitting again sends them together as
+    // one follow-up round — the same delivery machinery the initial comments
+    // rode. A resubmit with nothing new is the read it always was.
     if review.status == "submitted" {
-        let cutoff = max_operator_reply_id(&mut *tx, review_id).await?;
-        if cutoff > review.reply_upto {
-            let event = queue_reply_round(&mut tx, &mut review, &mut comments, cutoff).await?;
+        let reply_cutoff = max_operator_reply_id(&mut *tx, review_id).await?;
+        let pending_comments = comments.iter().any(|comment| comment.status == "pending");
+        if pending_comments || reply_cutoff > review.reply_upto {
+            let event =
+                queue_follow_up_round(&mut tx, &mut review, &mut comments, reply_cutoff).await?;
             tx.commit().await?;
             let review = get(db, review_id)
                 .await?
@@ -1259,15 +1365,17 @@ async fn submit_inner(
         data: event_data,
         created_at: event_row.get("created_at"),
     };
+    let comment_cutoff = comments.iter().map(|comment| comment.id).max().unwrap_or(0);
     sqlx::query(
         "INSERT INTO review_delivery_outbox
-            (review_id, delivery_key, state, attempts, next_attempt_at)
-         VALUES (?, ?, 'queued', 0, ?)
+            (review_id, delivery_key, state, attempts, next_attempt_at, comment_upto)
+         VALUES (?, ?, 'queued', 0, ?, ?)
          ON CONFLICT(review_id) DO NOTHING",
     )
     .bind(review_id)
     .bind(&review.delivery_key)
     .bind(&now)
+    .bind(comment_cutoff)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1281,38 +1389,54 @@ async fn submit_inner(
     })
 }
 
-/// Queue one follow-up round on a submitted review: the operator replies past
-/// the review's watermark go back to the session through the same outbox and
-/// inbox the initial submission rode, under a fresh round key — and the
-/// watermark moves to the round's cutoff so a resubmit cannot double-send the
-/// same words. The outbox row snapshots the round's reply window; a retry
-/// re-derives exactly this set, whatever lands in the meantime.
-async fn queue_reply_round(
+/// Queue one follow-up round on a submitted review: everything not yet
+/// delivered — new comments and the reviewer's thread replies alike — goes
+/// back to the session through the same outbox and inbox the initial
+/// submission rode, under a fresh round key.
+///
+/// The batch is the single live one for the review: the outbox row is
+/// overwritten in place, its payload frozen verbatim at submit time, so a
+/// retry re-sends byte-identical text and a superseded round's key never
+/// inserts into the once-only inbox. The delivered cursors
+/// (`comment_upto`/`reply_upto`) do **not** move here — they advance when
+/// delivery succeeds, which is what makes a failed or in-flight round
+/// self-healing: the next round's batch recomputes everything past the
+/// delivered point instead of stranding it.
+async fn queue_follow_up_round(
     tx: &mut crate::db::DbTransaction<'_>,
     review: &mut Review,
     comments: &mut [ReviewComment],
-    cutoff: i64,
+    reply_cutoff: i64,
 ) -> Result<Event> {
-    let from = review.reply_upto;
+    let comment_from = review.comment_upto;
+    let reply_from = review.reply_upto;
     let round = review.reply_round + 1;
     let now = now_iso();
     // The original key never carried a '#': every round appends its own.
     let base = review.delivery_key.split('#').next().unwrap_or_default();
     let key = format!("{base}#{round}");
+    // Pending comments join the delivered set — the round owns them now.
+    sqlx::query("UPDATE review_comments SET status = 'submitted' WHERE review_id = ? AND status = 'pending'")
+        .bind(review.id)
+        .execute(&mut **tx)
+        .await?;
     attach_replies(&mut **tx, comments).await?;
     review.reply_round = round;
-    review.reply_upto = cutoff;
     review.delivery_key = key.clone();
     review.comments = comments.to_owned();
-    let message = follow_up_message(review, from, cutoff);
+    let comment_cutoff = comments
+        .iter()
+        .map(|comment| comment.id)
+        .max()
+        .unwrap_or(comment_from);
+    let message = follow_up_message(review, comment_from, reply_from, reply_cutoff);
     let updated = sqlx::query(
         "UPDATE reviews
-         SET reply_round = ?, reply_upto = ?, delivery_key = ?,
+         SET reply_round = ?, delivery_key = ?,
              delivery_state = 'queued', delivery_error = NULL, updated_at = ?
          WHERE id = ? AND status = 'submitted' AND draft_revision = ?",
     )
     .bind(round)
-    .bind(cutoff)
     .bind(&key)
     .bind(&now)
     .bind(review.id)
@@ -1324,19 +1448,23 @@ async fn queue_reply_round(
     }
     sqlx::query(
         "INSERT INTO review_delivery_outbox
-            (review_id, delivery_key, state, attempts, next_attempt_at, reply_from, reply_upto)
-         VALUES (?, ?, 'queued', 0, ?, ?, ?)
+            (review_id, delivery_key, state, attempts, next_attempt_at,
+             reply_from, reply_upto, comment_upto, payload)
+         VALUES (?, ?, 'queued', 0, ?, ?, ?, ?, ?)
          ON CONFLICT(review_id) DO UPDATE SET
             delivery_key = excluded.delivery_key, state = 'queued', attempts = 0,
             next_attempt_at = excluded.next_attempt_at, last_error = NULL,
             lease_token = NULL, reply_from = excluded.reply_from,
-            reply_upto = excluded.reply_upto",
+            reply_upto = excluded.reply_upto, comment_upto = excluded.comment_upto,
+            payload = excluded.payload",
     )
     .bind(review.id)
     .bind(&key)
     .bind(&now)
-    .bind(from)
-    .bind(cutoff)
+    .bind(reply_from)
+    .bind(reply_cutoff)
+    .bind(comment_cutoff)
+    .bind(&message)
     .execute(&mut **tx)
     .await?;
     let comment_payload: Vec<Value> = comments
@@ -1386,29 +1514,49 @@ async fn queue_reply_round(
     })
 }
 
-/// The message a follow-up round carries: the reviewer's answers to the
-/// session's replies, one block per thread they touched. The replies arrive
-/// verbatim — the reviewer's words are the payload — while the anchors stay
-/// in the durable review, reachable through `review_list`.
-pub fn follow_up_message(review: &Review, from: i64, cutoff: i64) -> String {
+/// The message a follow-up round carries: the reviewer's new words, both
+/// kinds alike — new comments as first-class numbered entries with one-line
+/// locations, and their replies in the threads they answer, verbatim. The
+/// anchors stay in the durable review, reachable through `review_list`.
+pub fn follow_up_message(
+    review: &Review,
+    comment_from: i64,
+    reply_from: i64,
+    reply_cutoff: i64,
+) -> String {
     let subject = if review.subject_kind == "changes" {
         format!(
-            "The reviewer replied to your responses on changes version `{}`.",
+            "The reviewer sent follow-up feedback on changes version `{}`.",
             review.subject_version
         )
     } else {
         format!(
-            "The reviewer replied to your responses on artifact `{}`, revision {}.",
+            "The reviewer sent follow-up feedback on artifact `{}`, revision {}.",
             review.subject_label, review.subject_version
         )
     };
     let mut message = subject;
+    let fresh_comments: Vec<&ReviewComment> = review
+        .comments
+        .iter()
+        .filter(|comment| comment.id > comment_from)
+        .collect();
+    for (index, comment) in fresh_comments.iter().enumerate() {
+        message.push_str(&format!(
+            "\n\n{}. {} (revision {}, comment id {}):\n{}",
+            index + 1,
+            comment_location(comment),
+            comment.subject_version,
+            comment.id,
+            comment.body
+        ));
+    }
     for comment in review.comments.iter() {
         let fresh: Vec<&ReviewCommentReply> = comment
             .replies
             .iter()
             .filter(|reply| {
-                reply.author_kind == "operator" && reply.id > from && reply.id <= cutoff
+                reply.author_kind == "operator" && reply.id > reply_from && reply.id <= reply_cutoff
             })
             .collect();
         if fresh.is_empty() {
@@ -1428,10 +1576,11 @@ pub fn follow_up_message(review: &Review, from: i64, cutoff: i64) -> String {
         review.id, review.delivery_key
     ));
     message.push_str(
-        "\n\nContinue the threads with the `review_comment_reply` tool, passing each \
-         comment id and your response. Each comment's full anchor and surrounding \
-         context is served by the `review_list` tool. Resolving a comment is the \
-         reviewer's action, not yours.",
+        "\n\nTake action on any comment that calls for a change, and continue the threads \
+         with the `review_comment_reply` tool, passing each comment id and your response \
+         or what you did. Each comment's full anchor and surrounding context is served \
+         by the `review_list` tool. Resolving a comment is the reviewer's action, \
+         not yours.",
     );
     message
 }
@@ -1466,7 +1615,7 @@ pub async fn claim_delivery(db: &Db, review_id: i64) -> Result<Option<DeliveryLe
              lease_token = lower(hex(randomblob(16)))
          WHERE review_id = ? AND next_attempt_at <= ?
            AND state IN ('queued', 'retrying', 'delivering')
-         RETURNING lease_token AS token, reply_from, reply_upto",
+         RETURNING lease_token AS token, reply_from, reply_upto, comment_upto, payload",
     )
     .bind(lease_until)
     .bind(review_id)
@@ -1579,10 +1728,22 @@ pub async fn mark_delivered(db: &Db, review_id: i64, lease_token: &str) -> Resul
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() == 1 {
+        // The delivered cursors move here, never at submit: these words have
+        // now reached the session, so the next round's batch is exactly what
+        // arrives after them.
+        let (comment_upto, reply_upto): (i64, i64) = sqlx::query_as(
+            "SELECT comment_upto, reply_upto FROM review_delivery_outbox WHERE review_id = ?",
+        )
+        .bind(review_id)
+        .fetch_one(&mut *tx)
+        .await?;
         sqlx::query(
-            "UPDATE reviews SET delivery_state = 'delivered', delivery_error = NULL
+            "UPDATE reviews SET delivery_state = 'delivered', delivery_error = NULL,
+                 comment_upto = ?, reply_upto = ?
              WHERE id = ? AND delivery_state = 'delivering'",
         )
+        .bind(comment_upto)
+        .bind(reply_upto)
         .bind(review_id)
         .execute(&mut *tx)
         .await?;
@@ -1797,6 +1958,7 @@ mod tests {
             submitted_at: None,
             reply_round: 0,
             reply_upto: 0,
+            comment_upto: 0,
             pending_replies: 0,
             comments: Vec::new(),
         }
@@ -2553,15 +2715,30 @@ mod tests {
         let mutation = mutation_task.await.unwrap();
 
         match (submission, mutation) {
-            (Ok(submitted), Err(error)) => {
-                assert_eq!(submitted.review.comments.len(), 1);
-                assert!(error.to_string().contains("draft review not found"));
+            (Ok(submitted), Ok(mutated)) => {
+                // Submit won the race: the initial round's event carries
+                // exactly the pre-existing comment — nothing sneaks into
+                // the delivered payload — and the racing add simply queues
+                // on the now-submitted envelope as the continuation's first
+                // pending comment, delivered by the next round.
+                let event_comments = submitted
+                    .event
+                    .as_ref()
+                    .and_then(|event| event.data.get("comments"))
+                    .and_then(|comments| comments.as_array())
+                    .expect("the submission event carries its comments");
+                assert_eq!(event_comments.len(), 1);
+                assert_eq!(event_comments[0]["body"], "first");
+                assert_eq!(mutated.comments.len(), 2);
+                assert_eq!(mutated.comments.last().unwrap().status, "pending");
             }
             (Err(error), Ok(mutated)) => {
+                // The mutation won the revision race: the submit conflicts
+                // and the comment rides the envelope to the next submit.
                 assert!(error.downcast_ref::<DraftRevisionConflict>().is_some());
                 assert_eq!(mutated.comments.len(), 2);
             }
-            outcome => panic!("exactly one concurrent operation must win: {outcome:?}"),
+            outcome => panic!("one of the two race outcomes must hold: {outcome:?}"),
         }
     }
 
@@ -2700,7 +2877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_replies_queue_into_follow_up_rounds() {
+    async fn follow_up_rounds_carry_new_comments_and_replies_together() {
         let (db, artifact) = seeded().await;
         let first = draft(&db, &artifact, "alice").await;
         let first = add(&db, &first, "change this").await;
@@ -2708,13 +2885,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(submitted.review.reply_round, 0);
-        assert_eq!(submitted.review.pending_replies, 0);
         let base_key = submitted.review.delivery_key.clone();
-        let revision = submitted.review.draft_revision;
-
-        // The session answers; the reviewer replies. Nothing delivers yet —
-        // the reply queues on the review itself, like a draft comment does.
         let comment_id = submitted.review.comments[0].id;
+
+        // New comments attach to the submitted envelope directly — the
+        // comment-level continuation — while get_or_create keeps composing
+        // fresh drafts for a brand-new round workflow.
+        let continuation = add_comment(
+            &db,
+            submitted.review.id,
+            "alice",
+            submitted.review.draft_revision,
+            &NewComment {
+                subject_version: "1",
+                anchor: &anchor("gamma"),
+                body: "a brand-new follow-up comment",
+            },
+        )
+        .await
+        .unwrap();
+        let new_comment_id = continuation.comments.last().unwrap().id;
+        assert_eq!(continuation.comments.last().unwrap().status, "pending");
+        assert_eq!(continuation.pending_replies, 0);
+        let fresh = get_or_create(
+            &db,
+            &NewReview {
+                repo_root: &artifact.repo_root,
+                branch_id: artifact.branch_id.as_deref().unwrap(),
+                session_id: "session-1",
+                subject_kind: "artifact",
+                subject_id: &artifact.id.to_string(),
+                subject_key: &artifact.name,
+                subject_label: &artifact.name,
+                subject_version: "1",
+                created_by: "alice",
+            },
+        )
+        .await
+        .unwrap();
+        assert_ne!(fresh.id, continuation.id, "a fresh draft is a new envelope");
+
+        // The initial delivery lands: its delivered cursors move past its
+        // comments.
+        let lease = claim_delivery(&db, submitted.review.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(mark_delivered(&db, submitted.review.id, &lease.token)
+            .await
+            .unwrap());
+        let delivered = get(&db, submitted.review.id).await.unwrap().unwrap();
+        assert_eq!(delivered.comment_upto, comment_id);
+        assert_eq!(delivered.reply_upto, 0);
+        assert_eq!(delivered.pending_replies, 0);
+
+        // The session answers, the reviewer replies, and — the new shape —
+        // the reviewer also writes a brand-new comment on the submitted
+        // review. It queues there, exactly like a draft comment does.
         reply_comment(&db, comment_id, ReplyAuthor::Session("session-1"), "done")
             .await
             .unwrap();
@@ -2726,77 +2953,146 @@ mod tests {
         )
         .await
         .unwrap();
-        let queued = get(&db, submitted.review.id).await.unwrap().unwrap();
-        // Session replies never count: only the reviewer's words go back.
-        assert_eq!(queued.pending_replies, 1);
+        let live = get(&db, continuation.id).await.unwrap().unwrap();
+        assert_eq!(live.pending_replies, 1);
 
-        // Submitting again queues a follow-up round: a fresh delivery key,
-        // the watermark past the reply, the same outbox.
-        let round = submit(&db, queued.id, "alice", revision, false)
-            .await
-            .unwrap();
+        // One submission sends both kinds as one round: a fresh delivery
+        // key, the pending comment joining the delivered set, and the frozen
+        // outbox payload quoting comment and reply alike.
+        let round = submit(
+            &db,
+            continuation.id,
+            "alice",
+            continuation.draft_revision,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(round.review.reply_round, 1);
         assert_eq!(round.review.delivery_key, format!("{base_key}#1"));
         assert_eq!(round.review.delivery_state, "queued");
-        assert_eq!(round.review.pending_replies, 0);
-        assert!(round.event.is_some(), "a round is a real submission event");
-        let (from, upto): (i64, i64) = sqlx::query_as(
-            "SELECT reply_from, reply_upto FROM review_delivery_outbox WHERE review_id = ?",
-        )
-        .bind(round.review.id)
-        .fetch_one(&db)
-        .await
-        .unwrap();
-        // The outbox window is exactly the queued operator reply, so a
-        // retry re-derives the same set — and the message quotes the
-        // reviewer's words, never the session's own.
-        assert_eq!(from, 0);
-        assert!(upto > 0);
-        let message = follow_up_message(&round.review, from, upto);
-        assert!(message.contains("thanks — one more thing"), "{message}");
-        assert!(!message.contains("done"), "{message}");
+        assert!(round.event.is_some());
+        let flipped = get(&db, continuation.id).await.unwrap().unwrap();
+        assert_eq!(
+            flipped.comments.last().unwrap().status,
+            "submitted",
+            "the round owns the pending comment now"
+        );
+        // Undelivered until the transport says so — the cursors have not
+        // moved, so the words are still the reviewer's side of the loop.
+        assert_eq!(flipped.pending_replies, 1);
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM review_delivery_outbox WHERE review_id = ?")
+                .bind(continuation.id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
         assert!(
-            message.contains(&format!("comment id {comment_id}")),
-            "{message}"
+            payload.contains("a brand-new follow-up comment"),
+            "{payload}"
+        );
+        assert!(payload.contains("thanks — one more thing"), "{payload}");
+        assert!(!payload.contains("change this"), "{payload}");
+        assert!(
+            payload.contains(&format!("comment id {new_comment_id}")),
+            "{payload}"
         );
 
-        // A resubmit with nothing new stays the read it always was.
-        let read = submit(&db, round.review.id, "alice", revision, false)
+        // The round delivers: both cursors advance past what it carried, and
+        // the resubmit afterwards is the read it always was.
+        let lease = claim_delivery(&db, continuation.id).await.unwrap().unwrap();
+        assert!(mark_delivered(&db, continuation.id, &lease.token)
+            .await
+            .unwrap());
+        let after = get(&db, continuation.id).await.unwrap().unwrap();
+        assert_eq!(after.comment_upto, new_comment_id);
+        assert!(after.reply_upto >= 2, "past the operator reply");
+        assert_eq!(after.pending_replies, 0);
+        let read = submit(&db, continuation.id, "alice", after.draft_revision, false)
             .await
             .unwrap();
         assert!(read.event.is_none());
         assert_eq!(read.review.delivery_key, round.review.delivery_key);
+    }
 
-        // More replies start the next round under their own key, delivering
-        // only what the last round did not carry.
+    #[tokio::test]
+    async fn a_failed_round_self_heals_into_the_next_batch() {
+        let (db, artifact) = seeded().await;
+        let first = draft(&db, &artifact, "alice").await;
+        let first = add(&db, &first, "change this").await;
+        let submitted = submit(&db, first.id, "alice", first.draft_revision, false)
+            .await
+            .unwrap();
+        let comment_id = submitted.review.comments[0].id;
+        let lease = claim_delivery(&db, submitted.review.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(mark_delivered(&db, submitted.review.id, &lease.token)
+            .await
+            .unwrap());
+
+        // A round is queued but its transport never completes: no cursor
+        // advance, so nothing is presumed delivered.
         reply_comment(
             &db,
             comment_id,
             ReplyAuthor::Operator("alice"),
-            "and this too",
+            "words that failed to arrive",
         )
         .await
         .unwrap();
-        let next = submit(&db, round.review.id, "alice", revision, false)
+        let failed = submit(
+            &db,
+            first.id,
+            "alice",
+            submitted.review.draft_revision,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed.review.reply_round, 1);
+
+        // More words arrive, and the next round's batch recomputes
+        // everything past the delivered cursor — the failed round's reply
+        // rides too instead of being stranded by a watermark that moved at
+        // submit time.
+        reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Operator("alice"),
+            "and these came later",
+        )
+        .await
+        .unwrap();
+        let round = submit(&db, first.id, "alice", failed.review.draft_revision, false)
             .await
             .unwrap();
-        assert_eq!(next.review.reply_round, 2);
-        assert_eq!(next.review.delivery_key, format!("{base_key}#2"));
-        let (from, upto): (i64, i64) = sqlx::query_as(
-            "SELECT reply_from, reply_upto FROM review_delivery_outbox WHERE review_id = ?",
-        )
-        .bind(next.review.id)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+        assert_eq!(round.review.reply_round, 2);
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM review_delivery_outbox WHERE review_id = ?")
+                .bind(first.id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(payload.contains("words that failed to arrive"), "{payload}");
+        assert!(payload.contains("and these came later"), "{payload}");
+        // One live batch: the superseded round's window is gone with its
+        // delivery key, so the once-only inbox sees each message exactly
+        // once.
         assert_eq!(
-            from, 2,
-            "the window opens where the last round closed (the operator reply)"
+            round.review.delivery_key,
+            format!("{}#2", {
+                let base = round
+                    .review
+                    .delivery_key
+                    .split('#')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                base
+            })
         );
-        assert_eq!(upto, from + 1, "the window holds only the one new reply");
-        let message = follow_up_message(&next.review, from, upto);
-        assert!(message.contains("and this too"), "{message}");
-        assert!(!message.contains("thanks — one more thing"), "{message}");
     }
 
     #[tokio::test]

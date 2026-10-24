@@ -173,36 +173,6 @@ let summarySaveTimer: ReturnType<typeof setTimeout> | null = null;
 const acknowledgeOutdated = ref(false);
 const submitting = ref(false);
 
-// The signed-in operator: reply rounds are a creator's action, and the tray
-// gates its send button on the name.
-const operator = ref('');
-const sendingReplies = ref(false);
-void getMe()
-  .then((me) => {
-    operator.value = me.username ?? '';
-  })
-  .catch(() => {});
-
-/** Sends a submitted review's queued operator replies back to the session —
- *  the same queue and delivery the original comments rode. */
-async function sendReviewReplies(review: Review) {
-  if (sendingReplies.value) return;
-  sendingReplies.value = true;
-  trayError.value = '';
-  try {
-    const updated = await submitReview(review.id, {
-      expected_revision: review.draft_revision,
-      // A reply round rides the already-delivered snapshot; the outdated
-      // gate does not apply to it.
-      acknowledge_outdated: false,
-    });
-    replaceReview(updated);
-  } catch (cause) {
-    trayError.value = mutationMessage(cause);
-  } finally {
-    sendingReplies.value = false;
-  }
-}
 const discarding = ref(false);
 const layoutBusy = ref(false);
 let releaseLayoutBarrier: (() => void) | null = null;
@@ -210,6 +180,44 @@ let layoutReturnFocus: HTMLElement | null = null;
 const reanchorCommentId = ref<number | null>(null);
 
 const draft = computed(() => reviews.value.find((review) => review.status === 'draft') ?? null);
+
+// The signed-in operator: only a review's creator may submit it.
+const operator = ref('');
+void getMe()
+  .then((me) => {
+    operator.value = me.username ?? '';
+  })
+  .catch(() => {});
+
+/** The creator's submitted review with undelivered follow-up work — the
+ * pending surface beside (and in the tray, in place of) a draft. One submit
+ * sends its new comments and thread replies together. */
+const submittedEnvelopes = computed(() =>
+  reviews.value
+    .filter(
+      (review) =>
+        review.status === 'submitted' &&
+        !review.legacy &&
+        review.id > 0 &&
+        review.created_by === operator.value,
+    )
+    .sort((a, b) => b.id - a.id),
+);
+
+/** The envelope a fresh composer comment attaches to when no draft is open:
+ * the newest submitted one, pending or not. */
+const openEnvelope = computed(() => submittedEnvelopes.value[0] ?? null);
+
+const continuation = computed(() => {
+  if (draft.value) return null;
+  return (
+    submittedEnvelopes.value.find(
+      (review) =>
+        review.comments.some((comment) => comment.status === 'pending') ||
+        review.pending_replies > 0,
+    ) ?? null
+  );
+});
 const draftEntries = computed<ReviewEntry[]>(() =>
   (draft.value?.comments ?? []).map((comment) => ({ review: draft.value!, comment })),
 );
@@ -665,6 +673,7 @@ async function createPendingComment() {
     const updated = await draftController.command(async (current) => {
       const review =
         current ??
+        openEnvelope.value ??
         (await createReview(props.id, {
           subject_kind: 'artifact',
           subject_key: props.artifactName,
@@ -701,17 +710,33 @@ function cancelPendingComment() {
   void nextTick(() => reviewTrayRef.value?.focusToggle());
 }
 
-async function editComment(payload: { commentId: number; body: string }) {
-  if (!draft.value) return;
-  commentErrors.value[payload.commentId] = '';
-  try {
+/** Runs a pending-comment mutation against the surface that owns the
+ * comment: the open draft through its controller, or the submitted review
+ * still carrying it — its undelivered comments are as editable as draft
+ * ones. */
+async function mutateComment(run: (review: Review) => Promise<Review>): Promise<void> {
+  if (draft.value) {
     await draftController.command(async (current) => {
       if (!current) throw new Error('review draft is no longer available');
-      return updateReviewComment(current.id, payload.commentId, {
-        expected_revision: current.draft_revision,
-        body: payload.body,
-      });
+      return run(current);
     });
+    return;
+  }
+  const target = continuation.value;
+  if (!target) throw new Error('review draft is no longer available');
+  replaceReview(await run(target));
+}
+
+async function editComment(payload: { commentId: number; body: string }) {
+  if (!draft.value && !continuation.value) return;
+  commentErrors.value[payload.commentId] = '';
+  try {
+    await mutateComment((review) =>
+      updateReviewComment(review.id, payload.commentId, {
+        expected_revision: review.draft_revision,
+        body: payload.body,
+      }),
+    );
     reviewNotice.value = 'Pending comment updated.';
   } catch (e) {
     setCommentMutationError(payload.commentId, e);
@@ -719,13 +744,12 @@ async function editComment(payload: { commentId: number; body: string }) {
 }
 
 async function removeComment(commentId: number) {
-  if (!draft.value) return;
+  if (!draft.value && !continuation.value) return;
   commentErrors.value[commentId] = '';
   try {
-    await draftController.command(async (current) => {
-      if (!current) throw new Error('review draft is no longer available');
-      return deleteReviewComment(current.id, commentId, current.draft_revision);
-    });
+    await mutateComment((review) =>
+      deleteReviewComment(review.id, commentId, review.draft_revision),
+    );
     if (activeId.value === commentId) activeId.value = null;
     if (reanchorCommentId.value === commentId) reanchorCommentId.value = null;
     reviewNotice.value = 'Pending comment deleted.';
@@ -819,6 +843,28 @@ async function retargetDraft() {
 }
 
 async function submitDraft() {
+  // A submitted review with pending comments and replies is the same
+  // submission as a draft: one button sends whatever is queued.
+  if (!draft.value && continuation.value && !submitting.value) {
+    const target = continuation.value;
+    submitting.value = true;
+    trayError.value = '';
+    try {
+      const updated = await submitReview(target.id, {
+        expected_revision: target.draft_revision,
+        // A follow-up round rides the already-delivered revision; the
+        // outdated gate does not apply to it.
+        acknowledge_outdated: false,
+      });
+      replaceReview(updated);
+      reviewNotice.value = `Follow-up sent · ${updated.delivery_state}.`;
+    } catch (cause) {
+      trayError.value = mutationMessage(cause);
+    } finally {
+      submitting.value = false;
+    }
+    return;
+  }
   if (!draft.value || submitting.value) return;
   if (!(await focusUnsavedComment('submitting the review'))) return;
   submitting.value = true;
@@ -1208,8 +1254,7 @@ const DocBody = () => {
       :submitting="submitting"
       :discarding="discarding"
       :delivery-errors="deliveryErrors"
-      :operator="operator"
-      :sending-replies="sendingReplies"
+      :continuation="continuation"
       subject-label="artifact"
       :discard-action="discardDraft"
       @update:open="trayOpen = $event"
@@ -1220,7 +1265,6 @@ const DocBody = () => {
       @save-overall="saveOverallNote"
       @retarget="retargetDraft"
       @submit="submitDraft"
-      @send-replies="sendReviewReplies"
       @retry="retryDelivery"
     />
 

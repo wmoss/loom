@@ -72,6 +72,9 @@ const mounted = reactive(new Set<string>());
 const expandedByUser = new Set<string>();
 let fileObserver: IntersectionObserver | null = null;
 const activeComments = reactive(new Set<number>());
+/** Threads the reviewer closed by hand: refreshes re-open every live thread
+ * except these. */
+const closedByUser = new Set<number>();
 /** The thread the tray's prev/next last landed on; threads themselves stay
  * open independently — hiding one because another opened was noise. */
 const lastFocusedComment = ref<number | null>(null);
@@ -136,36 +139,14 @@ const summarySaving = ref(false);
 const acknowledgeOutdated = ref(false);
 const submitting = ref(false);
 
-// The signed-in operator: reply rounds are a creator's action, and the tray
-// gates its send button on the name.
+// The signed-in operator: only a review's creator may submit it, so the
+// continuation surface is gated on the name.
 const operator = ref('');
-const sendingReplies = ref(false);
 void getMe()
   .then((me) => {
     operator.value = me.username ?? '';
   })
   .catch(() => {});
-
-/** Sends a submitted review's queued operator replies back to the session —
- *  the same queue and delivery the original comments rode. */
-async function sendReviewReplies(review: Review) {
-  if (sendingReplies.value) return;
-  sendingReplies.value = true;
-  trayError.value = '';
-  try {
-    const updated = await submitReview(review.id, {
-      expected_revision: review.draft_revision,
-      // A reply round rides the already-delivered snapshot; the outdated
-      // gate does not apply to it.
-      acknowledge_outdated: false,
-    });
-    replaceReview(updated);
-  } catch (cause) {
-    trayError.value = mutationMessage(cause);
-  } finally {
-    sendingReplies.value = false;
-  }
-}
 const discarding = ref(false);
 
 type Pending = {
@@ -198,6 +179,39 @@ const diffDataCache = new Map<string, GitDiffViewData | null>();
 let cachedVersion: string | null = null;
 
 const draft = computed(() => reviews.value.find((review) => review.status === 'draft') ?? null);
+
+/** The creator's submitted review with undelivered follow-up work — the
+ * comments and replies still on the reviewer's side of the loop. It is the
+ * pending surface beside (and in the tray, in place of) a draft: one submit
+ * sends its new comments and thread replies together. */
+/** The creator's submitted reviews for this subject, newest first — one
+ * review carries the whole conversation, so these are the open envelopes. */
+const submittedEnvelopes = computed(() =>
+  reviews.value
+    .filter(
+      (review) =>
+        review.status === 'submitted' &&
+        !review.legacy &&
+        review.id > 0 &&
+        review.created_by === operator.value,
+    )
+    .sort((a, b) => b.id - a.id),
+);
+
+/** The envelope a fresh composer comment attaches to when no draft is open:
+ * the newest submitted one, pending or not. */
+const openEnvelope = computed(() => submittedEnvelopes.value[0] ?? null);
+
+const continuation = computed(() => {
+  if (draft.value) return null;
+  return (
+    submittedEnvelopes.value.find(
+      (review) =>
+        review.comments.some((comment) => comment.status === 'pending') ||
+        review.pending_replies > 0,
+    ) ?? null
+  );
+});
 
 /**
  * The snapshot a version string names: the oid of the one commit it pins, or
@@ -383,6 +397,20 @@ async function load() {
       return;
     }
     reviews.value = nextReviews;
+    // Threads open where the conversation still lives: every comment that is
+    // not resolved arrives open, resolved ones arrive closed, and a
+    // reviewer's own collapse survives the refresh.
+    for (const review of nextReviews) {
+      for (const comment of review.comments) {
+        if (
+          comment.anchor_kind === 'change' &&
+          comment.status !== 'resolved' &&
+          !closedByUser.has(comment.id)
+        ) {
+          activeComments.add(comment.id);
+        }
+      }
+    }
     error.value = '';
   } catch (cause) {
     error.value = (cause as Error).message;
@@ -791,6 +819,7 @@ async function saveComment() {
     const updated = await controller.command(async (current) => {
       const review =
         current ??
+        openEnvelope.value ??
         (await createReview(props.id, {
           subject_kind: 'changes',
           subject_key: 'changes',
@@ -828,15 +857,32 @@ async function saveComment() {
   }
 }
 
-async function editComment(payload: { commentId: number; body: string }) {
-  try {
+/** Runs a pending-comment mutation against the surface that owns the
+ * comment: the open draft through its controller (summary flush and
+ * conflict reconciliation ride along), or — the new shape — the submitted
+ * review still carrying it, whose undelivered comments are as editable as
+ * draft ones. */
+async function mutateComment(run: (review: Review) => Promise<Review>): Promise<void> {
+  if (draft.value) {
     await controller.command((current) => {
       if (!current) throw new Error('Review draft is unavailable.');
-      return updateReviewComment(current.id, payload.commentId, {
-        expected_revision: current.draft_revision,
-        body: payload.body,
-      });
+      return run(current);
     });
+    return;
+  }
+  const target = continuation.value;
+  if (!target) throw new Error('Review draft is unavailable.');
+  replaceReview(await run(target));
+}
+
+async function editComment(payload: { commentId: number; body: string }) {
+  try {
+    await mutateComment((review) =>
+      updateReviewComment(review.id, payload.commentId, {
+        expected_revision: review.draft_revision,
+        body: payload.body,
+      }),
+    );
   } catch (cause) {
     commentErrors[payload.commentId] = mutationMessage(cause);
   }
@@ -849,10 +895,9 @@ function replyToComment(commentId: number, body: string) {
 
 async function removeComment(commentId: number) {
   try {
-    await controller.command((current) => {
-      if (!current) throw new Error('Review draft is unavailable.');
-      return deleteReviewComment(current.id, commentId, current.draft_revision);
-    });
+    await mutateComment((review) =>
+      deleteReviewComment(review.id, commentId, review.draft_revision),
+    );
     activeComments.delete(commentId);
   } catch (cause) {
     throw new Error(mutationMessage(cause));
@@ -863,15 +908,14 @@ async function applyReanchor(commentId: number, anchor: ChangeAnchor) {
   const version = changes.value?.version;
   if (!version) return;
   try {
-    await controller.command((current) => {
-      if (!current) throw new Error('Review draft is unavailable.');
-      return updateReviewComment(current.id, commentId, {
-        expected_revision: current.draft_revision,
+    await mutateComment((review) =>
+      updateReviewComment(review.id, commentId, {
+        expected_revision: review.draft_revision,
         subject_version: version,
         anchor_kind: 'change',
         anchor,
-      });
-    });
+      }),
+    );
     reanchorComment.value = null;
     notice.value = 'Comment re-anchored to the current changes.';
   } catch (cause) {
@@ -931,6 +975,27 @@ async function retarget() {
 }
 
 async function submit() {
+  // A submitted review with pending comments and replies is the same
+  // submission as a draft: one button sends whatever is queued.
+  if (!draft.value && continuation.value) {
+    const target = continuation.value;
+    submitting.value = true;
+    trayError.value = '';
+    try {
+      const updated = await submitReview(target.id, {
+        expected_revision: target.draft_revision,
+        // A follow-up round rides the already-delivered snapshot; the
+        // outdated gate does not apply to it.
+        acknowledge_outdated: false,
+      });
+      replaceReview(updated);
+    } catch (cause) {
+      trayError.value = mutationMessage(cause);
+    } finally {
+      submitting.value = false;
+    }
+    return;
+  }
   submitting.value = true;
   try {
     const submitted = await controller.freeze(async (current) => {
@@ -990,6 +1055,7 @@ function openComment(commentId: number) {
 
 function closeComment(commentId: number) {
   activeComments.delete(commentId);
+  closedByUser.add(commentId);
 }
 
 /** The tray's prev/next walk the draft's pending comments — the buttons say
@@ -1020,7 +1086,15 @@ async function toggleResolved(commentId: number, resolved: boolean) {
     const index = entry.review.comments.findIndex((item) => item.id === commentId);
     if (index >= 0) entry.review.comments.splice(index, 1, comment);
     delete commentErrors[commentId];
-    if (resolved) activeComments.delete(commentId);
+    if (resolved) {
+      activeComments.delete(commentId);
+      closedByUser.add(commentId);
+    } else {
+      // A reopened thread is live again: it opens, and the reviewer's
+      // earlier collapse no longer pins it shut.
+      closedByUser.delete(commentId);
+      activeComments.add(commentId);
+    }
   } catch (cause) {
     commentErrors[commentId] = (cause as Error).message;
   }
@@ -1371,8 +1445,7 @@ function reviewAllFromPicker() {
         :submitting="submitting"
         :discarding="discarding"
         :delivery-errors="deliveryErrors"
-        :operator="operator"
-        :sending-replies="sendingReplies"
+        :continuation="continuation"
         subject-label="changes"
         :discard-action="discardDraft"
         @update:open="trayOpen = $event"
@@ -1383,7 +1456,6 @@ function reviewAllFromPicker() {
         @save-overall="saveOverall"
         @retarget="retarget"
         @submit="submit"
-        @send-replies="sendReviewReplies"
         @retry="retryDelivery"
       />
       <span v-if="changes" class="text-xs text-muted">

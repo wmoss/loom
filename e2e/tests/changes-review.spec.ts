@@ -8,6 +8,13 @@ import { join } from 'path';
 // becomes interactive once its row is hovered (`@git-diff-view/vue` renders
 // it `invisible` until `group-hover`), scoped to one side's table so the old
 // and new gutters never collide.
+/** Hovers a diff row to reveal its add-widget button. Callers click the
+ * result with `force: true`: the button only exists visually while its row is
+ * hovered, and a just-saved comment's card can reflow the rows under the
+ * stationary pointer between this hover and the click — a plain click then
+ * blocks on a visibility check it can never re-satisfy, because Playwright
+ * never re-hovers. The forced click's own mouse move re-engages the row's
+ * hover, and the press lands on the widget either way. */
 async function addWidgetButton(
   fileArticle: Locator,
   side: 'old' | 'new',
@@ -41,7 +48,7 @@ test('preserves Changes drafts through refresh and peer-submit conflicts', async
   await lockToggle.click();
   await expect(lockToggle).toHaveAttribute('aria-expanded', 'true');
   const article = page.locator('article').filter({ has: fileToggle });
-  await (await addWidgetButton(article, 'new', 1)).click();
+  await (await addWidgetButton(article, 'new', 1)).click({ force: true });
   const composer = page.getByTestId('change-comment-composer');
   const input = composer.locator('textarea');
   await input.fill('Explain why this line belongs here.');
@@ -192,12 +199,12 @@ test('confirm before discarding a typed inline comment', async ({ page, weaver }
   const confirm = page.getByTestId('change-comment-discard-confirm');
 
   // Escape with nothing typed closes the composer outright.
-  await (await addWidgetButton(article, 'new', 1)).click();
+  await (await addWidgetButton(article, 'new', 1)).click({ force: true });
   await composer.locator('textarea').press('Escape');
   await expect(composer).toHaveCount(0);
 
   // Escape with text typed presents the confirm, focused so Enter discards.
-  await (await addWidgetButton(article, 'new', 1)).click();
+  await (await addWidgetButton(article, 'new', 1)).click({ force: true });
   const input = composer.locator('textarea');
   await input.fill('Do not keep this.');
   await input.press('Escape');
@@ -208,7 +215,7 @@ test('confirm before discarding a typed inline comment', async ({ page, weaver }
   await expect(composer).toHaveCount(0);
 
   // Escape from the confirm returns to editing without discarding.
-  await (await addWidgetButton(article, 'new', 1)).click();
+  await (await addWidgetButton(article, 'new', 1)).click({ force: true });
   await input.fill('Keep me.');
   await input.press('Escape');
   await expect(confirm).toBeVisible();
@@ -234,7 +241,7 @@ test('comments whose lines leave the view persist in the outdated section', asyn
   await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
   const fileToggle = page.getByRole('button', { name: /shrinking\.txt/ });
   const article = page.locator('article').filter({ has: fileToggle });
-  await (await addWidgetButton(article, 'new', 20)).click();
+  await (await addWidgetButton(article, 'new', 20)).click({ force: true });
   const composer = page.getByTestId('change-comment-composer');
   await composer.locator('textarea').fill('This line fell off the end.');
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
@@ -278,7 +285,7 @@ test('a stale comment whose line content changed is outdated, not mispinned', as
   await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
   const fileToggle = page.getByRole('button', { name: /edited\.txt/ });
   const article = page.locator('article').filter({ has: fileToggle });
-  await (await addWidgetButton(article, 'new', 2)).click();
+  await (await addWidgetButton(article, 'new', 2)).click({ force: true });
   const composer = page.getByTestId('change-comment-composer');
   await composer.locator('textarea').fill('About the beta line.');
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
@@ -317,10 +324,10 @@ test('several comment threads stay open at once', async ({ page, weaver }) => {
   const composer = page.getByTestId('change-comment-composer');
 
   // Two threads on two lines. Saving the second must not hide the first.
-  await (await addWidgetButton(article, 'new', 3)).click();
+  await (await addWidgetButton(article, 'new', 3)).click({ force: true });
   await composer.locator('textarea').fill('First thread.');
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
-  await (await addWidgetButton(article, 'new', 8)).click();
+  await (await addWidgetButton(article, 'new', 8)).click({ force: true });
   await composer.locator('textarea').fill('Second thread.');
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
 
@@ -420,7 +427,7 @@ test('submitted comments persist in the diff and resolve from collapsed', async 
   await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
   const fileToggle = page.getByRole('button', { name: /resolve\.txt/ });
   const article = page.locator('article').filter({ has: fileToggle });
-  await (await addWidgetButton(article, 'new', 5)).click();
+  await (await addWidgetButton(article, 'new', 5)).click({ force: true });
   const composer = page.getByTestId('change-comment-composer');
   await composer.locator('textarea').fill('Submitted comments persist here.');
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
@@ -472,18 +479,35 @@ test('submitted comments persist in the diff and resolve from collapsed', async 
   await expect(thread).toContainText('loom-e2e-owner');
   await expect(card).toContainText('Resolved');
 
-  // The operator reply does not dead-end in the UI: the tray reports it
-  // waiting to reach the session, and sending it re-queues the review for
-  // delivery through the same path the original comments took.
+  // The operator reply does not dead-end in the UI: it queues on the review
+  // and looks exactly like a pending comment does — and a brand-new comment
+  // on the submitted review queues the same way, on the same envelope.
   const toggle = page.getByTestId('review-tray-toggle');
-  await expect(toggle).toContainText('Replies to send');
+  await expect(toggle).toContainText('Review · 1 pending');
   if ((await toggle.getAttribute('aria-expanded')) === 'false') await toggle.click();
-  const queue = page.locator('[data-testid^="review-reply-queue-"]');
-  await expect(queue).toHaveCount(1);
-  await expect(queue).toContainText('1 reply waiting to reach the session');
-  await queue.locator('[data-testid^="review-send-replies-"]').click();
-  await expect(queue).toHaveCount(0);
-  await expect(toggle).not.toContainText('Replies to send');
+  await expect(page.getByTestId('review-tray')).toContainText('Closing after the checks pass.');
+  await (await addWidgetButton(article, 'new', 7)).click({ force: true });
+  await page
+    .getByTestId('change-comment-composer')
+    .locator('textarea')
+    .fill('One more thing, brand new.');
+  await page
+    .getByTestId('change-comment-composer')
+    .getByRole('button', { name: 'Add pending comment' })
+    .click();
+  await expect(article).toContainText('One more thing, brand new.');
+  // Both kinds queue as the same rows, and one submit sends them together.
+  // (The composer's clicks minimized the tray; the header count survives.)
+  await expect(toggle).toContainText('Review · 2 pending');
+  if ((await toggle.getAttribute('aria-expanded')) === 'false') await toggle.click();
+  await expect(page.getByTestId('review-tray')).toContainText('One more thing, brand new.');
+  await expect(page.getByTestId('review-tray')).toContainText('Closing after the checks pass.');
+  const roundSubmitted = page.waitForResponse(
+    (response) => response.ok() && new URL(response.url()).pathname === '/api/reviews/submit',
+  );
+  await page.getByTestId('submit-review').click();
+  await roundSubmitted;
+  await expect(toggle).not.toContainText('pending');
 
   // The header collapses an open thread, same as the Close button.
   await card.getByTestId('review-comment-header').click();
@@ -606,7 +630,7 @@ test('a pending comment whose file left the snapshot is dropped, not parked', as
   const goneArticle = page
     .locator('article')
     .filter({ has: page.locator('code', { hasText: /^gone\.txt$/ }) });
-  await (await addWidgetButton(goneArticle, 'new', 2)).click();
+  await (await addWidgetButton(goneArticle, 'new', 2)).click({ force: true });
   await page
     .getByTestId('change-comment-composer')
     .locator('textarea')
@@ -624,9 +648,75 @@ test('a pending comment whose file left the snapshot is dropped, not parked', as
   const otherArticle = page
     .locator('article')
     .filter({ has: page.locator('code', { hasText: /^other\.txt$/ }) });
-  await (await addWidgetButton(otherArticle, 'new', 2)).click();
+  await (await addWidgetButton(otherArticle, 'new', 2)).click({ force: true });
   await expect(page.getByTestId('change-comment-composer')).toBeVisible();
   await expect(
     page.getByTestId('change-comment-composer').locator('textarea'),
   ).toHaveValue('');
+});
+
+test('unresolved threads open by default and resolved ones stay closed', async ({
+  page,
+  weaver,
+}) => {
+  const session = await weaver.seedSession({
+    goal: 'default open states',
+    name: 'changes-open-defaults',
+  });
+  const changedPath = join(session.work_dir, 'defaults.txt');
+  const lines = Array.from({ length: 10 }, (_, index) => `row ${index + 1}`);
+  writeFileSync(changedPath, lines.join('\n') + '\n');
+
+  await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
+  const article = page
+    .locator('article')
+    .filter({ has: page.locator('code', { hasText: /^defaults\.txt$/ }) });
+  // Two comments: one to leave live, one to resolve before reloading.
+  await (await addWidgetButton(article, 'new', 2)).click({ force: true });
+  await page
+    .getByTestId('change-comment-composer')
+    .locator('textarea')
+    .fill('stays open');
+  await page
+    .getByTestId('change-comment-composer')
+    .getByRole('button', { name: 'Add pending comment' })
+    .click();
+  // Let the first card mount and the rows settle before the next hover —
+  // under load, hovering into a reflowing table loses the row hover state.
+  await expect(article).toContainText('stays open');
+  await (await addWidgetButton(article, 'new', 8)).click({ force: true });
+  await page
+    .getByTestId('change-comment-composer')
+    .locator('textarea')
+    .fill('gets resolved');
+  await page
+    .getByTestId('change-comment-composer')
+    .getByRole('button', { name: 'Add pending comment' })
+    .click();
+  await expect(article).toContainText('gets resolved');
+  await page.getByTestId('review-tray-toggle').click();
+  const submitButton = page.getByTestId('submit-review');
+  await expect(submitButton).toBeVisible();
+  const submitted = page.waitForResponse(
+    (response) => response.ok() && new URL(response.url()).pathname === '/api/reviews/submit',
+  );
+  await submitButton.click();
+  await submitted;
+
+  const resolveCard = article.locator('[data-review-card]').filter({ hasText: 'gets resolved' });
+  await resolveCard.getByRole('button', { name: 'Resolve' }).click();
+  await expect(
+    article.locator('[data-review-collapsed]').filter({ hasText: 'gets resolved' }),
+  ).toContainText('Resolved');
+
+  // Arriving at the code review page: the live thread is open, the resolved
+  // one closed.
+  await page.reload();
+  await expect(article.locator('[data-review-card]').filter({ hasText: 'stays open' })).toBeVisible();
+  await expect(
+    article.locator('[data-review-collapsed]').filter({ hasText: 'stays open' }),
+  ).toHaveCount(0);
+  await expect(
+    article.locator('[data-review-collapsed]').filter({ hasText: 'gets resolved' }),
+  ).toContainText('Resolved');
 });
