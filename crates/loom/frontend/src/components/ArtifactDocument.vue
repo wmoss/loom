@@ -23,7 +23,9 @@ import {
   retryReviewDelivery,
   retargetReviewToCurrent,
   resolveThread,
+  replyReviewComment,
   setReviewCommentResolution,
+  getMe,
   submitReview,
   updateReview,
   updateReviewComment,
@@ -170,6 +172,37 @@ const summaryDirty = ref(false);
 let summarySaveTimer: ReturnType<typeof setTimeout> | null = null;
 const acknowledgeOutdated = ref(false);
 const submitting = ref(false);
+
+// The signed-in operator: reply rounds are a creator's action, and the tray
+// gates its send button on the name.
+const operator = ref('');
+const sendingReplies = ref(false);
+void getMe()
+  .then((me) => {
+    operator.value = me.username ?? '';
+  })
+  .catch(() => {});
+
+/** Sends a submitted review's queued operator replies back to the session —
+ *  the same queue and delivery the original comments rode. */
+async function sendReviewReplies(review: Review) {
+  if (sendingReplies.value) return;
+  sendingReplies.value = true;
+  trayError.value = '';
+  try {
+    const updated = await submitReview(review.id, {
+      expected_revision: review.draft_revision,
+      // A reply round rides the already-delivered snapshot; the outdated
+      // gate does not apply to it.
+      acknowledge_outdated: false,
+    });
+    replaceReview(updated);
+  } catch (cause) {
+    trayError.value = mutationMessage(cause);
+  } finally {
+    sendingReplies.value = false;
+  }
+}
 const discarding = ref(false);
 const layoutBusy = ref(false);
 let releaseLayoutBarrier: (() => void) | null = null;
@@ -711,12 +744,15 @@ async function setResolution(review: Review, commentId: number, resolved: boolea
       if (!resolved) return;
       await resolveThread(props.id, props.artifactName, -review.id);
       await loadReviews();
+      closeComment(commentId);
     } else {
       const updated = await setReviewCommentResolution(review.id, commentId, resolved);
       replaceReview({
         ...review,
         comments: review.comments.map((comment) => (comment.id === updated.id ? updated : comment)),
       });
+      // Resolving closes the thread, once the request has actually landed.
+      if (resolved) closeComment(commentId);
     }
     reviewNotice.value = resolved ? 'Review comment resolved.' : 'Review comment reopened.';
   } catch (e) {
@@ -844,6 +880,7 @@ async function onCommentEvent(
       'review_submitted',
       'review_delivery',
       'review_comment_resolved',
+      'review_comment_replied',
     ].includes(kind)
   ) {
     return;
@@ -959,6 +996,9 @@ function renderCard(entry: ReviewEntry): VNode {
       reanchoring: entry.comment.id === reanchorCommentId.value,
       error: commentErrors.value[entry.comment.id] ?? '',
       deleteAction: removeComment,
+      replyAction: (commentId: number, body: string) =>
+        replyReviewComment(props.id, commentId, body),
+      reanchorable: true,
       onFocus: focusComment,
       onClose: closeComment,
       onEdit: editComment,
@@ -1156,6 +1196,7 @@ const DocBody = () => {
 
     <ReviewTray
       ref="reviewTrayRef"
+      :floating="true"
       :reviews="reviews"
       :draft="draft"
       :open="trayOpen"
@@ -1167,6 +1208,8 @@ const DocBody = () => {
       :submitting="submitting"
       :discarding="discarding"
       :delivery-errors="deliveryErrors"
+      :operator="operator"
+      :sending-replies="sendingReplies"
       subject-label="artifact"
       :discard-action="discardDraft"
       @update:open="trayOpen = $event"
@@ -1177,6 +1220,7 @@ const DocBody = () => {
       @save-overall="saveOverallNote"
       @retarget="retargetDraft"
       @submit="submitDraft"
+      @send-replies="sendReviewReplies"
       @retry="retryDelivery"
     />
 

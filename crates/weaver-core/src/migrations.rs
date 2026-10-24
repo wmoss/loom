@@ -123,6 +123,21 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "scheduled_agents",
         include_str!("../migrations/0020_scheduled_agents.sql"),
     ),
+    (
+        21,
+        "review_comment_replies",
+        include_str!("../migrations/0021_review_comment_replies.sql"),
+    ),
+    (
+        22,
+        "reply_authors",
+        include_str!("../migrations/0022_reply_authors.sql"),
+    ),
+    (
+        23,
+        "review_reply_rounds",
+        include_str!("../migrations/0023_review_reply_rounds.sql"),
+    ),
 ];
 
 /// Latest core schema version compiled into this binary.

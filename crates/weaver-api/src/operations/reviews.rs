@@ -11,7 +11,8 @@ use super::OperationBundle;
 pub(super) use super::prelude;
 pub mod comments {
     //! Anchored feedback comments on a review: added and edited while it is a
-    //! private draft, resolved once it has been submitted.
+    //! private draft, resolved once it has been submitted, and — from the
+    //! reviewed session's own credential — answered after submit.
     pub(super) use super::prelude;
     pub mod create {
         use super::prelude::*;
@@ -98,6 +99,32 @@ pub mod comments {
             #[operand(positional)]
             pub comment_id: i64,
             pub resolved: bool,
+        }
+
+        pub type Output = ReviewCommentDto;
+    }
+
+    pub mod reply {
+        use super::prelude::*;
+
+        /// Append one entry to a comment's reply thread.
+        ///
+        /// Reachable from both sides of the review loop: the reviewed
+        /// session's own credential (as itself, its own reviews only) and
+        /// any operator (by username, any submitted review — the reach
+        /// `comments.resolve` grants). A comment's replies form one flat,
+        /// oldest-first conversation; resolving stays with `resolve`.
+        #[operation(id = "reviews.comments.reply", actor = SessionSelf, scope = Session, risk = Write,
+                    grants = ["loom/reviews/write@v1"])]
+        pub struct Input {
+            /// The comment whose thread the reply joins, as `reviews.list`
+            /// reports it.
+            #[operand(positional)]
+            pub comment_id: i64,
+            /// The reply body.
+            pub body: String,
+            #[operand(context)]
+            pub session: String,
         }
 
         pub type Output = ReviewCommentDto;
@@ -217,9 +244,10 @@ pub mod list {
     ///
     /// Reachable by both the reviewed session's own credential and a human
     /// operator: sessions may see submitted feedback on their own work, but not
-    /// draft reviews from other operators.
+    /// draft reviews from other operators. The delivered review prompt is
+    /// compact; this is where the reviewed session reads the full anchors.
     #[operation(id = "reviews.list", actor = SessionSelf, scope = Session, risk = Read,
-                grants = ["loom/artifacts/read@v1"], default = custom)]
+                grants = ["loom/reviews/read@v1"], default = custom)]
     pub struct Input {
         pub subject_kind: ReviewSubjectKindDto,
         /// The artifact name for `subject_kind = "artifact"`, or `"changes"` for
@@ -337,6 +365,7 @@ static OPERATIONS: &[&OperationSpec] = &[
     comments::update::SPEC,
     comments::delete::SPEC,
     comments::resolve::SPEC,
+    comments::reply::SPEC,
     submit::SPEC,
     retry_delivery::SPEC,
 ];
