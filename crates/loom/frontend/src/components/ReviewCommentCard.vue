@@ -186,7 +186,7 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
     type="button"
     class="my-1.5 flex w-full items-center gap-2 rounded border px-2 py-1 text-left text-xs"
     :class="
-      review.status === 'draft'
+      comment.status === 'pending'
         ? 'border-accent/60 bg-subtle text-fg hover:border-accent'
         : 'border-line bg-subtle/50 text-muted hover:border-accent/60'
     "
@@ -196,10 +196,10 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
   >
     <span
       class="inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-2xs font-semibold uppercase tracking-wide"
-      :class="review.status === 'draft' ? 'bg-accent text-accent-fg' : 'bg-surface text-faint'"
+      :class="comment.status === 'pending' ? 'bg-accent text-accent-fg' : 'bg-surface text-faint'"
     >
       {{
-        review.status === 'draft'
+        comment.status === 'pending'
           ? 'Pending'
           : comment.status === 'resolved'
             ? 'Resolved'
@@ -276,7 +276,7 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
         {{ legacyComment.body }}
       </div>
     </template>
-    <template v-else-if="review.status === 'draft'">
+    <template v-else-if="comment.status === 'pending'">
       <textarea
         v-if="editing"
         ref="textareaEl"
@@ -358,7 +358,7 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
     </form>
 
     <div class="mt-2 flex flex-wrap items-center gap-1.5">
-      <template v-if="review.status === 'draft'">
+      <template v-if="comment.status === 'pending'">
         <button
           v-if="editing"
           type="button"
@@ -403,7 +403,7 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
         />
       </template>
       <button
-        v-if="!review.legacy && review.status === 'submitted'"
+        v-if="!review.legacy && review.status === 'submitted' && comment.status !== 'pending'"
         type="button"
         class="btn-secondary px-2 py-1 text-2xs"
         @click.stop="replying ? cancelReply() : beginReply()"
@@ -411,7 +411,7 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
         {{ replying ? 'Cancel reply' : 'Reply' }}
       </button>
       <button
-        v-if="!review.legacy && review.status === 'submitted'"
+        v-if="!review.legacy && review.status === 'submitted' && comment.status !== 'pending'"
         ref="resolutionEl"
         type="button"
         class="btn-secondary px-2 py-1 text-2xs"

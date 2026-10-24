@@ -127,6 +127,7 @@ fn review_dto(review: &review::Review, current_version: &str) -> ReviewDto {
         delivery_error: review.delivery_error.clone(),
         delivery_key: review.delivery_key.clone(),
         pending_replies: review.pending_replies,
+        reply_upto: review.reply_upto,
         created_at: review.created_at.clone(),
         updated_at: review.updated_at.clone(),
         submitted_at: review.submitted_at.clone(),
@@ -236,6 +237,7 @@ fn legacy_review_dto(
         delivery_error: None,
         delivery_key: format!("legacy-thread:{}", thread.id),
         pending_replies: 0,
+        reply_upto: 0,
         created_at: thread.created_at.clone(),
         updated_at: thread
             .comments
@@ -362,7 +364,16 @@ async fn list_for(
             }
             _ => current_version.clone(),
         };
-        out.push(review_dto(item, &current));
+        let mut dto = review_dto(item, &current);
+        if !principal.is_human() {
+            // The session reads only what has already reached it: a pending
+            // comment or queued reply is the reviewer's words still on their
+            // side of the loop.
+            dto.comments.retain(|comment| comment.status != "pending");
+            dto.pending_replies = 0;
+            dto.reply_upto = 0;
+        }
+        out.push(dto);
     }
     if q.subject_kind == ReviewSubjectKindDto::Artifact {
         let artifact_id = subject_id
@@ -780,9 +791,9 @@ async fn comments_update_operation(
     let st = context.state;
     let principal = context.principal;
     let item = creator_review(&st, &principal, input.id).await?;
-    if item.status != "draft" {
-        return Err(submitted_draft_conflict(&st, &item).await);
-    }
+    // A submitted review stays open to its reviewer: the core decides
+    // which comment operations the surface allows (pending comments are
+    // editable; delivered ones are history).
     if input.body.is_none() && input.subject_version.is_none() && input.anchor.is_none() {
         return Err(AppError::bad_request("comment update is empty"));
     }
@@ -838,9 +849,9 @@ async fn comments_delete_operation(
     let st = context.state;
     let principal = context.principal;
     let item = creator_review(&st, &principal, input.id).await?;
-    if item.status != "draft" {
-        return Err(submitted_draft_conflict(&st, &item).await);
-    }
+    // A submitted review stays open to its reviewer: the core decides
+    // which comment operations the surface allows (pending comments are
+    // editable; delivered ones are history).
     let updated = match review::delete_comment(
         &st.db,
         item.id,
@@ -929,9 +940,9 @@ async fn comments_create_operation(
     let st = context.state;
     let principal = context.principal;
     let item = creator_review(&st, &principal, input.id).await?;
-    if item.status != "draft" {
-        return Err(submitted_draft_conflict(&st, &item).await);
-    }
+    // A submitted review stays open to its reviewer: the core decides
+    // which comment operations the surface allows (pending comments are
+    // editable; delivered ones are history).
     let (anchor, subject_version) = require_anchor(
         &st,
         &item,

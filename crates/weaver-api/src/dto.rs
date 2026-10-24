@@ -1842,6 +1842,11 @@ pub struct ReviewDto {
     /// yet. Submitting the review again sends them.
     #[serde(default)]
     pub pending_replies: u32,
+    /// The delivered-reply watermark: operator replies with ids past it are
+    /// the pending ones. Sessions read the payload that already reached
+    /// them; only operators see what is still queued.
+    #[serde(default)]
+    pub reply_upto: i64,
     pub created_at: String,
     pub updated_at: String,
     pub submitted_at: Option<String>,
