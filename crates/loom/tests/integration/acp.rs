@@ -255,6 +255,8 @@ async fn transient_setup_failure_preserves_the_acp_session_id() {
         mode: None,
         initial_model: None,
         initial_effort: None,
+        initial_fast: None,
+        harness: String::new(),
         goal: None,
         setup_timeout: Duration::from_millis(200),
     };
