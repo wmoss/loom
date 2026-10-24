@@ -39,6 +39,19 @@ async fn agents_list_merges_builtins_and_custom() {
 
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn catalog_refresh_starts_in_the_background() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    let res = client
+        .post("/api/agents/catalog/refresh", json!({ "harness": "" }))
+        .await
+        .expect("catalog refresh");
+    assert_eq!(res["started"], true);
+}
+
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn custom_agent_crud_and_validation() {
     let ts = TestServer::start().await;
     let client = &ts.client;
