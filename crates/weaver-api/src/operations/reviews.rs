@@ -1,9 +1,11 @@
 //! Creator-private draft feedback that, once submitted, becomes a durable
-//! review delivered into the reviewed session's own conversation.
+//! review delivered into the reviewed session's own conversation — and stays
+//! open to its reviewer: new comments and a changed overall note ride follow-up
+//! rounds through the same submission.
 //!
-//! Draft-mutating operations (`comments.delete`, `comments.update`, `discard`,
-//! `retarget`, `update`) are limited to the review's own creator and rejected
-//! once the review leaves `draft` status.
+//! Mutating operations (`comments.delete`, `comments.update`, `discard`,
+//! `update`) are limited to the review's own creator. Delivered comments are
+//! history — reply or resolve them — while `discard` stays draft-only.
 
 use super::registry::OperationSpec;
 use super::OperationBundle;
@@ -270,27 +272,6 @@ pub mod list {
     pub type Output = Vec<ReviewDto>;
 }
 
-pub mod retarget {
-    use super::prelude::*;
-
-    /// Retarget a draft review's subject onto its current version — an
-    /// artifact's latest revision, or the branch's current change-set — in one
-    /// step, without touching anything else.
-    #[operation(id = "reviews.retarget", actor = User, scope = Global, risk = Write,
-                render = custom, cli = "review retarget")]
-    pub struct Input {
-        /// The draft review to retarget.
-        #[operand(positional)]
-        pub id: i64,
-        /// Optimistic-concurrency guard on the review's draft revision, as
-        /// `loom review show` or the previous mutation reported it.
-        #[operand(long = "revision")]
-        pub expected_revision: i64,
-    }
-
-    pub type Output = ReviewDto;
-}
-
 pub mod retry_delivery {
     use super::prelude::*;
 
@@ -323,10 +304,6 @@ pub mod submit {
         pub id: i64,
         /// Optimistic-concurrency guard on the review's draft revision.
         pub expected_revision: i64,
-        /// Acknowledge that the review's subject moved since it was drafted, and
-        /// submit against the newer version anyway.
-        #[operand(default = false)]
-        pub acknowledge_outdated: bool,
     }
 
     pub type Output = ReviewDto;
@@ -335,20 +312,17 @@ pub mod submit {
 pub mod update {
     use super::prelude::*;
 
-    /// Edit a draft review's summary, or retarget it onto a caller-supplied
-    /// subject version.
+    /// Edit a review's overall note. On a draft it becomes the submitted
+    /// note; on the reviewer's own submitted review it queues for the next
+    /// follow-up round, like a pending comment does.
     #[operation(id = "reviews.update", actor = User, scope = Global, risk = Write)]
     pub struct Input {
-        /// The draft review to update.
+        /// The review to update.
         #[operand(positional)]
         pub id: i64,
         /// Optimistic-concurrency guard on the review's draft revision.
         pub expected_revision: i64,
         pub summary: Option<String>,
-        /// A newer subject version to retarget onto: an artifact revision number
-        /// for an artifact review, or the current change-set version for a
-        /// changes review (which must match the current version exactly).
-        pub subject_version: Option<String>,
     }
 
     pub type Output = ReviewDto;
@@ -358,7 +332,6 @@ static OPERATIONS: &[&OperationSpec] = &[
     get::SPEC,
     update::SPEC,
     discard::SPEC,
-    retarget::SPEC,
     list::SPEC,
     create::SPEC,
     comments::create::SPEC,

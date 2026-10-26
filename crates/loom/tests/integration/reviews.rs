@@ -184,7 +184,6 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
             id: draft.id,
             expected_revision: draft.draft_revision,
             summary: (Some("Review the safety argument.".to_string())).clone(),
-            subject_version: None.clone(),
         })
         .await
         .unwrap();
@@ -305,17 +304,6 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
         })
         .await
         .unwrap();
-    let outdated = ts
-        .client
-        .invoke::<reviews::submit::Op>(&reviews::submit::Input {
-            id: draft.id,
-            expected_revision: added.draft_revision,
-            acknowledge_outdated: false,
-        })
-        .await
-        .unwrap_err();
-    assert!(outdated.to_string().contains("outdated"));
-
     let reanchored = ts
         .client
         .invoke::<reviews::comments::update::Op>(&reviews::comments::update::Input {
@@ -335,16 +323,16 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
         })
         .await
         .unwrap();
-    assert_eq!(reanchored.subject.version, "2");
+    // The envelope keeps the revision it began against — provenance — while
+    // the re-anchored comment carries its own newer revision.
+    assert_eq!(reanchored.subject.version, "1");
     assert_eq!(reanchored.comments[0].subject_version, "2");
-    assert!(!reanchored.outdated);
     let preview = reanchored.message.clone();
     let submitted = ts
         .client
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: draft.id,
             expected_revision: reanchored.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();
@@ -369,7 +357,6 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
         .json(&json!({
             "id": draft.id,
             "expected_revision": 0,
-            "acknowledge_outdated": true,
         }))
         .send()
         .await
@@ -380,7 +367,6 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
             .invoke::<reviews::submit::Op>(&reviews::submit::Input {
                 id: draft.id,
                 expected_revision: reanchored.draft_revision,
-                acknowledge_outdated: true,
             })
             .await
             .unwrap()
@@ -481,19 +467,6 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
             &ts,
             &[
                 "review",
-                "retarget",
-                &cli_draft.id.to_string(),
-                "--revision",
-                &cli_draft.draft_revision.to_string(),
-            ],
-        )
-        .await,
-    );
-    assert_cli_ok(
-        &loom_review_cli(
-            &ts,
-            &[
-                "review",
                 "add",
                 &session.id,
                 "design",
@@ -517,7 +490,11 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
     let shown = loom_review_cli(&ts, &["review", "show", &cli_draft.id.to_string()]).await;
     assert_cli_ok(&shown);
     let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
-    assert_eq!(shown["subject"]["version"], "3");
+    // The envelope keeps the revision it began against (the draft opened at
+    // artifact revision 2); the fresh comment carries the revision it was
+    // anchored to.
+    assert_eq!(shown["subject"]["version"], "2");
+    assert_eq!(shown["comments"][0]["subject_version"], "3");
     assert_eq!(shown["summary"], "CLI overall");
     assert_eq!(shown["comments"][0]["anchor"]["quote"], "Third");
     assert_eq!(shown["comments"][0]["anchor"]["prefix"], "# Design\n\n");
@@ -625,23 +602,11 @@ async fn api_and_cli_share_the_private_optimistic_review_contract() {
         "hello\nstaged\nunstaged\nmoved\n",
     )
     .unwrap();
-    assert!(ts
-        .client
-        .invoke::<reviews::submit::Op>(&reviews::submit::Input {
-            id: change_draft.id,
-            expected_revision: change_draft.draft_revision,
-            acknowledge_outdated: false,
-        })
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("outdated"));
     let submitted = ts
         .client
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: change_draft.id,
             expected_revision: change_draft.draft_revision,
-            acknowledge_outdated: true,
         })
         .await
         .unwrap();
@@ -705,7 +670,6 @@ async fn acp_delivery_has_one_protected_crash_boundary_and_can_rehome() {
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: draft.id,
             expected_revision: draft.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();
@@ -792,7 +756,6 @@ async fn acp_delivery_has_one_protected_crash_boundary_and_can_rehome() {
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: rehomed.id,
             expected_revision: rehomed.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();
@@ -869,7 +832,6 @@ async fn terminal_delivery_queues_offline_recovers_and_reports_real_failure() {
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: offline.id,
             expected_revision: offline.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();
@@ -930,7 +892,6 @@ async fn terminal_delivery_queues_offline_recovers_and_reports_real_failure() {
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: failing.id,
             expected_revision: failing.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();
@@ -1019,7 +980,6 @@ async fn a_session_reads_full_review_detail_through_its_mcp_tool() {
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: draft.id,
             expected_revision: draft.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();
@@ -1139,7 +1099,6 @@ async fn a_restricted_session_keeps_the_review_detail_tool() {
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: draft.id,
             expected_revision: draft.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();
@@ -1292,17 +1251,13 @@ async fn a_commit_scoped_review_anchors_against_its_own_snapshot() {
         .await
         .unwrap();
     assert_eq!(listed.len(), 1);
-    assert!(!listed[0].outdated);
-    let submitted = ts
-        .client
+    ts.client
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: draft.id,
             expected_revision: commented.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();
-    assert!(!submitted.acknowledged_outdated);
 }
 
 #[tokio::test]
@@ -1391,7 +1346,9 @@ async fn an_unstaged_scoped_review_anchors_against_its_own_snapshot() {
         .await
         .unwrap();
     assert_eq!(fresh.len(), 1);
-    assert!(!fresh[0].outdated);
+    // A further unstaged edit moves the live snapshot the review was pinned
+    // to; the review keeps its captured version as provenance, and
+    // staleness is decided per anchor where it renders — never here.
     std::fs::write(repo.join("committed.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
     let moved = ts
         .client
@@ -1402,9 +1359,10 @@ async fn an_unstaged_scoped_review_anchors_against_its_own_snapshot() {
         })
         .await
         .unwrap();
-    assert!(
-        moved[0].outdated,
-        "a further unstaged edit moves the live snapshot the review is pinned to"
+    assert_eq!(moved[0].subject.version, fresh[0].subject.version);
+    assert_ne!(
+        moved[0].subject.current_version, fresh[0].subject.current_version,
+        "the live snapshot moved under the review's captured provenance"
     );
 }
 
@@ -1421,7 +1379,6 @@ async fn a_follow_up_round_sends_new_comments_and_replies_together() {
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: draft.id,
             expected_revision: draft.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();
@@ -1493,7 +1450,6 @@ async fn a_follow_up_round_sends_new_comments_and_replies_together() {
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: submitted.id,
             expected_revision: with_new_comment.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();
@@ -1544,7 +1500,6 @@ async fn a_follow_up_round_sends_new_comments_and_replies_together() {
         .invoke::<reviews::submit::Op>(&reviews::submit::Input {
             id: submitted.id,
             expected_revision: round.draft_revision,
-            acknowledge_outdated: false,
         })
         .await
         .unwrap();

@@ -153,9 +153,12 @@ pub struct Review {
     pub subject_version: String,
     pub status: String,
     pub summary: String,
+    /// The note as the session last received it — the summary's delivered
+    /// cursor. A summary that differs from it is pending words, riding the
+    /// next round like a pending comment does.
+    pub delivered_summary: String,
     pub draft_revision: i64,
     pub created_by: String,
-    pub acknowledged_outdated: bool,
     pub delivery_state: String,
     pub delivery_error: Option<String>,
     pub delivery_key: String,
@@ -176,6 +179,11 @@ pub struct Review {
     /// never stored.
     #[sqlx(default)]
     pub pending_replies: u32,
+    /// The note the live, undelivered batch carries — `None` when no batch
+    /// is in flight. The follow-up surface's gate compares against this
+    /// first, so words already queued for the session stop reading as
+    /// pending, exactly as the submit path's no-op check does.
+    pub queued_summary: Option<String>,
     #[sqlx(skip)]
     pub comments: Vec<ReviewComment>,
 }
@@ -282,7 +290,6 @@ pub struct CommentPatch<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct DraftPatch<'a> {
     pub summary: Option<&'a str>,
-    pub subject_version: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +307,7 @@ pub struct OutboxItem {
     pub next_attempt_at: String,
     pub last_error: Option<String>,
     pub lease_token: Option<String>,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -318,9 +326,13 @@ pub struct DeliveryLease {
 }
 
 const SELECT_REVIEW: &str = "SELECT id, repo_root, branch_id, session_id, subject_kind, \
-    subject_id, subject_key, subject_label, subject_version, status, summary, draft_revision, created_by, \
-    acknowledged_outdated, delivery_state, delivery_error, delivery_key, created_at, \
-    updated_at, submitted_at, reply_round, reply_upto, comment_upto FROM reviews";
+    subject_id, subject_key, subject_label, subject_version, status, summary, \
+    delivered_summary, draft_revision, created_by, \
+    delivery_state, delivery_error, delivery_key, created_at, \
+    updated_at, submitted_at, reply_round, reply_upto, comment_upto, \
+    (SELECT o.summary FROM review_delivery_outbox o \
+      WHERE o.review_id = reviews.id AND o.state != 'delivered') AS queued_summary \
+    FROM reviews";
 
 const SELECT_COMMENT: &str = "SELECT id, review_id, subject_version, anchor_kind, anchor_json, \
     body, status, created_at, updated_at FROM review_comments";
@@ -687,32 +699,6 @@ async fn finish_surface_mutation(
     attach_comments_tx(tx, review).await
 }
 
-async fn finish_draft_mutation(
-    tx: &mut crate::db::DbTransaction<'_>,
-    review_id: i64,
-    expected_revision: i64,
-    now: &str,
-) -> Result<Review> {
-    let updated = sqlx::query(
-        "UPDATE reviews
-         SET draft_revision = draft_revision + 1, updated_at = ?
-         WHERE id = ? AND status = 'draft' AND draft_revision = ?",
-    )
-    .bind(now)
-    .bind(review_id)
-    .bind(expected_revision)
-    .execute(&mut **tx)
-    .await?;
-    if updated.rows_affected() != 1 {
-        bail!("draft changed while applying the mutation");
-    }
-    let review = sqlx::query_as::<_, Review>(&format!("{SELECT_REVIEW} WHERE id = ?"))
-        .bind(review_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    attach_comments_tx(tx, review).await
-}
-
 pub async fn add_comment(
     db: &Db,
     review_id: i64,
@@ -879,27 +865,7 @@ pub async fn patch_comment(
     .execute(&mut *tx)
     .await?;
 
-    // Re-anchoring the final old comment is an explicit transition of the
-    // whole review envelope (including its persisted overall note) onto that
-    // revision. Any remaining old anchor keeps the original target and stale
-    // acknowledgement requirement.
-    if patch.subject_version.is_some() && patch.anchor.is_some() {
-        let old_comments: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM review_comments
-             WHERE review_id = ? AND subject_version != ?",
-        )
-        .bind(review_id)
-        .bind(subject_version)
-        .fetch_one(&mut *tx)
-        .await?;
-        if old_comments == 0 {
-            sqlx::query("UPDATE reviews SET subject_version = ? WHERE id = ?")
-                .bind(subject_version)
-                .bind(review_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-    }
+    let now = now_iso();
     let review = finish_surface_mutation(&mut tx, review_id, expected_revision, &now).await?;
     tx.commit().await?;
     Ok(review)
@@ -947,11 +913,11 @@ pub async fn update_draft(
     if let Some(summary) = patch.summary {
         validate_summary(summary)?;
     }
-    if patch.summary.is_none() && patch.subject_version.is_none() {
+    if patch.summary.is_none() {
         bail!("draft update is empty");
     }
     let mut tx = crate::db::begin_immediate(db).await?;
-    require_creator_draft(&mut tx, review_id, creator, expected_revision).await?;
+    require_comment_surface(&mut tx, review_id, creator, expected_revision, None).await?;
     if let Some(summary) = patch.summary {
         sqlx::query("UPDATE reviews SET summary = ? WHERE id = ?")
             .bind(summary.trim())
@@ -959,65 +925,8 @@ pub async fn update_draft(
             .execute(&mut *tx)
             .await?;
     }
-    if let Some(subject_version) = patch.subject_version {
-        let old_comments: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM review_comments
-             WHERE review_id = ? AND subject_version != ?",
-        )
-        .bind(review_id)
-        .bind(subject_version)
-        .fetch_one(&mut *tx)
-        .await?;
-        if old_comments != 0 {
-            bail!("re-anchor every comment before advancing the review revision");
-        }
-        sqlx::query("UPDATE reviews SET subject_version = ? WHERE id = ?")
-            .bind(subject_version)
-            .bind(review_id)
-            .execute(&mut *tx)
-            .await?;
-    }
     let now = now_iso();
-    let review = finish_draft_mutation(&mut tx, review_id, expected_revision, &now).await?;
-    tx.commit().await?;
-    Ok(review)
-}
-
-pub async fn retarget_draft_to_current(
-    db: &Db,
-    review_id: i64,
-    creator: &str,
-    expected_revision: i64,
-) -> Result<Review> {
-    let mut tx = crate::db::begin_immediate(db).await?;
-    let review = require_creator_draft(&mut tx, review_id, creator, expected_revision).await?;
-    let comment_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM review_comments WHERE review_id = ?")
-            .bind(review_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    if comment_count != 0 {
-        bail!("re-anchor every comment before advancing the review revision");
-    }
-    let artifact_id = review
-        .subject_id
-        .parse::<i64>()
-        .context("invalid artifact review subject id")?;
-    let current = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT MAX(rev) FROM artifact_versions WHERE artifact_id = ?",
-    )
-    .bind(artifact_id)
-    .fetch_one(&mut *tx)
-    .await?
-    .ok_or_else(|| anyhow!("artifact review subject not found"))?
-    .to_string();
-    sqlx::query("UPDATE reviews SET subject_version = ? WHERE id = ?")
-        .bind(current)
-        .bind(review_id)
-        .execute(&mut *tx)
-        .await?;
-    let now = now_iso();
-    let review = finish_draft_mutation(&mut tx, review_id, expected_revision, &now).await?;
+    let review = finish_surface_mutation(&mut tx, review_id, expected_revision, &now).await?;
     tx.commit().await?;
     Ok(review)
 }
@@ -1167,50 +1076,13 @@ pub async fn discard(
     Ok(removed)
 }
 
-fn is_outdated(review: &Review, comments: &[ReviewComment], current_version: &str) -> bool {
-    review.subject_version != current_version
-        || comments
-            .iter()
-            .any(|comment| comment.subject_version != current_version)
-}
-
 pub async fn submit(
     db: &Db,
     review_id: i64,
     creator: &str,
     expected_revision: i64,
-    acknowledge_outdated: bool,
 ) -> Result<Submission> {
-    submit_inner(
-        db,
-        review_id,
-        creator,
-        expected_revision,
-        acknowledge_outdated,
-        None,
-    )
-    .await
-}
-
-/// Submit a non-database subject against the current version resolved by its
-/// authoritative handler immediately before this transaction.
-pub async fn submit_at_version(
-    db: &Db,
-    review_id: i64,
-    creator: &str,
-    expected_revision: i64,
-    acknowledge_outdated: bool,
-    current_version: &str,
-) -> Result<Submission> {
-    submit_inner(
-        db,
-        review_id,
-        creator,
-        expected_revision,
-        acknowledge_outdated,
-        Some(current_version),
-    )
-    .await
+    submit_inner(db, review_id, creator, expected_revision).await
 }
 
 async fn submit_inner(
@@ -1218,8 +1090,6 @@ async fn submit_inner(
     review_id: i64,
     creator: &str,
     expected_revision: i64,
-    acknowledge_outdated: bool,
-    provided_current_version: Option<&str>,
 ) -> Result<Submission> {
     let mut tx = crate::db::begin_immediate(db).await?;
     let mut review =
@@ -1245,7 +1115,21 @@ async fn submit_inner(
     if review.status == "submitted" {
         let reply_cutoff = max_operator_reply_id(&mut *tx, review_id).await?;
         let pending_comments = comments.iter().any(|comment| comment.status == "pending");
-        if pending_comments || reply_cutoff > review.reply_upto {
+        let batch: Option<OutboxItem> = sqlx::query_as::<_, OutboxItem>(
+            "SELECT review_id, delivery_key, state, attempts, next_attempt_at, last_error, \
+             lease_token, summary FROM review_delivery_outbox WHERE review_id = ?",
+        )
+        .bind(review_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        // A note the live batch already carries is not pending words — it
+        // rides that batch. Once delivery lands, the batch snapshot becomes
+        // the review's delivered_summary and the comparison stays truthful.
+        let pending_note = match &batch {
+            Some(item) if item.state != "delivered" => review.summary != item.summary,
+            _ => review.summary != review.delivered_summary,
+        };
+        if pending_comments || pending_note || reply_cutoff > review.reply_upto {
             let event =
                 queue_follow_up_round(&mut tx, &mut review, &mut comments, reply_cutoff).await?;
             tx.commit().await?;
@@ -1272,41 +1156,16 @@ async fn submit_inner(
     if comments.is_empty() && review.summary.trim().is_empty() {
         bail!("add a comment or overall note before submitting");
     }
-    let current_version = match review.subject_kind.as_str() {
-        "artifact" => {
-            let artifact_id: i64 = review
-                .subject_id
-                .parse()
-                .context("invalid artifact review subject id")?;
-            // Artifact writes use the same immediate transaction discipline.
-            sqlx::query_scalar::<_, Option<i64>>(
-                "SELECT MAX(rev) FROM artifact_versions WHERE artifact_id = ?",
-            )
-            .bind(artifact_id)
-            .fetch_one(&mut *tx)
-            .await?
-            .ok_or_else(|| anyhow!("artifact review subject not found"))?
-            .to_string()
-        }
-        "changes" => provided_current_version
-            .filter(|version| !version.is_empty())
-            .context("current change-set version is unavailable")?
-            .to_string(),
-        _ => bail!("unsupported review subject kind"),
-    };
-    let outdated = is_outdated(&review, &comments, &current_version);
-    if outdated && !acknowledge_outdated {
-        bail!("review is outdated; acknowledge the reviewed revision before submitting");
-    }
-
+    // The captured revision is the review's provenance, not a gate: staleness
+    // is a property of what a comment anchors at, decided where the anchor
+    // renders, and the delivered message quotes each comment's own revision.
     let now = now_iso();
     sqlx::query(
         "UPDATE reviews
-         SET status = 'submitted', acknowledged_outdated = ?,
+         SET status = 'submitted',
              delivery_state = 'queued', delivery_error = NULL, submitted_at = ?, updated_at = ?
          WHERE id = ? AND status = 'draft' AND draft_revision = ?",
     )
-    .bind(outdated && acknowledge_outdated)
     .bind(&now)
     .bind(&now)
     .bind(review_id)
@@ -1343,9 +1202,7 @@ async fn submit_inner(
             "key": review.subject_key,
             "label": review.subject_label,
             "revision": review.subject_version,
-            "current_revision": current_version,
         },
-        "outdated": outdated,
         "summary": review.summary,
         "comments": comment_payload,
         "message": message,
@@ -1368,14 +1225,20 @@ async fn submit_inner(
     let comment_cutoff = comments.iter().map(|comment| comment.id).max().unwrap_or(0);
     sqlx::query(
         "INSERT INTO review_delivery_outbox
-            (review_id, delivery_key, state, attempts, next_attempt_at, comment_upto)
-         VALUES (?, ?, 'queued', 0, ?, ?)
+            (review_id, delivery_key, state, attempts, next_attempt_at, comment_upto, summary,
+             payload)
+         VALUES (?, ?, 'queued', 0, ?, ?, ?, ?)
          ON CONFLICT(review_id) DO NOTHING",
     )
     .bind(review_id)
     .bind(&review.delivery_key)
     .bind(&now)
     .bind(comment_cutoff)
+    .bind(&review.summary)
+    // The payload freezes exactly as the event's message: delivery re-sends
+    // byte-identical text, and the words the session receives are the words
+    // the delivered cursors record.
+    .bind(&message)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1449,14 +1312,14 @@ async fn queue_follow_up_round(
     sqlx::query(
         "INSERT INTO review_delivery_outbox
             (review_id, delivery_key, state, attempts, next_attempt_at,
-             reply_from, reply_upto, comment_upto, payload)
-         VALUES (?, ?, 'queued', 0, ?, ?, ?, ?, ?)
+             reply_from, reply_upto, comment_upto, summary, payload)
+         VALUES (?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(review_id) DO UPDATE SET
             delivery_key = excluded.delivery_key, state = 'queued', attempts = 0,
             next_attempt_at = excluded.next_attempt_at, last_error = NULL,
             lease_token = NULL, reply_from = excluded.reply_from,
             reply_upto = excluded.reply_upto, comment_upto = excluded.comment_upto,
-            payload = excluded.payload",
+            summary = excluded.summary, payload = excluded.payload",
     )
     .bind(review.id)
     .bind(&key)
@@ -1464,6 +1327,7 @@ async fn queue_follow_up_round(
     .bind(reply_from)
     .bind(reply_cutoff)
     .bind(comment_cutoff)
+    .bind(&review.summary)
     .bind(&message)
     .execute(&mut **tx)
     .await?;
@@ -1536,6 +1400,16 @@ pub fn follow_up_message(
         )
     };
     let mut message = subject;
+    if review.summary != review.delivered_summary {
+        // A cleared note is still news: the round says so, and its delivery
+        // advances the delivered cursor past the words it replaced. An
+        // empty round would strand the cursor and re-queue forever.
+        if review.summary.is_empty() {
+            message.push_str("\n\nThe reviewer cleared the overall note.");
+        } else {
+            message.push_str(&format!("\n\nOverall:\n{}", review.summary));
+        }
+    }
     let fresh_comments: Vec<&ReviewComment> = review
         .comments
         .iter()
@@ -1585,10 +1459,36 @@ pub fn follow_up_message(
     message
 }
 
+/// The message a submission would carry for the review as it stands — the
+/// tray's preview. A draft previews its initial payload; an envelope with
+/// words still on the reviewer's side previews the next follow-up round; a
+/// quiescent envelope previews its standing message. The pending-note rule
+/// matches the submit path's: words a live batch already carries are not
+/// pending.
+pub fn preview_message(review: &Review) -> String {
+    if review.status != "submitted" {
+        return structured_message(review);
+    }
+    let pending_comments = review
+        .comments
+        .iter()
+        .any(|comment| comment.status == "pending");
+    let pending_note = match &review.queued_summary {
+        Some(queued) => review.summary != *queued,
+        None => review.summary != review.delivered_summary,
+    };
+    if pending_comments || pending_note || review.pending_replies > 0 {
+        // Every operator reply past the delivered cursor is pending, so an
+        // open window picks exactly those up.
+        return follow_up_message(review, review.comment_upto, review.reply_upto, i64::MAX);
+    }
+    structured_message(review)
+}
+
 pub async fn ready_outbox(db: &Db, limit: i64) -> Result<Vec<OutboxItem>> {
     Ok(sqlx::query_as::<_, OutboxItem>(
         "SELECT review_id, delivery_key, state, attempts, next_attempt_at, last_error,
-                lease_token
+                lease_token, summary
          FROM review_delivery_outbox
          WHERE state IN ('queued', 'retrying', 'delivering') AND next_attempt_at <= ?
          ORDER BY next_attempt_at, review_id LIMIT ?",
@@ -1731,19 +1631,20 @@ pub async fn mark_delivered(db: &Db, review_id: i64, lease_token: &str) -> Resul
         // The delivered cursors move here, never at submit: these words have
         // now reached the session, so the next round's batch is exactly what
         // arrives after them.
-        let (comment_upto, reply_upto): (i64, i64) = sqlx::query_as(
-            "SELECT comment_upto, reply_upto FROM review_delivery_outbox WHERE review_id = ?",
+        let (comment_upto, reply_upto, delivered_summary): (i64, i64, String) = sqlx::query_as(
+            "SELECT comment_upto, reply_upto, summary FROM review_delivery_outbox WHERE review_id = ?",
         )
         .bind(review_id)
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query(
             "UPDATE reviews SET delivery_state = 'delivered', delivery_error = NULL,
-                 comment_upto = ?, reply_upto = ?
+                 comment_upto = ?, reply_upto = ?, delivered_summary = ?
              WHERE id = ? AND delivery_state = 'delivering'",
         )
         .bind(comment_upto)
         .bind(reply_upto)
+        .bind(delivered_summary)
         .bind(review_id)
         .execute(&mut *tx)
         .await?;
@@ -1947,9 +1848,9 @@ mod tests {
             subject_version: "1".to_string(),
             status: "submitted".to_string(),
             summary: String::new(),
+            delivered_summary: String::new(),
             draft_revision: 1,
             created_by: "alice".to_string(),
-            acknowledged_outdated: false,
             delivery_state: "delivered".to_string(),
             delivery_error: None,
             delivery_key: "key-7".to_string(),
@@ -1960,6 +1861,7 @@ mod tests {
             reply_upto: 0,
             comment_upto: 0,
             pending_replies: 0,
+            queued_summary: None,
             comments: Vec::new(),
         }
     }
@@ -1984,7 +1886,6 @@ mod tests {
             updated.draft_revision,
             &DraftPatch {
                 summary: Some("Durable overall note"),
-                subject_version: None,
             },
         )
         .await
@@ -2053,49 +1954,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overall_only_draft_retargets_to_current_with_one_guarded_revision() {
-        let (db, artifact) = seeded().await;
-        let draft = draft(&db, &artifact, "alice").await;
-        let draft = update_draft(
-            &db,
-            draft.id,
-            "alice",
-            draft.draft_revision,
-            &DraftPatch {
-                summary: Some("Review the current design"),
-                subject_version: None,
-            },
-        )
-        .await
-        .unwrap();
-        artifact::write(
-            &db,
-            &NewRevision {
-                repo_root: "/repo",
-                branch_id: artifact.branch_id.as_deref(),
-                name: "design",
-                kind: "markdown",
-                title: "Design",
-                content: "A newer design",
-                author: "agent",
-            },
-        )
-        .await
-        .unwrap();
-
-        let moved = retarget_draft_to_current(&db, draft.id, "alice", draft.draft_revision)
-            .await
-            .unwrap();
-        assert_eq!(moved.subject_version, "2");
-        assert_eq!(moved.summary, "Review the current design");
-        assert_eq!(moved.draft_revision, draft.draft_revision + 1);
-        let stale = retarget_draft_to_current(&db, draft.id, "alice", draft.draft_revision)
-            .await
-            .unwrap_err();
-        assert!(stale.downcast_ref::<DraftRevisionConflict>().is_some());
-    }
-
-    #[tokio::test]
     async fn replies_append_after_submit_and_reject_everyone_else() {
         let (db, artifact) = seeded().await;
         let draft = draft(&db, &artifact, "alice").await;
@@ -2109,7 +1967,7 @@ mod tests {
                 .is_err()
         );
 
-        let submitted = submit(&db, draft.id, "alice", draft.draft_revision, false)
+        let submitted = submit(&db, draft.id, "alice", draft.draft_revision)
             .await
             .unwrap();
 
@@ -2177,7 +2035,7 @@ mod tests {
         let draft = draft(&db, &artifact, "alice").await;
         let draft = add(&db, &draft, "change this").await;
         let comment_id = draft.comments[0].id;
-        let _ = submit(&db, draft.id, "alice", draft.draft_revision, false)
+        let _ = submit(&db, draft.id, "alice", draft.draft_revision)
             .await
             .unwrap();
 
@@ -2353,7 +2211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_is_atomic_idempotent_and_requires_stale_acknowledgement() {
+    async fn submit_is_atomic_idempotent_without_a_stale_gate() {
         let (db, artifact) = seeded().await;
         let first_draft = draft(&db, &artifact, "alice").await;
         let first_draft = add(&db, &first_draft, "change this").await;
@@ -2372,16 +2230,9 @@ mod tests {
         .await
         .unwrap();
 
-        let stale = submit(
-            &db,
-            first_draft.id,
-            "alice",
-            first_draft.draft_revision,
-            false,
-        )
-        .await
-        .unwrap_err();
-        assert!(stale.to_string().contains("outdated"));
+        // The captured revision is provenance, not a gate: a draft started
+        // against an older snapshot submits plainly, and staleness is decided
+        // where each comment's anchor renders, not here.
         let first_draft = update_draft(
             &db,
             first_draft.id,
@@ -2389,39 +2240,23 @@ mod tests {
             first_draft.draft_revision,
             &DraftPatch {
                 summary: Some("Overall note"),
-                subject_version: None,
             },
         )
         .await
         .unwrap();
-        let submitted = submit(
-            &db,
-            first_draft.id,
-            "alice",
-            first_draft.draft_revision,
-            true,
-        )
-        .await
-        .unwrap();
+        let submitted = submit(&db, first_draft.id, "alice", first_draft.draft_revision)
+            .await
+            .unwrap();
         assert!(submitted.event.is_some());
         assert_eq!(submitted.review.status, "submitted");
-        assert!(submitted.review.acknowledged_outdated);
 
-        let stale_retry = submit(&db, first_draft.id, "alice", 0, true)
-            .await
-            .unwrap_err();
+        let stale_retry = submit(&db, first_draft.id, "alice", 0).await.unwrap_err();
         assert!(stale_retry
             .downcast_ref::<DraftRevisionConflict>()
             .is_some());
-        let retried = submit(
-            &db,
-            first_draft.id,
-            "alice",
-            first_draft.draft_revision,
-            true,
-        )
-        .await
-        .unwrap();
+        let retried = submit(&db, first_draft.id, "alice", first_draft.draft_revision)
+            .await
+            .unwrap();
         assert!(retried.event.is_none());
         let events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM events WHERE branch_id = ? AND kind = 'review_submitted'",
@@ -2455,11 +2290,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_delivery_drain_maps_every_outbox_column() {
+        let (db, artifact) = seeded().await;
+        let first = add(&db, &draft(&db, &artifact, "alice").await, "change this").await;
+        let first = update_draft(
+            &db,
+            first.id,
+            "alice",
+            first.draft_revision,
+            &DraftPatch {
+                summary: Some("A note the drain must carry"),
+            },
+        )
+        .await
+        .unwrap();
+        let submitted = submit(&db, first.id, "alice", first.draft_revision)
+            .await
+            .unwrap();
+        assert_eq!(submitted.review.delivery_state, "queued");
+
+        // The background sweep maps rows through OutboxItem: a column drift
+        // between the struct and this query fails every due row at once, and
+        // the integration tests that would catch it are the two that cannot
+        // run on this box — so the mapping is pinned here.
+        let due = ready_outbox(&db, 10).await.unwrap();
+        let row = due
+            .iter()
+            .find(|item| item.review_id == first.id)
+            .expect("the queued round is due for the drain");
+        assert_eq!(row.state, "queued");
+        assert_eq!(row.summary, "A note the drain must carry");
+        assert!(!row.next_attempt_at.is_empty());
+    }
+
+    #[tokio::test]
     async fn delivery_claim_has_a_recoverable_single_owner_lease() {
         let (db, artifact) = seeded().await;
         let draft = draft(&db, &artifact, "alice").await;
         let draft = add(&db, &draft, "change this").await;
-        submit(&db, draft.id, "alice", draft.draft_revision, false)
+        submit(&db, draft.id, "alice", draft.draft_revision)
             .await
             .unwrap();
 
@@ -2503,7 +2372,7 @@ mod tests {
     async fn expired_ownerless_delivery_returns_to_queue_without_an_attempt() {
         let (db, artifact) = seeded().await;
         let draft = add(&db, &draft(&db, &artifact, "alice").await, "queue this").await;
-        submit(&db, draft.id, "alice", draft.draft_revision, false)
+        submit(&db, draft.id, "alice", draft.draft_revision)
             .await
             .unwrap();
         claim_delivery(&db, draft.id).await.unwrap().unwrap();
@@ -2594,7 +2463,7 @@ mod tests {
         let (db, artifact) = seeded().await;
         let draft = draft(&db, &artifact, "alice").await;
         let draft = add(&db, &draft, "change this").await;
-        submit(&db, draft.id, "alice", draft.draft_revision, false)
+        submit(&db, draft.id, "alice", draft.draft_revision)
             .await
             .unwrap();
 
@@ -2632,7 +2501,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_artifact_write_and_submit_make_one_serialized_stale_decision() {
+    async fn concurrent_artifact_write_and_submit_serialize_cleanly() {
         let (db, artifact) = seeded().await;
         let draft = add(&db, &draft(&db, &artifact, "alice").await, "change this").await;
         let barrier = Arc::new(Barrier::new(3));
@@ -2641,7 +2510,7 @@ mod tests {
         let submit_barrier = barrier.clone();
         let submit_task = tokio::spawn(async move {
             submit_barrier.wait().await;
-            submit(&submit_db, draft.id, "alice", draft.draft_revision, false).await
+            submit(&submit_db, draft.id, "alice", draft.draft_revision).await
         });
         let write_db = db.clone();
         let write_barrier = barrier.clone();
@@ -2666,16 +2535,12 @@ mod tests {
         let submission = submit_task.await.unwrap();
         write_task.await.unwrap().unwrap();
 
-        match submission {
-            Ok(submission) => {
-                let current = submission.event.unwrap().data["subject"]["current_revision"]
-                    .as_str()
-                    .unwrap()
-                    .to_string();
-                assert_eq!(current, "1", "submit committed before the artifact write");
-            }
-            Err(error) => assert!(error.to_string().contains("outdated")),
-        }
+        // There is no stale decision to make any more: the captured revision
+        // is provenance, so the submit wins in either interleaving and the
+        // review keeps the revision it began against.
+        let submission = submission.expect("submit no longer consults the subject");
+        assert!(submission.event.is_some());
+        assert_eq!(submission.review.subject_version, "1");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2690,7 +2555,7 @@ mod tests {
         let expected = draft.draft_revision;
         let submit_task = tokio::spawn(async move {
             submit_barrier.wait().await;
-            submit(&submit_db, submit_id, "alice", expected, false).await
+            submit(&submit_db, submit_id, "alice", expected).await
         });
         let mutate_db = db.clone();
         let mutate_barrier = barrier.clone();
@@ -2755,7 +2620,7 @@ mod tests {
             let expected = draft.draft_revision;
             tasks.push(tokio::spawn(async move {
                 task_barrier.wait().await;
-                submit(&task_db, review_id, "alice", expected, false).await
+                submit(&task_db, review_id, "alice", expected).await
             }));
         }
         barrier.wait().await;
@@ -2853,7 +2718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reanchoring_every_comment_advances_the_truthful_envelope_revision() {
+    async fn reanchoring_moves_the_comment_not_the_envelope() {
         let (db, artifact) = seeded().await;
         let draft = add(&db, &draft(&db, &artifact, "alice").await, "change this").await;
         let moved_anchor = anchor("gamma");
@@ -2871,7 +2736,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(moved.subject_version, "2");
+        // The captured revision is provenance: a re-anchored comment carries
+        // the new version, the envelope keeps where the review began, and the
+        // delivered message quotes each comment's own revision.
+        assert_eq!(moved.subject_version, "1");
         assert_eq!(moved.comments[0].subject_version, "2");
         assert!(structured_message(&moved).contains("revision 2"));
     }
@@ -2881,7 +2749,7 @@ mod tests {
         let (db, artifact) = seeded().await;
         let first = draft(&db, &artifact, "alice").await;
         let first = add(&db, &first, "change this").await;
-        let submitted = submit(&db, first.id, "alice", first.draft_revision, false)
+        let submitted = submit(&db, first.id, "alice", first.draft_revision)
             .await
             .unwrap();
         assert_eq!(submitted.review.reply_round, 0);
@@ -2959,15 +2827,9 @@ mod tests {
         // One submission sends both kinds as one round: a fresh delivery
         // key, the pending comment joining the delivered set, and the frozen
         // outbox payload quoting comment and reply alike.
-        let round = submit(
-            &db,
-            continuation.id,
-            "alice",
-            continuation.draft_revision,
-            false,
-        )
-        .await
-        .unwrap();
+        let round = submit(&db, continuation.id, "alice", continuation.draft_revision)
+            .await
+            .unwrap();
         assert_eq!(round.review.reply_round, 1);
         assert_eq!(round.review.delivery_key, format!("{base_key}#1"));
         assert_eq!(round.review.delivery_state, "queued");
@@ -3008,7 +2870,7 @@ mod tests {
         assert_eq!(after.comment_upto, new_comment_id);
         assert!(after.reply_upto >= 2, "past the operator reply");
         assert_eq!(after.pending_replies, 0);
-        let read = submit(&db, continuation.id, "alice", after.draft_revision, false)
+        let read = submit(&db, continuation.id, "alice", after.draft_revision)
             .await
             .unwrap();
         assert!(read.event.is_none());
@@ -3016,11 +2878,340 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_changed_note_rides_a_follow_up_round() {
+        let (db, artifact) = seeded().await;
+        let first = draft(&db, &artifact, "alice").await;
+        let first = add(&db, &first, "change this").await;
+        let first = update_draft(
+            &db,
+            first.id,
+            "alice",
+            first.draft_revision,
+            &DraftPatch {
+                summary: Some("First overall note"),
+            },
+        )
+        .await
+        .unwrap();
+        let submitted = submit(&db, first.id, "alice", first.draft_revision)
+            .await
+            .unwrap();
+        let base_key = submitted.review.delivery_key.clone();
+        let lease = claim_delivery(&db, submitted.review.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(mark_delivered(&db, submitted.review.id, &lease.token)
+            .await
+            .unwrap());
+        let delivered = get(&db, first.id).await.unwrap().unwrap();
+        assert_eq!(delivered.delivered_summary, "First overall note");
+
+        // The reviewer refines the note on the still-open envelope. It is
+        // pending words now, exactly like a pending comment.
+        let edited = update_draft(
+            &db,
+            first.id,
+            "alice",
+            delivered.draft_revision,
+            &DraftPatch {
+                summary: Some("Refined overall note"),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(edited.status, "submitted");
+        let round = submit(&db, first.id, "alice", edited.draft_revision)
+            .await
+            .unwrap();
+        assert_eq!(round.review.reply_round, 1);
+        assert_eq!(round.review.delivery_key, format!("{base_key}#1"));
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM review_delivery_outbox WHERE review_id = ?")
+                .bind(first.id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(
+            payload.contains("Overall:\nRefined overall note"),
+            "{payload}"
+        );
+        assert!(!payload.contains("First overall note"), "{payload}");
+
+        // The live batch carries the note, so a resubmit with nothing new is
+        // the read it always was — both before and after delivery lands.
+        let read = submit(&db, first.id, "alice", round.review.draft_revision)
+            .await
+            .unwrap();
+        assert!(read.event.is_none());
+        let lease = claim_delivery(&db, first.id).await.unwrap().unwrap();
+        assert!(mark_delivered(&db, first.id, &lease.token).await.unwrap());
+        let after = get(&db, first.id).await.unwrap().unwrap();
+        assert_eq!(after.delivered_summary, "Refined overall note");
+        let read = submit(&db, first.id, "alice", after.draft_revision)
+            .await
+            .unwrap();
+        assert!(read.event.is_none());
+
+        // The note that never delivered is never stranded either: an
+        // undelivered initial batch carries its note, and a note edited while
+        // it sits there rides the superseding round.
+        let second_subject = draft(&db, &artifact, "bob").await;
+        let bob_anchor = anchor("beta");
+        let second = add_comment(
+            &db,
+            second_subject.id,
+            "bob",
+            second_subject.draft_revision,
+            &NewComment {
+                subject_version: "1",
+                anchor: &bob_anchor,
+                body: "another change",
+            },
+        )
+        .await
+        .unwrap();
+        let second = update_draft(
+            &db,
+            second.id,
+            "bob",
+            second.draft_revision,
+            &DraftPatch {
+                summary: Some("Undelivered note"),
+            },
+        )
+        .await
+        .unwrap();
+        let queued = submit(&db, second.id, "bob", second.draft_revision)
+            .await
+            .unwrap();
+        assert_eq!(queued.review.delivery_state, "queued");
+        let edited = update_draft(
+            &db,
+            second.id,
+            "bob",
+            queued.review.draft_revision,
+            &DraftPatch {
+                summary: Some("Note while in flight"),
+            },
+        )
+        .await
+        .unwrap();
+        let superseded = submit(&db, second.id, "bob", edited.draft_revision)
+            .await
+            .unwrap();
+        assert_eq!(superseded.review.reply_round, 1);
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM review_delivery_outbox WHERE review_id = ?")
+                .bind(second.id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        // The single live batch re-carries everything undelivered: the
+        // comment, and the note as it stands now — never the stale first
+        // note, and never dropped.
+        assert!(payload.contains("another change"), "{payload}");
+        assert!(
+            payload.contains("Overall:\nNote while in flight"),
+            "{payload}"
+        );
+        assert!(!payload.contains("Undelivered note"), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn a_cleared_note_rides_as_words_not_silence() {
+        let (db, artifact) = seeded().await;
+        let first = add(&db, &draft(&db, &artifact, "alice").await, "change this").await;
+        let first = update_draft(
+            &db,
+            first.id,
+            "alice",
+            first.draft_revision,
+            &DraftPatch {
+                summary: Some("A note that will be retracted"),
+            },
+        )
+        .await
+        .unwrap();
+        let submitted = submit(&db, first.id, "alice", first.draft_revision)
+            .await
+            .unwrap();
+        let lease = claim_delivery(&db, first.id).await.unwrap().unwrap();
+        assert!(mark_delivered(&db, first.id, &lease.token).await.unwrap());
+
+        // Retracting the note is a change the session must hear about, and
+        // the delivered cursor must move past it — an empty round would
+        // leave the cursor stranded and re-queue forever.
+        let cleared = update_draft(
+            &db,
+            first.id,
+            "alice",
+            submitted.review.draft_revision,
+            &DraftPatch { summary: Some("") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.summary, "");
+        let round = submit(&db, first.id, "alice", cleared.draft_revision)
+            .await
+            .unwrap();
+        assert_eq!(round.review.reply_round, 1);
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM review_delivery_outbox WHERE review_id = ?")
+                .bind(first.id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(payload.contains("cleared the overall note"), "{payload}");
+        assert!(
+            !payload.contains("A note that will be retracted"),
+            "{payload}"
+        );
+
+        let lease = claim_delivery(&db, first.id).await.unwrap().unwrap();
+        assert!(mark_delivered(&db, first.id, &lease.token).await.unwrap());
+        let after = get(&db, first.id).await.unwrap().unwrap();
+        assert_eq!(after.delivered_summary, "");
+        let read = submit(&db, first.id, "alice", after.draft_revision)
+            .await
+            .unwrap();
+        assert!(read.event.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_initial_payload_freezes_at_submit() {
+        let (db, artifact) = seeded().await;
+        let first = add(
+            &db,
+            &draft(&db, &artifact, "alice").await,
+            "the original line",
+        )
+        .await;
+        let first = update_draft(
+            &db,
+            first.id,
+            "alice",
+            first.draft_revision,
+            &DraftPatch {
+                summary: Some("Original note"),
+            },
+        )
+        .await
+        .unwrap();
+        let submitted = submit(&db, first.id, "alice", first.draft_revision)
+            .await
+            .unwrap();
+        assert_eq!(submitted.review.delivery_state, "queued");
+
+        // Words keep moving while the initial round sits queued: the note is
+        // refined, and a follow-up comment joins the open envelope. Neither
+        // may leak into the initial delivery — its payload froze at submit,
+        // or the delivered cursors would record words the session never saw
+        // and the next round would duplicate them.
+        let live = get(&db, first.id).await.unwrap().unwrap();
+        assert_eq!(
+            live.queued_summary.as_deref(),
+            Some("Original note"),
+            "the in-flight batch carries the note it froze with"
+        );
+        let edited = update_draft(
+            &db,
+            first.id,
+            "alice",
+            submitted.review.draft_revision,
+            &DraftPatch {
+                summary: Some("Refined note"),
+            },
+        )
+        .await
+        .unwrap();
+        let later = add_comment(
+            &db,
+            first.id,
+            "alice",
+            edited.draft_revision,
+            &NewComment {
+                subject_version: "1",
+                anchor: &anchor("gamma"),
+                body: "a comment that arrived late",
+            },
+        )
+        .await
+        .unwrap();
+
+        let lease = claim_delivery(&db, first.id).await.unwrap().unwrap();
+        assert!(mark_delivered(&db, first.id, &lease.token).await.unwrap());
+        let delivered = get(&db, first.id).await.unwrap().unwrap();
+        assert_eq!(delivered.delivered_summary, "Original note");
+        assert!(delivered.queued_summary.is_none(), "the batch landed");
+        let frozen: String =
+            sqlx::query_scalar("SELECT payload FROM review_delivery_outbox WHERE review_id = ?")
+                .bind(first.id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(frozen.contains("the original line"), "{frozen}");
+        assert!(frozen.contains("Original note"), "{frozen}");
+        assert!(!frozen.contains("Refined note"), "{frozen}");
+        assert!(!frozen.contains("a comment that arrived late"), "{frozen}");
+
+        // The next round carries exactly the late words, once each.
+        let round = submit(&db, first.id, "alice", later.draft_revision)
+            .await
+            .unwrap();
+        assert_eq!(round.review.reply_round, 1);
+        let payload: String =
+            sqlx::query_scalar("SELECT payload FROM review_delivery_outbox WHERE review_id = ?")
+                .bind(first.id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(payload.contains("Refined note"), "{payload}");
+        assert!(payload.contains("a comment that arrived late"), "{payload}");
+        assert!(!payload.contains("Original note"), "{payload}");
+        assert!(!payload.contains("the original line"), "{payload}");
+    }
+
+    #[tokio::test]
+    async fn preview_message_speaks_for_the_surface_it_is_on() {
+        // A draft previews the initial payload it would submit.
+        let (db, artifact) = seeded().await;
+        let first = add(&db, &draft(&db, &artifact, "alice").await, "change this").await;
+        assert!(preview_message(&first).contains("change this"));
+
+        // A quiescent envelope previews its standing message: everything is
+        // delivered, nothing would queue.
+        submit(&db, first.id, "alice", first.draft_revision)
+            .await
+            .unwrap();
+        let lease = claim_delivery(&db, first.id).await.unwrap().unwrap();
+        assert!(mark_delivered(&db, first.id, &lease.token).await.unwrap());
+        let quiescent = get(&db, first.id).await.unwrap().unwrap();
+        assert!(preview_message(&quiescent).contains("change this"));
+
+        // An envelope with pending words previews the round a submit would
+        // send — the follow-up shape, not the standing one.
+        let with_reply = reply_comment(
+            &db,
+            first.comments[0].id,
+            ReplyAuthor::Operator("alice"),
+            "and here is my answer",
+        )
+        .await
+        .unwrap();
+        let _ = with_reply;
+        let live = get(&db, first.id).await.unwrap().unwrap();
+        let preview = preview_message(&live);
+        assert!(preview.contains("follow-up feedback"), "{preview}");
+        assert!(preview.contains("and here is my answer"), "{preview}");
+    }
+
+    #[tokio::test]
     async fn a_failed_round_self_heals_into_the_next_batch() {
         let (db, artifact) = seeded().await;
         let first = draft(&db, &artifact, "alice").await;
         let first = add(&db, &first, "change this").await;
-        let submitted = submit(&db, first.id, "alice", first.draft_revision, false)
+        let submitted = submit(&db, first.id, "alice", first.draft_revision)
             .await
             .unwrap();
         let comment_id = submitted.review.comments[0].id;
@@ -3042,15 +3233,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let failed = submit(
-            &db,
-            first.id,
-            "alice",
-            submitted.review.draft_revision,
-            false,
-        )
-        .await
-        .unwrap();
+        let failed = submit(&db, first.id, "alice", submitted.review.draft_revision)
+            .await
+            .unwrap();
         assert_eq!(failed.review.reply_round, 1);
 
         // More words arrive, and the next round's batch recomputes
@@ -3065,7 +3250,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let round = submit(&db, first.id, "alice", failed.review.draft_revision, false)
+        let round = submit(&db, first.id, "alice", failed.review.draft_revision)
             .await
             .unwrap();
         assert_eq!(round.review.reply_round, 2);
@@ -3100,7 +3285,7 @@ mod tests {
         let (db, artifact) = seeded().await;
         let first = draft(&db, &artifact, "alice").await;
         let first = add(&db, &first, "change this").await;
-        let submitted = submit(&db, first.id, "alice", first.draft_revision, false)
+        let submitted = submit(&db, first.id, "alice", first.draft_revision)
             .await
             .unwrap();
         let revision = submitted.review.draft_revision;
@@ -3117,9 +3302,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let read = submit(&db, first.id, "alice", revision, false)
-            .await
-            .unwrap();
+        let read = submit(&db, first.id, "alice", revision).await.unwrap();
         assert!(read.event.is_none(), "a session reply alone is not a round");
         assert_eq!(read.review.reply_round, 0);
         assert_eq!(read.review.delivery_key, submitted.review.delivery_key);
@@ -3135,9 +3318,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let round = submit(&db, first.id, "alice", revision, false)
-            .await
-            .unwrap();
+        let round = submit(&db, first.id, "alice", revision).await.unwrap();
         assert!(round.event.is_some());
         assert_eq!(round.review.reply_round, 1);
     }

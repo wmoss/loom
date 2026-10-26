@@ -136,7 +136,6 @@ function toggleFolder(path: string) {
 const overallNote = ref('');
 const summaryDirty = ref(false);
 const summarySaving = ref(false);
-const acknowledgeOutdated = ref(false);
 const submitting = ref(false);
 
 // The signed-in operator: only a review's creator may submit it, so the
@@ -198,19 +197,23 @@ const submittedEnvelopes = computed(() =>
     .sort((a, b) => b.id - a.id),
 );
 
-/** The envelope a fresh composer comment attaches to when no draft is open:
- * the newest submitted one, pending or not. */
 const openEnvelope = computed(() => submittedEnvelopes.value[0] ?? null);
 
-const continuation = computed(() => {
-  if (draft.value) return null;
-  return (
-    submittedEnvelopes.value.find(
-      (review) =>
-        review.comments.some((comment) => comment.status === 'pending') ||
-        review.pending_replies > 0,
-    ) ?? null
-  );
+/** The follow-up surface: the newest submitted review, standing in wherever a
+ * draft is not open. Its pending comments and replies queue beside a draft's
+ * — and a note typed into its tray queues too, riding the next round. */
+const continuation = computed(() => (draft.value ? null : openEnvelope.value));
+
+// The follow-up surface's note seeds the tray once the signed-in operator is
+// known: the envelope the reviewer already submitted carries the summary
+// they last wrote, and editing it queues for the next round.
+watch([openEnvelope, draft], () => {
+  // Seed whenever the no-draft-with-envelope state is (re)entered: a fresh
+  // operator arrival, a draft submitting into its envelope, or a peer's
+  // submit that opened one mid-review.
+  const envelope = openEnvelope.value;
+  if (draft.value || !envelope || summaryDirty.value) return;
+  controller.reconcile(envelope);
 });
 
 /**
@@ -234,15 +237,12 @@ function inViewScope(comment: ReviewComment): boolean {
   return snapshotScope(comment.subject_version) === viewScope.value;
 }
 
-/** True when the anchor's side and line range is rendered by some hunk of its
- * file, with the lines still holding the text the comment was written
- * against. The contiguity matches what the backend's anchor validation
- * requires; the text fingerprint is the rule a moved-under revision demands —
- * a range whose content changed is pinned on the wrong code, so the comment
- * reads as outdated rather than misattached. */
-function anchorPlaced(anchor: ChangeAnchor): boolean {
+/** The hunk and offset where the view draws the anchor's side and line
+ * range, or null when it does not — geometry only. The contiguity matches
+ * what the backend's anchor validation requires. */
+function anchorRender(anchor: ChangeAnchor): { hunk: ChangeHunk; first: number } | null {
   const file = (changes.value?.files ?? []).find((item) => item.path.bytes === anchor.path.bytes);
-  if (!file) return false;
+  if (!file) return null;
   for (const hunk of file.hunks) {
     const eligible = hunk.lines
       .map((line) => (anchor.side === 'old' ? line.old_line : line.new_line))
@@ -256,11 +256,33 @@ function anchorPlaced(anchor: ChangeAnchor): boolean {
         break;
       }
     }
-    if (!resolves) continue;
-    if (!fingerprintHolds(anchor, hunk, first)) continue;
-    return true;
+    if (resolves) return { hunk, first };
   }
-  return false;
+  return null;
+}
+
+/** Placement asks exactly this: the comment stays at its place in the file
+ * whenever the view draws lines for it, whether or not the text beneath
+ * moved. */
+function anchorRenders(anchor: ChangeAnchor): boolean {
+  return anchorRender(anchor) != null;
+}
+
+/** True when a placed comment still anchors the text it was written against:
+ * the selected lines' fingerprint holds in this view. Failing this is
+ * staleness — the badge, the tray warning, and nothing else. */
+function anchorVerifies(anchor: ChangeAnchor): boolean {
+  const at = anchorRender(anchor);
+  return at != null && fingerprintHolds(anchor, at.hunk, at.first);
+}
+
+/** A comment is stale exactly when its lines render but no longer hold the
+ * text it was written against — content-keyed, never version-keyed. A
+ * comment on unchanged code is indistinguishable from a fresh one, and a
+ * re-anchor clears the badge by rewriting the anchor. */
+function commentStale(entry: ReviewCommentEntry): boolean {
+  const anchor = entry.comment.anchor as ChangeAnchor;
+  return inViewScope(entry.comment) && anchorRenders(anchor) && !anchorVerifies(anchor);
 }
 
 /** Compares the anchor's recorded line texts against what its range renders
@@ -291,17 +313,61 @@ const changeCommentEntries = computed<ReviewCommentEntry[]>(() =>
   ),
 );
 
-/** Comments — draft or submitted — that cannot be placed inline in this
- * view: the comment belongs to another snapshot (a different commit's diff,
- * or the branch change-set while a commit is scoped), the anchored file left
- * the change set, or its lines are no longer rendered. Drafts still submit
- * with the review, so everything persists in the outdated section where
- * drafts can be edited, re-anchored, or deleted and submitted comments can
- * be resolved. */
-const outdatedComments = computed(() =>
+/** Comments — draft or submitted — that cannot sit at a line in this view:
+ * the comment belongs to another snapshot (a different commit's diff, or the
+ * branch change-set while a commit is scoped), the anchored file left the
+ * change set, or the view no longer draws its range. Drafts still submit
+ * with the review, so everything persists where it can be edited,
+ * re-anchored, or deleted and submitted ones resolved. */
+const unplaceableComments = computed(() =>
   changeCommentEntries.value.filter(
-    (entry) => !inViewScope(entry.comment) || !anchorPlaced(entry.comment.anchor as ChangeAnchor),
+    (entry) => !inViewScope(entry.comment) || !anchorRenders(entry.comment.anchor as ChangeAnchor),
   ),
+);
+
+/** The unplaceable comments whose file still renders in this view — a
+ * deleted file, or one shrunk past the anchored range. They join a strip
+ * under their own file's header: as close to their place as the file
+ * allows, visible the moment the file is. */
+const unplaceableByFile = computed(() => {
+  const map = new Map<string, ReviewCommentEntry[]>();
+  for (const entry of unplaceableComments.value) {
+    if (!inViewScope(entry.comment)) continue;
+    const anchor = entry.comment.anchor as ChangeAnchor;
+    if (!(changes.value?.files ?? []).some((item) => item.path.bytes === anchor.path.bytes))
+      continue;
+    const list = map.get(anchor.path.bytes) ?? [];
+    list.push(entry);
+    map.set(anchor.path.bytes, list);
+  }
+  return map;
+});
+
+/** The unplaceable comments with no file to sit under — another snapshot's
+ * scope, or a file the change set no longer carries. They persist in the
+ * section below the diff. */
+const outdatedComments = computed(() =>
+  unplaceableComments.value.filter(
+    (entry) =>
+      !unplaceableByFile.value.has((entry.comment.anchor as ChangeAnchor).path.bytes) ||
+      !inViewScope(entry.comment),
+  ),
+);
+
+/** Pending comments on the submitting surface whose lines hold changed
+ * code — the tray's one staleness signal. */
+const staleCommentIds = computed(
+  () =>
+    (draft.value ?? continuation.value)?.comments
+      .filter(
+        (comment) =>
+          comment.status === 'pending' &&
+          commentStale({
+            review: draft.value ?? continuation.value!,
+            comment,
+          }),
+      )
+      .map((comment) => comment.id) ?? [],
 );
 
 const baseProblem = computed(() => changeBaseProblem(changes.value?.base, 'Changes'));
@@ -345,6 +411,7 @@ const controller = new ReviewDraftController<Review>({
     if (!version) throw new Error('The change-set version is unavailable.');
     const review =
       current ??
+      openEnvelope.value ??
       (await createReview(props.id, {
         subject_kind: 'changes',
         subject_key: 'changes',
@@ -372,7 +439,21 @@ async function load() {
       getChanges(props.id, rev.value ?? undefined),
       listChangesReviews(props.id),
     ]);
-    const nextDraft = nextReviews.find((review) => review.status === 'draft') ?? null;
+    // The tracked surface: the draft, or — once the signed-in operator is
+    // known — the newest submitted envelope, whose note the tray composes.
+    const nextDraft =
+      nextReviews.find((review) => review.status === 'draft') ??
+      (operator.value
+        ? ([...nextReviews]
+            .filter(
+              (review) =>
+                review.status === 'submitted' &&
+                !review.legacy &&
+                review.id > 0 &&
+                review.created_by === operator.value,
+            )
+            .sort((a, b) => b.id - a.id)[0] ?? null)
+        : null);
     // The snapshot is not the draft controller's to gate, but only the
     // freshest response may install it — an out-of-order older response
     // would overwrite a newer snapshot (and could drop a live composer via
@@ -698,7 +779,7 @@ function extendDataFor(file: ChangeFile): {
     if (
       anchor.path.bytes !== file.path.bytes ||
       !inViewScope(entry.comment) ||
-      !anchorPlaced(anchor)
+      !anchorRenders(anchor)
     )
       continue;
     const bucket = anchor.side === 'old' ? oldFile : newFile;
@@ -953,60 +1034,26 @@ async function discardDraft() {
   }
 }
 
-async function retarget() {
-  // The version this panel is rendering — the branch change-set, or the
-  // commit a `?rev` view scopes to. Retargeting moves the empty draft onto
-  // exactly the snapshot under review, so the button's "current changes" is
-  // true in both spellings (and the reviewed commit's own diff becomes
-  // commentable when a branch-scope draft was in the way).
-  const version = changes.value?.version;
-  if (!draft.value || draft.value.comments.length || !version) return;
-  try {
-    await controller.command((current) => {
-      if (!current) throw new Error('Review draft is unavailable.');
-      return updateReview(current.id, {
-        expected_revision: current.draft_revision,
-        subject_version: version,
-      });
-    });
-  } catch (cause) {
-    trayError.value = mutationMessage(cause);
-  }
-}
-
 async function submit() {
-  // A submitted review with pending comments and replies is the same
-  // submission as a draft: one button sends whatever is queued.
-  if (!draft.value && continuation.value) {
-    const target = continuation.value;
-    submitting.value = true;
-    trayError.value = '';
-    try {
-      const updated = await submitReview(target.id, {
-        expected_revision: target.draft_revision,
-        // A follow-up round rides the already-delivered snapshot; the
-        // outdated gate does not apply to it.
-        acknowledge_outdated: false,
-      });
-      replaceReview(updated);
-    } catch (cause) {
-      trayError.value = mutationMessage(cause);
-    } finally {
-      submitting.value = false;
-    }
-    return;
-  }
+  // One submission path for both surfaces: the freeze flushes a dirty note
+  // onto its review first — a draft or the still-open envelope alike — then
+  // sends whatever is queued.
   submitting.value = true;
+  trayError.value = '';
   try {
     const submitted = await controller.freeze(async (current) => {
-      if (!current) throw new Error('Review draft is unavailable.');
-      const result = await submitReview(current.id, {
-        expected_revision: current.draft_revision,
-        acknowledge_outdated: acknowledgeOutdated.value,
+      const target = current ?? continuation.value;
+      if (!target) throw new Error('Review draft is unavailable.');
+      const result = await submitReview(target.id, {
+        expected_revision: target.draft_revision,
       });
       replaceReview(result);
       return { draft: null, result };
     });
+    // Freeze's own clear (its null hand-back resets the note) races the
+    // seeding watch's microtask, so the envelope's note is seeded
+    // deterministically here, after the freeze fully settles.
+    if (!draft.value && openEnvelope.value) controller.reconcile(openEnvelope.value);
     notice.value = `Review submitted · ${submitted.delivery_state}.`;
   } catch (cause) {
     trayError.value = mutationMessage(cause);
@@ -1439,22 +1486,20 @@ function reviewAllFromPicker() {
         :open="trayOpen"
         :overall-note="overallNote"
         :summary-saving="summarySaving || summaryDirty"
-        :acknowledge-outdated="acknowledgeOutdated"
         :error="trayError"
         :layout-busy="false"
         :submitting="submitting"
         :discarding="discarding"
         :delivery-errors="deliveryErrors"
         :continuation="continuation"
+        :stale-comment-ids="staleCommentIds"
         subject-label="changes"
         :discard-action="discardDraft"
         @update:open="trayOpen = $event"
         @update:overall-note="editOverall"
-        @update:acknowledge-outdated="acknowledgeOutdated = $event"
         @navigate="navigate"
         @focus-comment="focusComment"
         @save-overall="saveOverall"
-        @retarget="retarget"
         @submit="submit"
         @retry="retryDelivery"
       />
@@ -1601,9 +1646,10 @@ function reviewAllFromPicker() {
           </button>
           <template v-if="outdatedOpen">
             <p class="px-3 pb-2 text-2xs text-faint">
-              Comments anchored to another snapshot, or to lines this view no longer shows. Drafts
-              still submit with the review; ones written against this snapshot can be re-anchored
-              onto a current line, and submitted ones stay for the record and can be resolved.
+              Comments anchored to another snapshot, or to a file this view no longer carries — ones
+              whose file still renders sit under that file's header instead. Drafts still submit
+              with the review; ones written against this snapshot can be re-anchored onto a current
+              line, and submitted ones stay for the record and can be resolved.
             </p>
             <div
               v-for="entry in outdatedComments"
@@ -1784,6 +1830,7 @@ function reviewAllFromPicker() {
                       :delete-action="removeComment"
                       :reply-action="replyToComment"
                       :reanchorable="true"
+                      :stale="commentStale(entry)"
                       @focus="openComment"
                       @close="closeComment"
                       @edit="editComment"
@@ -1801,6 +1848,46 @@ function reviewAllFromPicker() {
                 Loading diff…
               </p>
               <p v-else class="px-4 py-8 text-center text-2xs text-faint">No renderable diff.</p>
+            </div>
+            <div
+              v-if="unplaceableByFile.get(file.path.bytes)?.length"
+              class="border-t border-line bg-code px-3 py-2"
+              :data-testid="`file-comment-strip-${file.path.display}`"
+            >
+              <p class="mb-1 text-2xs text-faint">
+                {{ unplaceableByFile.get(file.path.bytes)!.length }}
+                comment{{ unplaceableByFile.get(file.path.bytes)!.length === 1 ? '' : 's' }} anchor
+                lines this view no longer draws
+              </p>
+              <div
+                v-for="entry in unplaceableByFile.get(file.path.bytes)"
+                :key="entry.comment.id"
+                class="border-t border-line bg-surface p-2 first:border-t-0"
+              >
+                <p class="mb-1 truncate font-mono text-2xs text-faint">
+                  {{ (entry.comment.anchor as ChangeAnchor).path.display }} ·
+                  {{ (entry.comment.anchor as ChangeAnchor).side }}
+                  {{ (entry.comment.anchor as ChangeAnchor).start_line }}–{{
+                    (entry.comment.anchor as ChangeAnchor).end_line
+                  }}
+                </p>
+                <ReviewCommentCard
+                  :review="entry.review"
+                  :comment="entry.comment"
+                  :active="activeComments.has(entry.comment.id)"
+                  :reanchoring="reanchorComment === entry.comment.id"
+                  :error="commentErrors[entry.comment.id] ?? ''"
+                  :delete-action="removeComment"
+                  :reply-action="replyToComment"
+                  :reanchorable="inViewScope(entry.comment)"
+                  @focus="openComment"
+                  @close="closeComment"
+                  @edit="editComment"
+                  @reanchor="reanchorComment = $event"
+                  @cancel-reanchor="reanchorComment = null"
+                  @resolution="toggleResolved"
+                />
+              </div>
             </div>
           </div>
         </article>

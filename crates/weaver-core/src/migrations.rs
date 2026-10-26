@@ -143,6 +143,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "unified_review_rounds",
         include_str!("../migrations/0024_unified_review_rounds.sql"),
     ),
+    (
+        25,
+        "review_note_delivery",
+        include_str!("../migrations/0025_review_note_delivery.sql"),
+    ),
 ];
 
 /// Latest core schema version compiled into this binary.

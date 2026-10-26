@@ -20,6 +20,10 @@ const props = defineProps<{
    *  move, so the action hides instead of dead-ending. Pass it at every
    *  call site: an absent Boolean prop casts to false, never undefined. */
   reanchorable: boolean;
+  /** True when the anchor's lines render but no longer hold the text the
+   *  comment was written against — decided by the host surface, which sees
+   *  the current snapshot. Absent casts to false. */
+  stale?: boolean;
 }>();
 const emit = defineEmits<{
   focus: [commentId: number];
@@ -216,10 +220,7 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
     >
       {{ comment.replies.length }}
     </span>
-    <span
-      v-if="comment.subject_version !== review.subject.current_version"
-      class="shrink-0 text-2xs text-block"
-    >
+    <span v-if="stale" class="shrink-0 text-2xs text-block" data-testid="stale-pill-marker">
       Stale
     </span>
   </button>
@@ -254,8 +255,9 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
         {{ comment.anchor_kind === 'text' ? `“${anchorLabel}”` : anchorLabel }}
       </div>
       <span
-        v-if="comment.subject_version !== review.subject.current_version"
+        v-if="stale"
         class="shrink-0 rounded bg-block-soft px-1.5 py-0.5 text-2xs font-medium text-block"
+        data-testid="stale-card-marker"
       >
         Revision {{ comment.subject_version }} · stale
       </span>

@@ -74,19 +74,20 @@ async fn enqueue_review_once(
     if completed.rows_affected() == 1 {
         // The delivered cursors move here, never at submit (see
         // review::mark_delivered for the terminal twin of this transition).
-        let (comment_upto, reply_upto): (i64, i64) = sqlx::query_as(
-            "SELECT comment_upto, reply_upto FROM review_delivery_outbox WHERE review_id = ?",
+        let (comment_upto, reply_upto, delivered_summary): (i64, i64, String) = sqlx::query_as(
+            "SELECT comment_upto, reply_upto, summary FROM review_delivery_outbox WHERE review_id = ?",
         )
         .bind(item.id)
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query(
             "UPDATE reviews SET delivery_state = 'delivered', delivery_error = NULL,
-                 comment_upto = ?, reply_upto = ?
+                 comment_upto = ?, reply_upto = ?, delivered_summary = ?
              WHERE id = ? AND delivery_state = 'delivering'",
         )
         .bind(comment_upto)
         .bind(reply_upto)
+        .bind(delivered_summary)
         .bind(item.id)
         .execute(&mut *tx)
         .await?;

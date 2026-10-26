@@ -25,7 +25,7 @@ async function addWidgetButton(
   return row.locator('button.diff-add-widget');
 }
 
-test('preserves Changes drafts through refresh and peer-submit conflicts', async ({
+test('preserves Changes drafts through refresh and peer submit', async ({
   page,
   weaver,
 }) => {
@@ -108,27 +108,47 @@ test('preserves Changes drafts through refresh and peer-submit conflicts', async
   await peer.getByTestId('submit-review').click();
   await peerSubmit;
 
-  const saveConflict = page.waitForResponse(
-    (response) =>
-      response.status() === 409 &&
-      response.request().method() === 'POST' &&
-      new URL(response.url()).pathname === '/api/reviews/update',
-  );
-  await overall.focus();
-  await overall.press('Tab');
-  await saveConflict;
+  // The peer's submit opens the envelope while this page holds an unsaved
+  // local note: the dirty text survives the peer's submit — a clean reload
+  // is refused while a note is mid-flight in the composer — and reads as
+  // the one pending row against what the session received. The tray is the
+  // same drop-down a follow-up gets.
   await expect(overall).toHaveValue('Keep this local edit after the conflict.');
-
-  const retrySave = page.waitForResponse(
-    (response) =>
-      response.ok() &&
-      response.request().method() === 'POST' &&
-      new URL(response.url()).pathname === '/api/reviews/update',
+  await expect(page.getByTestId('review-tray-toggle')).toContainText('Review · 1 pending');
+  await expect(page.getByTestId('pending-note-row')).toContainText(
+    'Keep this local edit after the conflict.',
   );
-  await overall.focus();
-  await overall.press('Tab');
-  await retrySave;
-  await expect(tray).toContainText('0 pending');
+
+  // Submitting flushes that local note onto the envelope and sends it as a
+  // follow-up round — the freeze owns the flush, so the click's own blur
+  // cannot lose it.
+  const localRound = page.waitForResponse(
+    (response) => response.ok() && new URL(response.url()).pathname === '/api/reviews/submit',
+  );
+  await page.getByTestId('submit-review').click();
+  await localRound;
+  const reviewsJson = await page.evaluate(async (sessionId) => {
+    const response = await fetch('/api/reviews/list', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        subject_kind: 'changes',
+        subject_key: 'changes',
+        session: sessionId,
+      }),
+    });
+    return (await response.json()) as Array<{
+      summary: string;
+      queued_summary: string | null;
+      delivered_summary: string;
+      delivery_key: string;
+    }>;
+  }, session.id);
+  expect(reviewsJson[0].summary).toBe('Keep this local edit after the conflict.');
+  expect(reviewsJson[0].delivery_key).toContain('#');
+  // The round carries the note — in flight or delivered, no longer pending.
+  await expect(page.getByTestId('review-tray-toggle')).toContainText('Review · 0 pending');
+  await expect(page.getByTestId('submit-review')).toBeDisabled();
   await peer.close();
 });
 
@@ -247,33 +267,27 @@ test('comments whose lines leave the view persist in the outdated section', asyn
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
   await expect(page.getByTestId('review-tray')).toContainText('1 pending');
 
-  // Shrink the file and reload: line 20 is no longer rendered anywhere, so the
-  // comment cannot sit inline — it must persist in the outdated section.
+  // Shrink the file and reload: line 20 no longer renders, so the comment
+  // cannot sit at a line — but its file still draws, so it persists in that
+  // file's own strip under the header, not the global section below.
   writeFileSync(changedPath, twenty.slice(0, 10).join('\n') + '\n');
   await page.getByRole('button', { name: 'Refresh' }).click();
   const section = page.getByTestId('outdated-comments');
-  await expect(section).toBeVisible();
-  // Open by default: the card and its anchor location are right there.
-  await expect(section).toContainText('This line fell off the end.');
-  await expect(section).toContainText('shrinking.txt');
+  await expect(section).toHaveCount(0);
+  const strip = article.getByTestId('file-comment-strip-shrinking.txt');
+  await expect(strip).toContainText('This line fell off the end.');
+  await expect(strip).toContainText('shrinking.txt');
 
-  // The header collapses the section without losing anything.
-  const toggle = page.getByTestId('outdated-comments-toggle');
-  await toggle.click();
-  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
-  await expect(section).not.toContainText('This line fell off the end.');
+  // Collapsing the file hides the strip with it, losing nothing; the tray
+  // still counts the comment as pending.
+  await fileToggle.click();
+  await expect(strip).toHaveCount(0);
   await expect(page.getByTestId('review-tray')).toContainText('1 pending');
-
-  // And reopening brings the persisted comment back.
-  await toggle.click();
-  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
-  await expect(section).toContainText('This line fell off the end.');
+  await fileToggle.click();
+  await expect(strip).toContainText('This line fell off the end.');
 });
 
-test('a stale comment whose line content changed is outdated, not mispinned', async ({
-  page,
-  weaver,
-}) => {
+test('a changed line keeps its comment in place, marked stale', async ({ page, weaver }) => {
   const session = await weaver.seedSession({
     goal: 'review an edited file',
     name: 'stale-content-comment',
@@ -291,22 +305,72 @@ test('a stale comment whose line content changed is outdated, not mispinned', as
   await composer.getByRole('button', { name: 'Add pending comment' }).click();
   await expect(page.getByTestId('review-tray')).toContainText('1 pending');
 
-  // The revision moves and line 2 is rewritten in place. Its number still
-  // exists — the range is contiguous — but the text the comment was written
-  // against is gone: pinning it on the new line 2 would point it at code it
-  // never saw. It belongs in the outdated section.
+  // The revision moves and line 2 is rewritten in place. The view still
+  // draws line 2, so the comment stays right there — marked stale, because
+  // the text it was written against is gone. No exile to a bottom section.
   writeFileSync(changedPath, ['alpha', 'beta was replaced', 'gamma'].join('\n') + '\n');
   await page.getByRole('button', { name: 'Refresh' }).click();
-  const section = page.getByTestId('outdated-comments');
-  await expect(section).toContainText('About the beta line.');
-  await expect(article).not.toContainText('About the beta line.');
+  await expect(page.getByTestId('outdated-comments')).toHaveCount(0);
+  const staleCard = article
+    .locator('[data-review-card]')
+    .filter({ hasText: 'About the beta line.' });
+  await expect(staleCard).toBeVisible();
+  await expect(staleCard.getByTestId('stale-card-marker')).toContainText('stale');
 
-  // Rewriting the revision again so the original text returns re-places the
-  // comment inline: the fingerprint, not just the number, decides.
+  // The tray warns in red, non-blocking; the row carries the same flag, and
+  // there is no acknowledgement checkbox any more.
+  const tray = page.getByTestId('review-tray');
+  await page.getByTestId('review-tray-toggle').click();
+  await expect(page.getByTestId('review-stale-warning')).toContainText(
+    '1 pending comment',
+  );
+  await expect(tray.getByRole('button', { name: /About the beta line/ })).toContainText('stale');
+  await expect(page.getByTestId('review-stale-ack')).toHaveCount(0);
+
+  // Unchanged code is indistinguishable from fresh: restoring the original
+  // text clears the badge and the warning with it.
   writeFileSync(changedPath, lines.join('\n') + '\n');
   await page.getByRole('button', { name: 'Refresh' }).click();
-  await expect(section).toHaveCount(0);
-  await expect(article).toContainText('About the beta line.');
+  await expect(staleCard.getByTestId('stale-card-marker')).toHaveCount(0);
+  await expect(page.getByTestId('review-stale-warning')).toHaveCount(0);
+
+  // Stale again — and re-anchoring is the reviewer's action that resolves
+  // it: the badge clears the moment the anchor lands on current code. (The
+  // refresh click minimized the tray; the warning lives inside it.)
+  writeFileSync(changedPath, ['alpha', 'beta was replaced', 'gamma'].join('\n') + '\n');
+  await page.getByRole('button', { name: 'Refresh' }).click();
+  if ((await page.getByTestId('review-tray-toggle').getAttribute('aria-expanded')) === 'false') {
+    await page.getByTestId('review-tray-toggle').click();
+  }
+  await expect(page.getByTestId('review-stale-warning')).toContainText('1 pending comment');
+  // The open tray overlays the page; close it to reach the card.
+  await page.getByTestId('review-tray-toggle').click();
+  await staleCard.getByRole('button', { name: 'Re-anchor' }).click();
+  await (await addWidgetButton(article, 'new', 2)).click({ force: true });
+  await page
+    .getByTestId('change-comment-composer')
+    .getByRole('button', { name: 'Move comment here' })
+    .click();
+  await expect(staleCard.getByTestId('stale-card-marker')).toHaveCount(0);
+  await expect(page.getByTestId('review-stale-warning')).toHaveCount(0);
+
+  // A stale comment submits with the warning and no gate: one click sends
+  // the review as it stands.
+  writeFileSync(changedPath, ['alpha', 'entirely new line', 'gamma'].join('\n') + '\n');
+  await page.getByRole('button', { name: 'Refresh' }).click();
+  if ((await page.getByTestId('review-tray-toggle').getAttribute('aria-expanded')) === 'false') {
+    await page.getByTestId('review-tray-toggle').click();
+  }
+  await expect(page.getByTestId('review-stale-warning')).toContainText('1 pending comment');
+  const submitted = page.waitForResponse(
+    (response) => response.ok() && new URL(response.url()).pathname === '/api/reviews/submit',
+  );
+  await page.getByTestId('submit-review').click();
+  await submitted;
+  // The same dropdown, back to its quiescent shape: the submitted envelope
+  // with nothing pending, its state line in place of the rows.
+  await expect(tray).toContainText('Review · 0 pending');
+  await expect(page.getByTestId('review-envelope-state')).toContainText('submitted');
 });
 
 test('several comment threads stay open at once', async ({ page, weaver }) => {
@@ -507,7 +571,9 @@ test('submitted comments persist in the diff and resolve from collapsed', async 
   );
   await page.getByTestId('submit-review').click();
   await roundSubmitted;
-  await expect(toggle).not.toContainText('pending');
+  await expect(toggle).toContainText('Review · 0 pending');
+  // The open tray overlays the page; close it before working the cards.
+  await toggle.click();
 
   // The header collapses an open thread, same as the Close button.
   await card.getByTestId('review-comment-header').click();
@@ -518,13 +584,15 @@ test('submitted comments persist in the diff and resolve from collapsed', async 
   await card.getByRole('button', { name: 'Close' }).click();
   await expect(pill).toContainText('Submitted');
 
-  // When the anchored line later leaves the view, the submitted comment moves
-  // to the outdated section instead of vanishing.
+  // When the anchored line later leaves the view, the submitted comment
+  // persists under its own file's strip — the file still renders, so its
+  // comments stay with it instead of vanishing or sinking to a global bucket.
   writeFileSync(changedPath, twenty.slice(0, 3).join('\n') + '\n');
   await page.getByRole('button', { name: 'Refresh' }).click();
-  const section = page.getByTestId('outdated-comments');
-  await expect(section).toBeVisible();
-  await expect(section).toContainText('Submitted comments persist here.');
+  await expect(page.getByTestId('outdated-comments')).toHaveCount(0);
+  const strip = article.getByTestId('file-comment-strip-resolve.txt');
+  await expect(strip).toContainText('Submitted comments persist here.');
+  await expect(strip).toContainText('resolve.txt');
 });
 
 test('large files keep their syntax highlighting', async ({ page, weaver }) => {
@@ -653,6 +721,101 @@ test('a pending comment whose file left the snapshot is dropped, not parked', as
   await expect(
     page.getByTestId('change-comment-composer').locator('textarea'),
   ).toHaveValue('');
+});
+
+test('a note edited on a submitted review rides a follow-up round', async ({
+  page,
+  weaver,
+}) => {
+  const session = await weaver.seedSession({
+    goal: 'note follow-up',
+    name: 'note-followup',
+  });
+  const changedPath = join(session.work_dir, 'note.txt');
+  writeFileSync(changedPath, 'one\ntwo\nthree\n');
+
+  await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
+  const article = page
+    .locator('article')
+    .filter({ has: page.locator('code', { hasText: /^note\.txt$/ }) });
+  await (await addWidgetButton(article, 'new', 2)).click({ force: true });
+  await page
+    .getByTestId('change-comment-composer')
+    .locator('textarea')
+    .fill('First round.');
+  await page
+    .getByTestId('change-comment-composer')
+    .getByRole('button', { name: 'Add pending comment' })
+    .click();
+  const submitted = page.waitForResponse(
+    (response) => response.ok() && new URL(response.url()).pathname === '/api/reviews/submit',
+  );
+  await page.getByTestId('review-tray-toggle').click();
+  await page.getByTestId('submit-review').click();
+  await submitted;
+
+  // The envelope is quiescent with nothing pending: the button rests.
+  await expect(page.getByTestId('review-envelope-state')).toContainText('submitted');
+  await expect(page.getByTestId('submit-review')).toBeDisabled();
+
+  // A note typed on the submitted envelope is pending words. Its autosave
+  // lands on the envelope — and the button must stay enabled, because the
+  // note differs from what the session last received, not from what the
+  // envelope now holds.
+  const note = page.getByTestId('review-overall-note');
+  const autosave = page.waitForResponse(
+    (response) =>
+      response.ok() &&
+      response.request().method() === 'POST' &&
+      new URL(response.url()).pathname === '/api/reviews/update',
+  );
+  await note.fill('One more overall thought.');
+  await note.press('Tab');
+  await autosave;
+  // The note is pending words like any comment: the manifest counts it, the
+  // same 'X pending' as anything else, and the quiescent state line yields.
+  await expect(page.getByTestId('review-tray-toggle')).toContainText('Review · 1 pending');
+  await expect(page.getByTestId('pending-note-row')).toContainText('One more overall thought.');
+  await expect(page.getByTestId('review-envelope-state')).toHaveCount(0);
+  await expect(page.getByTestId('submit-review')).toBeEnabled();
+
+  // The preview speaks for this surface too: drilling in shows the round a
+  // submit would send, note first — not the envelope's standing message.
+  await page.getByTestId('conversation-preview').locator('summary').click();
+  await expect(page.getByTestId('conversation-preview')).toContainText(
+    'Overall:',
+  );
+  await expect(page.getByTestId('conversation-preview')).toContainText(
+    'One more overall thought.',
+  );
+
+  // One submission sends the note as a round — the freeze flushes any
+  // unsaved text first, so nothing is lost to the click's own blur.
+  const round = page.waitForResponse(
+    (response) => response.ok() && new URL(response.url()).pathname === '/api/reviews/submit',
+  );
+  await page.getByTestId('submit-review').click();
+  await round;
+  // The tray still composes against the same envelope, its note in place —
+  // and now carried: in flight or delivered, it is no longer pending words.
+  await expect(note).toHaveValue('One more overall thought.');
+  await expect(page.getByTestId('review-tray-toggle')).toContainText('Review · 0 pending');
+  await expect(page.getByTestId('submit-review')).toBeDisabled();
+  // A 200 alone could be the no-op read of an unchanged envelope; the round
+  // key proves a follow-up was actually queued.
+  const reviewsJson = await page.evaluate(async (sessionId) => {
+    const response = await fetch('/api/reviews/list', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        subject_kind: 'changes',
+        subject_key: 'changes',
+        session: sessionId,
+      }),
+    });
+    return (await response.json()) as Array<{ delivery_key: string }>;
+  }, session.id);
+  expect(reviewsJson[0].delivery_key).toContain('#');
 });
 
 test('unresolved threads open by default and resolved ones stay closed', async ({

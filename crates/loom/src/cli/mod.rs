@@ -131,7 +131,6 @@ pub fn bindings() -> Vec<CliBinding> {
         bind::<reviews::comments::delete::Op>(),
         bind::<reviews::discard::Op>(),
         bind::<reviews::get::Op>(),
-        bind::<reviews::retarget::Op>(),
         bind::<reviews::retry_delivery::Op>(),
         bind::<runs::create::Op>(),
         bind::<runs::get::Op>(),

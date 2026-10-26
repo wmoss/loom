@@ -9,17 +9,19 @@ const props = defineProps<{
   open: boolean;
   overallNote: string;
   summarySaving: boolean;
-  acknowledgeOutdated: boolean;
   error: string;
   layoutBusy: boolean;
   submitting: boolean;
   discarding: boolean;
   deliveryErrors: Record<number, string>;
-  /** The creator's submitted review with undelivered follow-up work: its
-   *  pending comments and replies queue beside a draft's — one surface, one
-   *  submit. Null when a draft is open (the draft is the surface) or when
-   *  nothing is pending. */
+  /** The creator's submitted review — the follow-up surface: its pending
+   *  comments and replies queue beside a draft's, one surface, one submit.
+   *  Null when a draft is open (the draft is the surface) or when the
+   *  reviewer has no submitted review for the subject. */
   continuation: Review | null;
+  /** Ids of pending comments whose anchored lines changed since they were
+   *  written — the content-keyed staleness the warning and row tags read. */
+  staleCommentIds: number[];
   subjectLabel: string;
   discardAction: () => Promise<void>;
   /** Floats bottom-right and expands upward. Set false to sit inline (e.g.
@@ -32,17 +34,20 @@ const props = defineProps<{
 const emit = defineEmits<{
   'update:open': [value: boolean];
   'update:overallNote': [value: string];
-  'update:acknowledgeOutdated': [value: boolean];
   navigate: [direction: number];
   focusComment: [commentId: number];
   saveOverall: [];
-  retarget: [];
   submit: [];
   retry: [review: Review];
 }>();
 const toggleEl = ref<HTMLButtonElement | null>(null);
 const rootEl = ref<HTMLElement | null>(null);
 const overallInput = ref<HTMLTextAreaElement | null>(null);
+
+/** The note row's target: the composer itself, in the same tray. */
+function focusOverall() {
+  overallInput.value?.focus();
+}
 const overallId = `review-overall-${useId()}`;
 defineExpose({ focusToggle: () => toggleEl.value?.focus() });
 
@@ -96,24 +101,69 @@ const recent = computed(
       .sort((a, b) => b.id - a.id)[0] ?? null,
 );
 
+// The pending comments whose anchors point at changed code — the tray's one
+// staleness signal, counted only over what a submit would send.
+const staleRows = computed(() => pendingRows.value.filter((row) => row.stale));
+
 // The open surface — a draft, or a submitted review carrying undelivered
 // follow-up work. Pending rows render identically for both: a new comment
 // and a reply look the same because they are the same thing here, words the
 // session has not received yet, queued until one submit sends them.
 const surface = computed(() => props.draft ?? props.continuation);
 
+/** The note the session is on track to receive next: the live batch's if one
+ * is in flight, the delivered one otherwise. */
+const carriedNote = computed(
+  () => props.continuation?.queued_summary ?? props.continuation?.delivered_summary ?? '',
+);
+
+// The note is pending words exactly like a pending comment: a draft has
+// never delivered anything, so any note is pending; a submitted envelope's
+// note is pending until its round reaches the session — words a live batch
+// already carries are in flight, not pending, mirroring the submit path's
+// own no-op rule.
+const notePending = computed(() => {
+  if (!surface.value) return false;
+  const note = props.overallNote.trim();
+  return note !== (props.draft ? '' : carriedNote.value).trim();
+});
+
 const pendingRows = computed(() => {
   const review = surface.value;
   if (!review) return [];
-  const rows = review.comments
+  // The note leads the manifest, the same place the delivery message puts
+  // it: overall first, then the line-anchored words.
+  const rows: {
+    key: string;
+    body: string;
+    note: boolean;
+    reply: boolean;
+    focusId: number;
+    stale: boolean;
+  }[] = notePending.value
+    ? [
+        {
+          key: 'note',
+          body: props.overallNote.trim(),
+          note: true,
+          reply: false,
+          focusId: 0,
+          stale: false,
+        },
+      ]
+    : [];
+  for (const comment of review.comments
     .filter((comment) => comment.status === 'pending')
     .map((comment) => ({
       key: `c${comment.id}`,
       body: comment.body,
+      note: false,
       reply: false,
       focusId: comment.id,
-      stale: comment.subject_version !== review.subject.current_version,
-    }));
+      stale: props.staleCommentIds.includes(comment.id),
+    }))) {
+    rows.push(comment);
+  }
   // Replies only exist on submitted reviews; the ones past the delivered
   // cursor are still the reviewer's side of the loop.
   for (const comment of review.comments) {
@@ -122,6 +172,7 @@ const pendingRows = computed(() => {
         rows.push({
           key: `r${reply.id}`,
           body: reply.body,
+          note: false,
           reply: true,
           focusId: comment.id,
           stale: false,
@@ -138,16 +189,7 @@ const pendingRows = computed(() => {
 // make the request invalid outright, not "unsaved" itself.
 function submitShortcut() {
   if (props.layoutBusy || props.submitting || props.discarding) return;
-  if (props.draft) {
-    if (
-      (!props.draft.comments.length && !props.overallNote.trim()) ||
-      (props.draft.outdated && !props.acknowledgeOutdated)
-    ) {
-      return;
-    }
-  } else if (!props.continuation || !pendingRows.value.length) {
-    if (!props.overallNote.trim()) return;
-  }
+  if (!pendingRows.value.length) return;
   emit('submit');
 }
 </script>
@@ -177,7 +219,6 @@ function submitShortcut() {
       >
         <template v-if="surface">
           Review · {{ pendingRows.length }} pending
-          <span v-if="draft?.outdated" class="ml-1 text-block">· stale</span>
           <span v-if="failed.length" class="ml-1 text-block">
             · {{ failed.length }} delivery failed
           </span>
@@ -251,23 +292,20 @@ function submitShortcut() {
 
       <template v-if="surface">
         <p
-          v-if="draft?.outdated"
+          v-if="staleRows.length"
           class="mb-3 rounded border border-block-line bg-block-soft p-2 text-xs text-block"
           data-testid="review-stale-warning"
         >
-          This {{ subjectLabel }} changed to {{ draft.subject.current_version }}. Captured anchors
-          are preserved; re-anchor them, or acknowledge the older context before submitting.
+          {{ staleRows.length }} pending comment{{ staleRows.length === 1 ? '' : 's' }} anchor code
+          that changed since they were written. Re-anchor them, or submit as they stand.
         </p>
-        <button
-          v-if="draft?.outdated && !draft.comments.length"
-          type="button"
-          class="btn-secondary mb-3 px-2 py-1 text-xs"
-          data-testid="review-retarget-current"
-          :disabled="summarySaving"
-          @click="emit('retarget')"
+        <p
+          v-if="!draft && !pendingRows.length"
+          class="mb-3 text-2xs text-faint"
+          data-testid="review-envelope-state"
         >
-          Move review to current {{ subjectLabel }}
-        </button>
+          Review {{ surface.id }} submitted · delivery {{ surface.delivery_state }}
+        </p>
 
         <div class="space-y-1.5" aria-label="Pending comments">
           <button
@@ -276,20 +314,25 @@ function submitShortcut() {
             type="button"
             class="flex w-full items-center gap-2 rounded border border-line px-2 py-1.5 text-left text-xs hover:border-accent"
             :data-testid="
-              row.reply ? `pending-reply-row-${row.key}` : `pending-comment-row-${row.key}`
+              row.note
+                ? 'pending-note-row'
+                : row.reply
+                  ? `pending-reply-row-${row.key}`
+                  : `pending-comment-row-${row.key}`
             "
-            @click="emit('focusComment', row.focusId)"
+            @click="row.note ? focusOverall() : emit('focusComment', row.focusId)"
           >
             <span class="shrink-0 font-mono text-2xs text-faint">{{ index + 1 }}</span>
             <span class="min-w-0 flex-1 truncate text-fg">
-              <span v-if="row.reply" class="mr-1 text-faint" aria-hidden="true">↳</span
+              <span v-if="row.note" class="mr-1 text-faint" aria-hidden="true">✎</span>
+              <span v-else-if="row.reply" class="mr-1 text-faint" aria-hidden="true">↳</span
               >{{ row.body }}
             </span>
             <span v-if="row.stale" class="shrink-0 text-2xs text-block"> stale </span>
           </button>
         </div>
 
-        <label v-if="draft" class="mt-3 block text-xs font-medium text-muted" :for="overallId">
+        <label class="mt-3 block text-xs font-medium text-muted" :for="overallId">
           Overall note <span class="font-normal text-faint">(optional)</span>
         </label>
         <textarea
@@ -311,30 +354,16 @@ function submitShortcut() {
           Saving overall note…
         </p>
 
-        <label
-          v-if="draft?.outdated"
-          class="mt-2 flex cursor-pointer items-start gap-2 rounded bg-subtle/50 p-2 text-xs text-muted"
-        >
-          <input
-            :checked="acknowledgeOutdated"
-            type="checkbox"
-            class="mt-0.5"
-            data-testid="review-stale-ack"
-            @change="
-              emit('update:acknowledgeOutdated', ($event.target as HTMLInputElement).checked)
-            "
-          />
-          Submit against the captured version intentionally.
-        </label>
-
-        <div v-if="draft" class="mt-3 border-t border-line pt-3">
-          <p class="mb-2 text-2xs font-semibold uppercase tracking-wide text-faint">
+        <details class="mt-3 border-t border-line pt-3" data-testid="conversation-preview">
+          <summary
+            class="cursor-pointer select-none text-2xs font-semibold uppercase tracking-wide text-faint"
+          >
             Conversation feedback preview
-          </p>
+          </summary>
           <pre
-            class="max-h-32 overflow-auto whitespace-pre-wrap rounded bg-code p-2 text-xs text-code-fg"
-            >{{ draft.message }}</pre>
-        </div>
+            class="mt-2 max-h-32 overflow-auto whitespace-pre-wrap rounded bg-code p-2 text-xs text-code-fg"
+            >{{ surface?.message }}</pre>
+        </details>
 
         <div class="mt-3 flex flex-wrap items-center gap-2">
           <p
@@ -357,13 +386,7 @@ function submitShortcut() {
             type="button"
             class="btn-primary ml-auto px-3 py-1.5 text-xs"
             data-testid="submit-review"
-            :disabled="
-              submitting ||
-              layoutBusy ||
-              discarding ||
-              (!pendingRows.length && !(draft && overallNote.trim())) ||
-              (draft?.outdated && !acknowledgeOutdated)
-            "
+            :disabled="submitting || layoutBusy || discarding || !pendingRows.length"
             @click="emit('submit')"
           >
             {{ submitting ? 'Submitting…' : 'Submit review' }}

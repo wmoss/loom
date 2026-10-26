@@ -1834,13 +1834,22 @@ pub struct ReviewDto {
     pub subject: ReviewSubjectDto,
     pub status: String,
     pub summary: String,
+    /// The note as the session last received it. A summary that differs from
+    /// it is pending words — the follow-up surface's submit gates on exactly
+    /// this, so a saved-but-undelivered note stays submittable until its
+    /// round is sent.
+    #[serde(default)]
+    pub delivered_summary: String,
+    /// The note the live, undelivered batch carries — absent when nothing is
+    /// in flight. The follow-up surface's note gate reads it first, so words
+    /// already queued for the session stop reading as pending.
+    #[serde(default)]
+    pub queued_summary: Option<String>,
     /// Monotonic optimistic revision for the editable draft envelope.
     pub draft_revision: i64,
     /// Server-authoritative exact conversation payload preview.
     pub message: String,
     pub created_by: String,
-    pub outdated: bool,
-    pub acknowledged_outdated: bool,
     pub delivery_state: String,
     pub delivery_error: Option<String>,
     pub delivery_key: String,

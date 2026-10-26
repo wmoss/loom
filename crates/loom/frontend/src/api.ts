@@ -669,16 +669,8 @@ export const deleteReviewComment = (
 export const discardReview = (reviewId: number, expectedRevision: number) =>
   invokeOperation('reviews.discard', { id: reviewId, expected_revision: expectedRevision });
 
-export const submitReview = (
-  reviewId: number,
-  body: { expected_revision: number; acknowledge_outdated: boolean },
-) => invokeOperation('reviews.submit', { id: reviewId, ...body });
-
-export const retargetReviewToCurrent = (reviewId: number, expectedRevision: number) =>
-  invokeOperation('reviews.retarget', {
-    id: reviewId,
-    expected_revision: expectedRevision,
-  });
+export const submitReview = (reviewId: number, body: { expected_revision: number }) =>
+  invokeOperation('reviews.submit', { id: reviewId, ...body });
 
 export const retryReviewDelivery = (reviewId: number) =>
   invokeOperation('reviews.retry_delivery', { id: reviewId });
