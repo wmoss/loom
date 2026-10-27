@@ -2,8 +2,9 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use weaver_api::{
-    ArtifactTextAnchorDto, ChangeAnchorDto, ReviewAnchorDto, ReviewAnchorKindDto, ReviewCommentDto,
-    ReviewDto, ReviewSubjectDto, ReviewSubjectKindDto,
+    ArtifactTextAnchorDto, ChangeAnchorDto, ReviewAnchorDto, ReviewAnchorKindDto,
+    ReviewAuthorKindDto, ReviewCommentDto, ReviewCommentReplyDto, ReviewDto, ReviewSubjectDto,
+    ReviewSubjectKindDto,
 };
 use weaver_core::artifact::{self, Artifact};
 use weaver_core::branch::Branch;
@@ -74,17 +75,27 @@ fn comment_dto(comment: &review::ReviewComment) -> ReviewCommentDto {
         anchor,
         body: comment.body.clone(),
         status: comment.status.clone(),
+        replies: comment
+            .replies
+            .iter()
+            .map(|reply| ReviewCommentReplyDto {
+                id: reply.id,
+                author_kind: if reply.author_kind == "operator" {
+                    ReviewAuthorKindDto::Operator
+                } else {
+                    ReviewAuthorKindDto::Session
+                },
+                author: reply.author.clone(),
+                body: reply.body.clone(),
+                created_at: reply.created_at.clone(),
+            })
+            .collect(),
         created_at: comment.created_at.clone(),
         updated_at: comment.updated_at.clone(),
     }
 }
 
 fn review_dto(review: &review::Review, current_version: &str) -> ReviewDto {
-    let outdated = review.subject_version != current_version
-        || review
-            .comments
-            .iter()
-            .any(|comment| comment.subject_version != current_version);
     ReviewDto {
         id: review.id,
         session_id: review.session_id.clone(),
@@ -102,14 +113,18 @@ fn review_dto(review: &review::Review, current_version: &str) -> ReviewDto {
         },
         status: review.status.clone(),
         summary: review.summary.clone(),
+        delivered_summary: review.delivered_summary.clone(),
+        queued_summary: review.queued_summary.clone(),
         draft_revision: review.draft_revision,
-        message: review::structured_message(review),
+        // The preview speaks one semantic on both surfaces: what submitting
+        // now would send — the initial payload, or the next follow-up round.
+        message: review::preview_message(review),
         created_by: review.created_by.clone(),
-        outdated,
-        acknowledged_outdated: review.acknowledged_outdated,
         delivery_state: review.delivery_state.clone(),
         delivery_error: review.delivery_error.clone(),
         delivery_key: review.delivery_key.clone(),
+        pending_replies: review.pending_replies,
+        reply_upto: review.reply_upto,
         created_at: review.created_at.clone(),
         updated_at: review.updated_at.clone(),
         submitted_at: review.submitted_at.clone(),
@@ -142,6 +157,21 @@ async fn current_review_version(st: &AppState, item: &review::Review) -> ApiResu
             if item.subject_id != branch.id {
                 return Err(AppError::bad_request("invalid changes review subject"));
             }
+            // The snapshot a version names is the review's truth: one
+            // spelling for a pinned commit (immutable, so the review is its
+            // own current version — never outdated, whatever later happens
+            // to the branch), one for the unstaged working state and one for
+            // the branch change-set (both live, recomputed on read).
+            if crate::changes::commit_for_version(&item.subject_version).is_some() {
+                return Ok(Some(item.subject_version.clone()));
+            }
+            if crate::changes::is_unstaged_version(&item.subject_version) {
+                return Ok(
+                    crate::changes::load_unstaged(std::path::Path::new(&session.work_dir))
+                        .await?
+                        .version,
+                );
+            }
             Ok(
                 crate::changes::load(std::path::Path::new(&session.work_dir), &branch.base_branch)
                     .await?
@@ -172,6 +202,8 @@ fn legacy_review_dto(
             }),
             body: comment.body.clone(),
             status: thread.status.clone(),
+            // Legacy threads predate replies and carry none.
+            replies: Vec::new(),
             created_at: comment.created_at.clone(),
             updated_at: comment.created_at.clone(),
         })
@@ -189,6 +221,8 @@ fn legacy_review_dto(
         },
         status: "submitted".to_string(),
         summary: String::new(),
+        delivered_summary: String::new(),
+        queued_summary: None,
         draft_revision: 0,
         message: String::new(),
         created_by: thread
@@ -196,11 +230,11 @@ fn legacy_review_dto(
             .first()
             .map(|comment| comment.author.clone())
             .unwrap_or_else(|| "legacy".to_string()),
-        outdated: thread.base_rev != artifact.rev,
-        acknowledged_outdated: true,
         delivery_state: "delivered".to_string(),
         delivery_error: None,
         delivery_key: format!("legacy-thread:{}", thread.id),
+        pending_replies: 0,
+        reply_upto: 0,
         created_at: thread.created_at.clone(),
         updated_at: thread
             .comments
@@ -306,10 +340,38 @@ async fn list_for(
         viewer,
     )
     .await?;
-    let mut out: Vec<ReviewDto> = reviews
-        .iter()
-        .map(|item| review_dto(item, &current_version))
-        .collect();
+    let mut out: Vec<ReviewDto> = Vec::with_capacity(reviews.len());
+    for item in &reviews {
+        // A commit-pinned review is its own current version — the snapshot it
+        // names cannot move — while the branch change-set stays one shared
+        // load. The unstaged working state is live like the branch, but has
+        // a snapshot of its own, so each such review recomputes against it.
+        let current = match (
+            q.subject_kind,
+            crate::changes::commit_for_version(&item.subject_version),
+        ) {
+            (ReviewSubjectKindDto::Changes, Some(_)) => item.subject_version.clone(),
+            _ if q.subject_kind == ReviewSubjectKindDto::Changes
+                && crate::changes::is_unstaged_version(&item.subject_version) =>
+            {
+                crate::changes::load_unstaged(std::path::Path::new(&session.work_dir))
+                    .await?
+                    .version
+                    .unwrap_or_else(|| item.subject_version.clone())
+            }
+            _ => current_version.clone(),
+        };
+        let mut dto = review_dto(item, &current);
+        if !principal.is_human() {
+            // The session reads only what has already reached it: a pending
+            // comment or queued reply is the reviewer's words still on their
+            // side of the loop.
+            dto.comments.retain(|comment| comment.status != "pending");
+            dto.pending_replies = 0;
+            dto.reply_upto = 0;
+        }
+        out.push(dto);
+    }
     if q.subject_kind == ReviewSubjectKindDto::Artifact {
         let artifact_id = subject_id
             .parse()
@@ -352,9 +414,13 @@ async fn create_for(
                         "changes review subject_key must be 'changes'",
                     ));
                 }
-                let changes = crate::changes::load(
+                // The snapshot the caller is looking at may be the branch's
+                // whole change-set, one commit's diff, or the unstaged
+                // working state; the version string says which.
+                let changes = crate::changes::load_for_review(
                     std::path::Path::new(&session.work_dir),
                     &branch.base_branch,
+                    crate::changes::rev_for_version(&body.subject_version).as_deref(),
                 )
                 .await?;
                 let version = changes.version.ok_or_else(|| {
@@ -442,9 +508,15 @@ async fn require_anchor(
         }
         ("changes", ReviewAnchorKindDto::Change, ReviewAnchorDto::Change(anchor)) => {
             let (session, branch) = require_session(&st.db, &item.session_id).await?;
-            let changes =
-                crate::changes::load(std::path::Path::new(&session.work_dir), &branch.base_branch)
-                    .await?;
+            // Validate against the exact snapshot the comment's version
+            // names: the branch's change-set, one commit's diff, or the
+            // unstaged working state.
+            let changes = crate::changes::load_for_review(
+                std::path::Path::new(&session.work_dir),
+                &branch.base_branch,
+                crate::changes::rev_for_version(subject_version).as_deref(),
+            )
+            .await?;
             let anchor = crate::changes::validate_anchor(&changes, subject_version, anchor)
                 .map_err(|error| AppError::conflict(error.to_string()))?;
             Ok((
@@ -525,7 +597,6 @@ pub(super) fn bound_operations() -> Vec<Bound> {
         register::<weaver_api::operations::reviews::get::Op, _, _>(get_operation),
         register::<weaver_api::operations::reviews::update::Op, _, _>(update_operation),
         register::<weaver_api::operations::reviews::discard::Op, _, _>(discard_operation),
-        register::<weaver_api::operations::reviews::retarget::Op, _, _>(retarget_operation),
         register::<weaver_api::operations::reviews::list::Op, _, _>(list_operation),
         register::<weaver_api::operations::reviews::create::Op, _, _>(create_operation),
         register::<weaver_api::operations::reviews::comments::create::Op, _, _>(
@@ -539,6 +610,9 @@ pub(super) fn bound_operations() -> Vec<Bound> {
         ),
         register::<weaver_api::operations::reviews::comments::resolve::Op, _, _>(
             comments_resolve_operation,
+        ),
+        register::<weaver_api::operations::reviews::comments::reply::Op, _, _>(
+            comments_reply_operation,
         ),
         register::<weaver_api::operations::reviews::submit::Op, _, _>(submit_operation),
         register::<weaver_api::operations::reviews::retry_delivery::Op, _, _>(
@@ -567,27 +641,10 @@ async fn update_operation(
     let st = context.state;
     let principal = context.principal;
     let item = creator_review(&st, &principal, input.id).await?;
-    if item.status != "draft" {
-        return Err(submitted_draft_conflict(&st, &item).await);
-    }
-    let subject_version = match &input.subject_version {
-        Some(version) if item.subject_kind == "artifact" => {
-            let artifact = review_artifact(&st, &item).await?;
-            Some(require_artifact_version(&st, &artifact, version, "review").await?)
-        }
-        Some(version) => {
-            let current = current_review_version(&st, &item)
-                .await?
-                .ok_or_else(|| AppError::conflict("current change-set version is unavailable"))?;
-            if version != &current {
-                return Err(AppError::conflict(
-                    "change-set version moved; refresh before retargeting",
-                ));
-            }
-            Some(current)
-        }
-        None => None,
-    };
+    // A submitted review stays open to its reviewer for the note as much as
+    // for comments: the core decides which surface the edit lands on, and a
+    // changed note queues for the next follow-up round like a pending
+    // comment does.
     let updated = match review::update_draft(
         &st.db,
         item.id,
@@ -595,7 +652,6 @@ async fn update_operation(
         input.expected_revision,
         &review::DraftPatch {
             summary: input.summary.as_deref(),
-            subject_version: subject_version.as_deref(),
         },
     )
     .await
@@ -629,47 +685,6 @@ async fn discard_operation(
     Ok(weaver_api::operations::reviews::discard::Output { discarded: true })
 }
 
-async fn retarget_operation(
-    context: OperationContext,
-    input: weaver_api::operations::reviews::retarget::Input,
-) -> ApiResult<weaver_api::operations::reviews::retarget::Output> {
-    let st = context.state;
-    let principal = context.principal;
-    let item = creator_review(&st, &principal, input.id).await?;
-    if item.status != "draft" {
-        return Err(submitted_draft_conflict(&st, &item).await);
-    }
-    let current = current_review_version(&st, &item)
-        .await?
-        .ok_or_else(|| AppError::conflict("current review subject is unavailable"))?;
-    let result = if item.subject_kind == "artifact" {
-        review::retarget_draft_to_current(
-            &st.db,
-            item.id,
-            &principal.username,
-            input.expected_revision,
-        )
-        .await
-    } else {
-        review::update_draft(
-            &st.db,
-            item.id,
-            &principal.username,
-            input.expected_revision,
-            &review::DraftPatch {
-                summary: None,
-                subject_version: Some(&current),
-            },
-        )
-        .await
-    };
-    let updated = match result {
-        Ok(updated) => updated,
-        Err(error) => return Err(draft_mutation_error(&st, &item, error).await),
-    };
-    Ok(review_dto(&updated, &current))
-}
-
 async fn list_operation(
     context: OperationContext,
     input: weaver_api::operations::reviews::list::Input,
@@ -701,9 +716,9 @@ async fn comments_update_operation(
     let st = context.state;
     let principal = context.principal;
     let item = creator_review(&st, &principal, input.id).await?;
-    if item.status != "draft" {
-        return Err(submitted_draft_conflict(&st, &item).await);
-    }
+    // A submitted review stays open to its reviewer: the core decides
+    // which comment operations the surface allows (pending comments are
+    // editable; delivered ones are history).
     if input.body.is_none() && input.subject_version.is_none() && input.anchor.is_none() {
         return Err(AppError::bad_request("comment update is empty"));
     }
@@ -759,9 +774,9 @@ async fn comments_delete_operation(
     let st = context.state;
     let principal = context.principal;
     let item = creator_review(&st, &principal, input.id).await?;
-    if item.status != "draft" {
-        return Err(submitted_draft_conflict(&st, &item).await);
-    }
+    // A submitted review stays open to its reviewer: the core decides
+    // which comment operations the surface allows (pending comments are
+    // editable; delivered ones are history).
     let updated = match review::delete_comment(
         &st.db,
         item.id,
@@ -803,6 +818,46 @@ async fn comments_resolve_operation(
     Ok(comment_dto(&comment))
 }
 
+async fn comments_reply_operation(
+    context: OperationContext,
+    input: weaver_api::operations::reviews::comments::reply::Input,
+) -> ApiResult<weaver_api::operations::reviews::comments::reply::Output> {
+    let st = context.state;
+    // The credential names the speaker, not the request operand — the scope
+    // check admits ancestor sessions too, and a parent must not append to a
+    // child's review answers in the child's name. The session author is the
+    // token's own session; the core rejects any review that is not its own.
+    let author = match &context.principal.grant {
+        crate::auth::Grant::Session { session_id, .. } => review::ReplyAuthor::Session(session_id),
+        _ => review::ReplyAuthor::Operator(&context.principal.username),
+    };
+    let comment = review::reply_comment(&st.db, input.comment_id, author, &input.body)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let item = review::get(&st.db, comment.review_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("submitted review"))?;
+    if let Some(reply) = comment.replies.last() {
+        events::emit(
+            &st.bus,
+            &item.branch_id,
+            "review_comment_replied",
+            json!({
+                "review_id": item.id,
+                "comment_id": comment.id,
+                "reply_id": reply.id,
+                "session_id": item.session_id,
+                "author_kind": reply.author_kind,
+                "author": reply.author,
+                "subject_kind": item.subject_kind,
+                "subject_key": item.subject_key,
+                "body": reply.body,
+            }),
+        );
+    }
+    Ok(comment_dto(&comment))
+}
+
 async fn comments_create_operation(
     context: OperationContext,
     input: weaver_api::operations::reviews::comments::create::Input,
@@ -810,9 +865,9 @@ async fn comments_create_operation(
     let st = context.state;
     let principal = context.principal;
     let item = creator_review(&st, &principal, input.id).await?;
-    if item.status != "draft" {
-        return Err(submitted_draft_conflict(&st, &item).await);
-    }
+    // A submitted review stays open to its reviewer: the core decides
+    // which comment operations the surface allows (pending comments are
+    // editable; delivered ones are history).
     let (anchor, subject_version) = require_anchor(
         &st,
         &item,
@@ -847,47 +902,18 @@ async fn submit_operation(
     let st = context.state;
     let principal = context.principal;
     let item = creator_review(&st, &principal, input.id).await?;
-    let current = current_review_version(&st, &item).await?;
-    let result = if item.subject_kind == "changes" {
-        let current = current
-            .as_deref()
-            .ok_or_else(|| AppError::conflict("current change-set version is unavailable"))?;
-        review::submit_at_version(
-            &st.db,
-            item.id,
-            &principal.username,
-            input.expected_revision,
-            input.acknowledge_outdated,
-            current,
-        )
-        .await
-    } else {
-        review::submit(
-            &st.db,
-            item.id,
-            &principal.username,
-            input.expected_revision,
-            input.acknowledge_outdated,
-        )
-        .await
-    };
+    // The captured revision is provenance: submitting consults neither the
+    // subject nor its current version.
+    let result = review::submit(
+        &st.db,
+        item.id,
+        &principal.username,
+        input.expected_revision,
+    )
+    .await;
     let submission = match result {
         Ok(submission) => submission,
-        Err(error) => {
-            if error
-                .to_string()
-                .contains("acknowledge the reviewed revision")
-            {
-                let fresh = review::get(&st.db, item.id).await?.unwrap_or(item);
-                let current = current_review_version(&st, &fresh)
-                    .await?
-                    .unwrap_or_else(|| fresh.subject_version.clone());
-                return Err(AppError::conflict(error.to_string()).with_details(json!({
-                    "review": review_dto(&fresh, &current),
-                })));
-            }
-            return Err(draft_mutation_error(&st, &item, error).await);
-        }
+        Err(error) => return Err(draft_mutation_error(&st, &item, error).await),
     };
     if let Some(event) = submission.event {
         st.bus.publish(event);

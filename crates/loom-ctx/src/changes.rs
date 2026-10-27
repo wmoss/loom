@@ -32,21 +32,32 @@ pub const MAX_HUNKS_PER_FILE: usize = 50;
 pub const MAX_LINES_PER_FILE: usize = 1_000;
 pub const MAX_TOTAL_LINES: usize = 8_000;
 pub const MAX_LINE_BYTES: usize = 2_048;
-const MAX_INVENTORY_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on the raw git status/diff inventory captures backing the snapshots.
+pub(crate) const MAX_INVENTORY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PATCH_BYTES: usize = 2 * 1024 * 1024;
 const MAX_UNTRACKED_RENDER_BYTES: u64 = 512 * 1024;
 const MAX_IDENTITY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_EXCLUDE_BYTES: u64 = 256 * 1024;
+/// Per-file ceiling for the full pre/post-change text the browser needs to
+/// enable hunk expansion; a larger file gets no expand controls rather than
+/// expansion that would reveal wrong lines. Sized to cover real source
+/// files — a file past it also loses syntax highlighting when its language
+/// grammar needs block structure the hunk skeleton cannot supply (a Vue
+/// SFC's `<script>` region, for one).
+const MAX_CONTENT_BYTES: usize = 128 * 1024;
+/// Response-wide ceiling for expansion content; files past it degrade the
+/// same way per-file oversize does.
+const MAX_TOTAL_CONTENT_BYTES: usize = 512 * 1024;
 const MAX_SAFE_CONFIG_BYTES: usize = 4 * 1024;
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const GIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
-struct Capture {
-    bytes: Vec<u8>,
-    truncated: bool,
-    timed_out: bool,
+pub(crate) struct Capture {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
+    pub(crate) timed_out: bool,
 }
 
 #[derive(Debug)]
@@ -55,6 +66,10 @@ struct RawFile {
     path: Vec<u8>,
     old_path: Option<Vec<u8>>,
     gitlink: bool,
+    /// Pre/post-change blob hashes from `--raw --full-index`; used to read
+    /// full file contents for hunk expansion.
+    old_blob: Option<Vec<u8>>,
+    new_blob: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -127,7 +142,7 @@ impl Drop for GitProcessGroup {
     }
 }
 
-fn hardened_git(work_dir: &Path) -> Command {
+pub(crate) fn hardened_git(work_dir: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -189,7 +204,7 @@ impl GitBoundary {
     }
 }
 
-async fn capture_git_status(
+pub(crate) async fn capture_git_status(
     mut command: Command,
     args: &[&str],
     retain: usize,
@@ -273,7 +288,7 @@ async fn capture_diff(boundary: &GitBoundary, args: &[&str], retain: usize) -> R
     capture_git(boundary, &full, retain).await
 }
 
-async fn bootstrap_text(work_dir: &Path, args: &[&str]) -> Result<Option<String>> {
+pub(crate) async fn bootstrap_text(work_dir: &Path, args: &[&str]) -> Result<Option<String>> {
     let (capture, success) = capture_git_status(hardened_git(work_dir), args, 4 * 1024).await?;
     if capture.timed_out {
         bail!("git {} exceeded its deadline", args.join(" "));
@@ -562,7 +577,7 @@ fn same_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     metadata_identity(left) == metadata_identity(right)
 }
 
-fn nul_records(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub(crate) fn nul_records(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes
         .split(|byte| *byte == 0)
         .filter(|item| !item.is_empty())
@@ -576,6 +591,12 @@ fn parse_raw_files(bytes: &[u8]) -> Vec<RawFile> {
             continue;
         };
         let letter = code.first().copied().unwrap_or(b'M');
+        // `:old-mode new-mode old-blob new-blob status` — the blobs back
+        // full-content reads; absent formats degrade to `None`.
+        let fields: Vec<&[u8]> = header.splitn(6, |byte| *byte == b' ').collect();
+        let blob = |index: usize| fields.get(index).map(|b| b.to_vec());
+        let old_blob = blob(2);
+        let new_blob = blob(3);
         let Some(first_path) = records.next() else {
             break;
         };
@@ -604,6 +625,8 @@ fn parse_raw_files(bytes: &[u8]) -> Vec<RawFile> {
             path,
             old_path,
             gitlink,
+            old_blob,
+            new_blob,
         });
     }
     files
@@ -642,7 +665,7 @@ fn source_paths(bytes: &[u8]) -> BTreeSet<Vec<u8>> {
     nul_records(bytes).map(ToOwned::to_owned).collect()
 }
 
-fn sanitize_text(value: &str, limit: usize) -> (String, bool) {
+pub(crate) fn sanitize_text(value: &str, limit: usize) -> (String, bool) {
     let cleaned: String = value
         .chars()
         .map(|ch| {
@@ -854,11 +877,121 @@ async fn hash_path(
     }
 }
 
+/// An all-zero hash from `--raw`: Git's spelling for "this side's content is
+/// the working-tree state, not an object I can name" — most often a file with
+/// unstaged edits, where the whole post-image lives only in the worktree.
+fn is_zero_hash(blob: &[u8]) -> bool {
+    !blob.is_empty() && blob.iter().all(|byte| *byte == b'0')
+}
+
+/// Reads one blob's full text for hunk expansion — `None` unless the whole
+/// blob fits the per-file bound, so expansion never works from partial text.
+/// A zero hash names no object, so it short-circuits without a process spawn.
+async fn read_blob_text(boundary: &GitBoundary, blob: &Option<Vec<u8>>) -> Result<Option<String>> {
+    let Some(blob) = blob else {
+        return Ok(None);
+    };
+    if blob.is_empty() || is_zero_hash(blob) {
+        return Ok(None);
+    }
+    let spec = String::from_utf8_lossy(blob).to_string();
+    let (capture, ok) = capture_git_status(
+        boundary.command(),
+        &["cat-file", "blob", &spec],
+        MAX_CONTENT_BYTES + 1,
+    )
+    .await?;
+    // A missing blob or a capture that did not come back whole leaves that
+    // side non-expandable.
+    if !ok || capture.truncated || capture.timed_out {
+        return Ok(None);
+    }
+    // Whole-file text, not patch lines: keep the line structure the renderer
+    // splits on, repairing only invalid UTF-8.
+    Ok(Some(String::from_utf8_lossy(&capture.bytes).into_owned()))
+}
+
+/// Reads the working-tree file's whole text within the content bound — the
+/// true new side for a file whose changes are unstaged, where `--raw` can
+/// only spell the all-zero hash. Binary and missing files read as `None`.
+async fn read_worktree_text(work_dir: &Path, raw: &[u8]) -> Result<Option<String>> {
+    let Some((handle, metadata)) = safe_file(work_dir, raw)? else {
+        return Ok(None);
+    };
+    if metadata.len() as usize > MAX_CONTENT_BYTES {
+        return Ok(None);
+    }
+    let mut handle = tokio::fs::File::from_std(handle);
+    let mut bytes = vec![0_u8; metadata.len() as usize];
+    if handle.read_exact(&mut bytes).await.is_err() {
+        return Ok(None);
+    }
+    let mut extra = [0_u8; 1];
+    if handle.read(&mut extra).await? != 0 || !same_metadata(&metadata, &handle.metadata().await?) {
+        return Ok(None);
+    }
+    if bytes.contains(&0) {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// Full pre/post-change text for one file, from its `--raw` blob hashes. The
+/// budget is spent on both sides together, so exhaustion never halves a file.
+/// Each side still carries its own blob limit, and an added or deleted file
+/// legitimately has exactly one expandable side.
+async fn attach_contents(
+    work_dir: &Path,
+    boundary: &GitBoundary,
+    raw: &RawFile,
+    budget: &mut usize,
+    // True when the diff's new side *is* the working tree (the branch
+    // snapshot), so a zero new-side hash means unstaged edits whose
+    // post-image is the live file. False for commit snapshots, where a
+    // zero new side means the side is gone: reading the live worktree
+    // would graft the session's current state onto an immutable commit,
+    // and move the version digest with it.
+    worktree_new_side: bool,
+) -> Result<(Option<String>, Option<String>)> {
+    if raw.gitlink {
+        return Ok((None, None));
+    }
+    // Once the response-wide budget is spent no file gets content — and no
+    // further blob reads spawn for the files behind it.
+    if *budget == 0 {
+        return Ok((None, None));
+    }
+    let old = read_blob_text(boundary, &raw.old_blob).await?;
+    let new = match read_blob_text(boundary, &raw.new_blob).await? {
+        Some(text) => Some(text),
+        None if worktree_new_side && raw.new_blob.as_deref().is_some_and(is_zero_hash) => {
+            // The zero hash names working-tree state: unstaged edits, the
+            // primary Changes-tab case. The worktree file itself is the real
+            // post-image, and a deleted file simply reads as absent.
+            read_worktree_text(work_dir, &raw.path).await?
+        }
+        None => None,
+    };
+    let cost = old.as_ref().map_or(0, |text: &String| text.len())
+        + new.as_ref().map_or(0, |text: &String| text.len());
+    if cost > *budget {
+        // The first file that does not fit closes the budget: the crumbs it
+        // leaves behind would only pay for a chance later file fits them, at
+        // two blob reads per remaining file for content that mostly cannot
+        // land. Attachment is best-effort; the spawn loop is not.
+        *budget = 0;
+        return Ok((None, None));
+    }
+    *budget -= cost;
+    Ok((old, new))
+}
+
 async fn untracked_file(
     work_dir: &Path,
     raw: &[u8],
     sources: Vec<ChangeSourceDto>,
     remaining_total: &mut usize,
+    content_budget: &mut usize,
 ) -> Result<ChangeFileDto> {
     let mut file = ChangeFileDto {
         status: ChangeFileStatusDto::Untracked,
@@ -870,6 +1003,8 @@ async fn untracked_file(
         content: ChangeContentDto::Unsupported,
         hunks: Vec::new(),
         truncated: false,
+        old_content: None,
+        new_content: None,
     };
     let (handle, metadata) = match safe_file(work_dir, raw)? {
         Some(file) => file,
@@ -897,6 +1032,7 @@ async fn untracked_file(
     }
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
+    let line_count = lines.len();
     file.additions = Some(lines.len().min(u32::MAX as usize) as u32);
     let mut rendered = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -917,10 +1053,17 @@ async fn untracked_file(
     file.content = ChangeContentDto::Text;
     if !rendered.is_empty() {
         file.hunks.push(ChangeHunkDto {
-            header: format!("@@ -0,0 +1,{} @@", lines.len()),
+            header: format!("@@ -0,0 +1,{} @@", line_count),
             lines: rendered,
             truncated: file.truncated,
         });
+    }
+    // The whole file is already in hand; hand it to the renderer for hunk
+    // expansion when it fits the same bounds tracked files obey.
+    let text_len = text.len();
+    if !file.truncated && text_len <= MAX_CONTENT_BYTES && text_len <= *content_budget {
+        *content_budget -= text_len;
+        file.new_content = Some(text.into_owned());
     }
     Ok(file)
 }
@@ -1120,13 +1263,13 @@ fn short_ref(reference: &str) -> String {
 /// The fork point a change set is taken from, plus the ref state it was derived
 /// from so a concurrent ref move is caught by the stability re-read.
 #[derive(Debug, PartialEq, Eq)]
-struct ResolvedBase {
+pub(crate) struct ResolvedBase {
     /// Display form of the ref the merge-base came from.
-    reference: String,
+    pub(crate) reference: String,
     /// Every candidate ref that resolved, with its tip.
-    tips: Vec<(String, String)>,
+    pub(crate) tips: Vec<(String, String)>,
     /// Merge-base of `HEAD` with the chosen ref.
-    oid: String,
+    pub(crate) oid: String,
 }
 
 /// Does `ancestor` reach `descendant`? (`--is-ancestor` answers by exit status.)
@@ -1150,7 +1293,7 @@ async fn is_ancestor(work_dir: &Path, ancestor: &str, descendant: &str) -> Resul
 /// then usually rebased onto the remote one, so the local ref goes stale as soon
 /// as nobody checks it out to pull; diffing from the stale ref would replay every
 /// intervening upstream commit as this branch's own work.
-async fn resolve_base(
+pub(crate) async fn resolve_base(
     work_dir: &Path,
     base_reference: &str,
     head_oid: &str,
@@ -1208,8 +1351,11 @@ fn unavailable(
     }
 }
 
-async fn load_once(boundary: &GitBoundary, base_reference: &str) -> Result<(ChangeSetDto, bool)> {
-    let work_dir = &boundary.work_tree;
+async fn load_once(
+    work_dir: &Path,
+    boundary: &GitBoundary,
+    base_reference: &str,
+) -> Result<(ChangeSetDto, bool)> {
     let Some(head_oid) = bootstrap_text(work_dir, &["rev-parse", "--verify", "HEAD"]).await? else {
         return Ok((
             unavailable(
@@ -1250,11 +1396,18 @@ async fn load_once(boundary: &GitBoundary, base_reference: &str) -> Result<(Chan
                 path: path.clone(),
                 old_path: None,
                 gitlink: false,
+                old_blob: None,
+                new_blob: None,
             });
         }
     }
+    // One path order for the whole listing: the tracked status output is
+    // sorted by path, but the untracked merge appends, which would park every
+    // new file at the end of the review instead of beside its neighbours.
+    raw_files.sort_by(|a, b| a.path.cmp(&b.path));
     let total_files = raw_files.len().min(u32::MAX as usize) as u32;
     let mut remaining_total = MAX_TOTAL_LINES;
+    let mut remaining_content = MAX_TOTAL_CONTENT_BYTES;
     let mut files = Vec::new();
     for raw in raw_files.iter().take(MAX_FILES) {
         let mut sources = Vec::new();
@@ -1271,12 +1424,26 @@ async fn load_once(boundary: &GitBoundary, base_reference: &str) -> Result<(Chan
             sources.push(ChangeSourceDto::Untracked);
         }
         if raw.status == ChangeFileStatusDto::Untracked {
-            files.push(untracked_file(work_dir, &raw.path, sources, &mut remaining_total).await?);
+            files.push(
+                untracked_file(
+                    work_dir,
+                    &raw.path,
+                    sources,
+                    &mut remaining_total,
+                    &mut remaining_content,
+                )
+                .await?,
+            );
             continue;
         }
         let section = sections.pop_front().unwrap_or_default();
         let (content, hunks, section_truncated) = parse_hunks(section, &mut remaining_total);
         let stat = stats.get(&raw.path).copied().unwrap_or_default();
+        let (old_content, new_content) = if content == ChangeContentDto::Text {
+            attach_contents(work_dir, boundary, raw, &mut remaining_content, true).await?
+        } else {
+            (None, None)
+        };
         files.push(ChangeFileDto {
             status: raw.status,
             path: path_dto(&raw.path),
@@ -1287,6 +1454,8 @@ async fn load_once(boundary: &GitBoundary, base_reference: &str) -> Result<(Chan
             content,
             hunks,
             truncated: section_truncated || (patch.truncated && sections.is_empty()),
+            old_content,
+            new_content,
         });
     }
     let totals = ChangeTotalsDto {
@@ -1342,7 +1511,7 @@ async fn load_once(boundary: &GitBoundary, base_reference: &str) -> Result<(Chan
 pub async fn load(work_dir: &Path, base_reference: &str) -> Result<ChangeSetDto> {
     let boundary = GitBoundary::load(work_dir).await?;
     for attempt in 0..2 {
-        let (mut changes, stable) = load_once(&boundary, base_reference).await?;
+        let (mut changes, stable) = load_once(work_dir, &boundary, base_reference).await?;
         if stable {
             return Ok(changes);
         }
@@ -1354,6 +1523,338 @@ pub async fn load(work_dir: &Path, base_reference: &str) -> Result<ChangeSetDto>
         }
     }
     unreachable!("bounded change read always returns or retries once")
+}
+
+/// The snapshot for a review target: the whole worktree state, the diff one
+/// commit introduces, or the unstaged edits alone (`rev = "unstaged"`).
+pub async fn load_for_review(
+    work_dir: &Path,
+    base_reference: &str,
+    rev: Option<&str>,
+) -> Result<ChangeSetDto> {
+    match rev {
+        None => load(work_dir, base_reference).await,
+        Some(UNSTAGED_REV) => load_unstaged(work_dir).await,
+        Some(rev) => load_commit(work_dir, rev).await,
+    }
+}
+
+/// The commit a change-set version pins, when that version names one commit's
+/// diff rather than the branch's whole change-set. The parse itself lives in
+/// `weaver_core::review::pinned_commit` — the one spelling, one parser.
+pub fn commit_for_version(version: &str) -> Option<&str> {
+    weaver_core::review::pinned_commit(version)
+}
+
+/// True for the unstaged-diff spelling of a change-set version. The parse
+/// itself lives in `weaver_core::review::is_unstaged_version` — the one
+/// spelling, one parser.
+pub fn is_unstaged_version(version: &str) -> bool {
+    weaver_core::review::is_unstaged_version(version)
+}
+
+/// The `rev` a change-set version names, for the one loader that can
+/// reproduce it: a pinned commit's oid, the unstaged sentinel, or `None` for
+/// the branch change-set.
+pub fn rev_for_version(version: &str) -> Option<String> {
+    commit_for_version(version)
+        .map(str::to_string)
+        .or_else(|| is_unstaged_version(version).then(|| UNSTAGED_REV.to_string()))
+}
+
+/// The `rev` spelling that scopes a snapshot to the unstaged working state.
+/// Commit oids are hex, so the two can never collide.
+pub const UNSTAGED_REV: &str = "unstaged";
+
+/// Resolve `rev` to one commit oid, or `None` when it names nothing.
+async fn resolve_commit(work_dir: &Path, rev: &str) -> Result<Option<String>> {
+    bootstrap_text(
+        work_dir,
+        &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
+    )
+    .await
+}
+
+/// The diff one commit introduces (`parent..rev`), as a bounded snapshot the
+/// review surface renders exactly like the worktree state. A commit and its
+/// parent are immutable, so there is no stability re-read to race.
+pub async fn load_commit(work_dir: &Path, rev: &str) -> Result<ChangeSetDto> {
+    let Some(oid) = resolve_commit(work_dir, rev).await? else {
+        bail!("revision {rev} does not resolve to a commit");
+    };
+    commit_snapshot(work_dir, &oid).await
+}
+
+/// Everything a resolved commit needs for its snapshot; the caller has
+/// already decided how an unresolvable revision is reported.
+async fn commit_snapshot(work_dir: &Path, oid: &str) -> Result<ChangeSetDto> {
+    let parent = bootstrap_text(work_dir, &["rev-parse", "--verify", &format!("{oid}^")])
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("commit {oid} is a root commit with no parent to diff against")
+        })?;
+    let boundary = GitBoundary::load(work_dir).await?;
+    let (raw, success) = capture_git_status(
+        boundary.command(),
+        &[
+            "diff-tree",
+            "--raw",
+            "--full-index",
+            "--find-renames",
+            "-r",
+            "-z",
+            &parent,
+            oid,
+            "--",
+        ],
+        MAX_INVENTORY_BYTES,
+    )
+    .await?;
+    // A failed inventory must not read as a commit that touches nothing: the
+    // same rule `capture_git` applies, with a truncated capture's partial
+    // inventory still usable through its `truncated` flag.
+    if !success && !raw.truncated {
+        bail!("git diff-tree failed");
+    }
+    let (numstat, patch) = tokio::try_join!(
+        async {
+            capture_diff(
+                &boundary,
+                &["--numstat", "--find-renames", "-z", &parent, oid, "--"],
+                MAX_INVENTORY_BYTES,
+            )
+            .await
+        },
+        async {
+            capture_diff(
+                &boundary,
+                &[
+                    "--patch",
+                    "--find-renames",
+                    "--unified=3",
+                    &parent,
+                    oid,
+                    "--",
+                ],
+                MAX_PATCH_BYTES,
+            )
+            .await
+        },
+    )?;
+    let mut raw_files = parse_raw_files(&raw.bytes);
+    // The same path order the branch change-set serves; `diff-tree` already
+    // emits it, this just keeps the two snapshot spellings from drifting.
+    raw_files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut sections = patch_sections(&patch.bytes);
+    let stats = parse_numstat(&numstat.bytes);
+    // A commit's changes are committed by definition, and nothing in a commit
+    // view is staged, unstaged, or untracked.
+    let sources = vec![ChangeSourceDto::Committed];
+    let total_files = raw_files.len().min(u32::MAX as usize) as u32;
+    let mut remaining_total = MAX_TOTAL_LINES;
+    let mut remaining_content = MAX_TOTAL_CONTENT_BYTES;
+    let mut files = Vec::new();
+    for raw in raw_files.iter().take(MAX_FILES) {
+        let section = sections.pop_front().unwrap_or_default();
+        let (content, hunks, section_truncated) = parse_hunks(section, &mut remaining_total);
+        let stat = stats.get(&raw.path).copied().unwrap_or_default();
+        let (old_content, new_content) = if content == ChangeContentDto::Text {
+            attach_contents(work_dir, &boundary, raw, &mut remaining_content, false).await?
+        } else {
+            (None, None)
+        };
+        files.push(ChangeFileDto {
+            status: raw.status,
+            path: path_dto(&raw.path),
+            old_path: raw.old_path.as_deref().map(path_dto),
+            sources: sources.clone(),
+            additions: stat.additions,
+            deletions: stat.deletions,
+            content,
+            hunks,
+            truncated: section_truncated || (patch.truncated && sections.is_empty()),
+            old_content,
+            new_content,
+        });
+    }
+    let short = oid[..oid.len().min(10)].to_string();
+    let mut changes = ChangeSetDto {
+        version: None,
+        base: ChangeBaseDto::Available {
+            // The pair must agree: the base *is* the reviewed commit's
+            // parent, and the reference says so in git's own spelling.
+            reference: format!("commit {short}^"),
+            oid: parent.clone(),
+        },
+        head_oid: Some(oid.to_string()),
+        totals: ChangeTotalsDto {
+            files: total_files,
+            additions: stats.values().filter_map(|stat| stat.additions).sum(),
+            deletions: stats.values().filter_map(|stat| stat.deletions).sum(),
+            truncated: patch.truncated || raw.truncated || numstat.truncated,
+        },
+        files,
+        truncated: patch.truncated
+            || raw.truncated
+            || numstat.truncated
+            || raw_files.len() > MAX_FILES
+            || remaining_total == 0,
+        limits: limits(),
+    };
+    if patch.timed_out || raw.timed_out || numstat.timed_out {
+        return Ok(changes);
+    }
+    let rendered = serde_json::to_vec(&changes).context("serializing commit change response")?;
+    let mut hasher = Sha256::new();
+    hash_record(&mut hasher, b"schema", b"changes-commit-v1");
+    hash_record(&mut hasher, b"parent-oid", parent.as_bytes());
+    hash_record(&mut hasher, b"commit-oid", oid.as_bytes());
+    hash_record(&mut hasher, b"rendered-response", &rendered);
+    // The oid rides in the version string so any later reader can reload this
+    // exact snapshot — the digest alone cannot be reversed into a revision.
+    changes.version = Some(format!(
+        "changes-commit-v1:{oid}:{}",
+        hex::encode(hasher.finalize())
+    ));
+    Ok(changes)
+}
+
+/// The unstaged edits alone — the working tree against the index — as a
+/// bounded snapshot the review surface renders like any other. A live
+/// snapshot like the branch change-set, not an immutable one: the version
+/// digest moves the moment the staged or unstaged state does.
+pub async fn load_unstaged(work_dir: &Path) -> Result<ChangeSetDto> {
+    let boundary = GitBoundary::load(work_dir).await?;
+    for attempt in 0..2 {
+        let (mut changes, stable) = load_unstaged_once(work_dir, &boundary).await?;
+        if stable {
+            return Ok(changes);
+        }
+        if attempt == 1 {
+            changes.version = None;
+            changes.truncated = true;
+            changes.totals.truncated = true;
+            return Ok(changes);
+        }
+    }
+    unreachable!("bounded unstaged read always returns or retries once")
+}
+
+async fn load_unstaged_once(
+    work_dir: &Path,
+    boundary: &GitBoundary,
+) -> Result<(ChangeSetDto, bool)> {
+    let Some(head_oid) = bootstrap_text(work_dir, &["rev-parse", "--verify", "HEAD"]).await? else {
+        return Ok((
+            unavailable("index", ChangeBaseUnavailableReasonDto::UnbornHead, None),
+            true,
+        ));
+    };
+    let (raw, numstat, patch) = tokio::try_join!(
+        capture_diff(
+            boundary,
+            &["--raw", "--full-index", "--find-renames", "-z", "--"],
+            MAX_INVENTORY_BYTES
+        ),
+        capture_diff(
+            boundary,
+            &["--numstat", "--find-renames", "-z", "--"],
+            MAX_INVENTORY_BYTES
+        ),
+        capture_diff(
+            boundary,
+            &["--patch", "--find-renames", "--unified=3", "--"],
+            MAX_PATCH_BYTES,
+        ),
+    )?;
+    let mut raw_files = parse_raw_files(&raw.bytes);
+    raw_files.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut sections = patch_sections(&patch.bytes);
+    let stats = parse_numstat(&numstat.bytes);
+    // Everything in this snapshot is unstaged by definition: the staged
+    // and committed parts of the same file belong to the other scopes.
+    let sources = vec![ChangeSourceDto::Unstaged];
+    let total_files = raw_files.len().min(u32::MAX as usize) as u32;
+    let mut remaining_total = MAX_TOTAL_LINES;
+    let mut remaining_content = MAX_TOTAL_CONTENT_BYTES;
+    let mut files = Vec::new();
+    for raw in raw_files.iter().take(MAX_FILES) {
+        let section = sections.pop_front().unwrap_or_default();
+        let (content, hunks, section_truncated) = parse_hunks(section, &mut remaining_total);
+        let stat = stats.get(&raw.path).copied().unwrap_or_default();
+        let (old_content, new_content) = if content == ChangeContentDto::Text {
+            attach_contents(work_dir, boundary, raw, &mut remaining_content, true).await?
+        } else {
+            (None, None)
+        };
+        files.push(ChangeFileDto {
+            status: raw.status,
+            path: path_dto(&raw.path),
+            old_path: raw.old_path.as_deref().map(path_dto),
+            sources: sources.clone(),
+            additions: stat.additions,
+            deletions: stat.deletions,
+            content,
+            hunks,
+            truncated: section_truncated || (patch.truncated && sections.is_empty()),
+            old_content,
+            new_content,
+        });
+    }
+    let mut changes = ChangeSetDto {
+        version: None,
+        base: ChangeBaseDto::Available {
+            // The old side of this diff is the index — the staged state —
+            // which has no oid of its own; the commit it currently sits on
+            // is the context worth naming.
+            reference: "index".to_string(),
+            oid: head_oid.clone(),
+        },
+        head_oid: Some(head_oid.clone()),
+        totals: ChangeTotalsDto {
+            files: total_files,
+            additions: stats.values().filter_map(|stat| stat.additions).sum(),
+            deletions: stats.values().filter_map(|stat| stat.deletions).sum(),
+            truncated: patch.truncated || raw.truncated || numstat.truncated,
+        },
+        files,
+        truncated: patch.truncated
+            || raw.truncated
+            || numstat.truncated
+            || raw_files.len() > MAX_FILES
+            || remaining_total == 0,
+        limits: limits(),
+    };
+    if patch.timed_out || raw.timed_out || numstat.timed_out {
+        return Ok((changes, false));
+    }
+    // The unstaged state is live: an edit landing mid-capture would freeze a
+    // snapshot that never existed. Re-read the two cheap witnesses and
+    // compare — the same two-phase rule the branch change-set applies.
+    let (raw_after, numstat_after) = tokio::try_join!(
+        capture_diff(
+            boundary,
+            &["--raw", "--full-index", "--find-renames", "-z", "--"],
+            MAX_INVENTORY_BYTES
+        ),
+        capture_diff(
+            boundary,
+            &["--numstat", "--find-renames", "-z", "--"],
+            MAX_INVENTORY_BYTES
+        ),
+    )?;
+    if raw_after.bytes != raw.bytes || numstat_after.bytes != numstat.bytes {
+        return Ok((changes, false));
+    }
+    let rendered = serde_json::to_vec(&changes).context("serializing unstaged change response")?;
+    let mut hasher = Sha256::new();
+    hash_record(&mut hasher, b"schema", b"changes-unstaged-v1");
+    hash_record(&mut hasher, b"rendered-response", &rendered);
+    changes.version = Some(format!(
+        "changes-unstaged-v1:{}",
+        hex::encode(hasher.finalize())
+    ));
+    Ok((changes, true))
 }
 
 /// Validate a mutable comment anchor against the exact snapshot on screen.
@@ -1395,6 +1896,25 @@ pub fn validate_anchor(
             line_number(line, anchor.side) == expected
         });
         if contiguous {
+            // The client-supplied selection is a fingerprint of the lines
+            // the comment was written against. A range whose content
+            // changed in place must not save by number alone — the comment
+            // would pin onto code it never saw, the same misattribution the
+            // review surface's placement check rejects on display. The
+            // surrounding context lines are deliberately exempt: a comment
+            // is about its selection, not its neighbors, and the server
+            // re-derives (never stores) the context either way. Anchors
+            // with no recorded text (older API callers) cannot be verified
+            // and keep the contiguity-only rule.
+            if !anchor.selected.is_empty()
+                && (anchor.selected.len() != selected.len()
+                    || selected
+                        .iter()
+                        .zip(&anchor.selected)
+                        .any(|(line, text)| line.text != *text))
+            {
+                bail!("change anchor text no longer matches these lines; re-anchor the comment");
+            }
             return Ok(ChangeAnchorDto {
                 path: file.path.clone(),
                 side: anchor.side,
@@ -1428,6 +1948,273 @@ fn line_number(line: &ChangeLineDto, side: ChangeSideDto) -> Option<u32> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_commit_snapshot_is_stable_across_reloads_and_gone_commits_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.path().to_str().unwrap()])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-b", "main"]).status.success());
+        assert!(git(&["config", "user.name", "E2E"]).status.success());
+        assert!(git(&["config", "user.email", "e2e@weaver.test"])
+            .status
+            .success());
+        std::fs::write(dir.path().join("a"), "base\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "base"]).status.success());
+        std::fs::write(dir.path().join("a"), "base\ntouched\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "touched"]).status.success());
+
+        // The snapshot of an immutable commit is itself immutable: reloading
+        // it names the same version, which is why a review pinned to it can
+        // treat its own stored version as current everywhere.
+        let first = load_commit(dir.path(), "HEAD").await.unwrap();
+        let second = load_commit(dir.path(), "HEAD").await.unwrap();
+        assert_eq!(first.version, second.version);
+
+        // A revision that resolves to nothing stays a caller-facing error.
+        assert!(load_commit(dir.path(), "no-such-rev").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_deletes_a_file_stays_immutable_when_the_worktree_re_adds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.path().to_str().unwrap()])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-b", "main"]).status.success());
+        assert!(git(&["config", "user.name", "E2E"]).status.success());
+        assert!(git(&["config", "user.email", "e2e@weaver.test"])
+            .status
+            .success());
+        std::fs::write(dir.path().join("gone.txt"), "original\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "add the file"]).status.success());
+        std::fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        let delete = git(&["commit", "-m", "delete the file"]);
+        assert!(delete.status.success());
+
+        // The file returns to the working tree — unstaged, so the branch
+        // snapshot would legitimately show it, but the committed deletion is
+        // immutable: its snapshot must not grow a new side, and its version
+        // must not move when the live file changes.
+        std::fs::write(dir.path().join("gone.txt"), "revived in the worktree\n").unwrap();
+
+        let first = load_commit(dir.path(), "HEAD").await.unwrap();
+        let file = first
+            .files
+            .iter()
+            .find(|file| file.path.display == "gone.txt")
+            .expect("the deletion is in the commit snapshot");
+        assert_eq!(file.status, ChangeFileStatusDto::Deleted);
+        assert_eq!(file.new_content, None);
+        assert_eq!(file.old_content.as_deref(), Some("original\n"));
+
+        std::fs::write(dir.path().join("gone.txt"), "edited again\n").unwrap();
+        let second = load_commit(dir.path(), "HEAD").await.unwrap();
+        assert_eq!(
+            first.version, second.version,
+            "a commit snapshot's version must not track the worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unstaged_snapshot_scopes_to_the_worktree_against_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.path().to_str().unwrap()])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-b", "main"]).status.success());
+        assert!(git(&["config", "user.name", "E2E"]).status.success());
+        assert!(git(&["config", "user.email", "e2e@weaver.test"])
+            .status
+            .success());
+        std::fs::write(dir.path().join("a"), "one\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "base"]).status.success());
+        // A staged edit, a further unstaged edit on top of it, and an
+        // untracked file: only the unstaged edit belongs to this scope.
+        std::fs::write(dir.path().join("a"), "one\nstaged\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        std::fs::write(dir.path().join("a"), "one\nstaged\nunstaged\n").unwrap();
+        std::fs::write(dir.path().join("untracked.txt"), "fresh\n").unwrap();
+
+        let snapshot = load_unstaged(dir.path()).await.unwrap();
+        let version = snapshot.version.clone().unwrap();
+        assert!(
+            version.starts_with("changes-unstaged-v1:"),
+            "the unstaged scope carries its own version spelling, got {version}"
+        );
+        assert!(is_unstaged_version(&version));
+        assert_eq!(commit_for_version(&version), None);
+        assert_eq!(rev_for_version(&version).as_deref(), Some(UNSTAGED_REV));
+        let ChangeBaseDto::Available { reference, oid } = &snapshot.base else {
+            panic!("the unstaged scope diff is against the index, so its base resolves");
+        };
+        assert_eq!(reference, "index");
+        let head = bootstrap_text(dir.path(), &["rev-parse", "--verify", "HEAD"])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*oid, head);
+        assert_eq!(
+            snapshot.files.len(),
+            1,
+            "staged and untracked work is out of scope"
+        );
+        let file = &snapshot.files[0];
+        assert_eq!(file.path.display, "a");
+        assert_eq!(file.sources, vec![ChangeSourceDto::Unstaged]);
+        assert!(file.hunks.iter().any(|hunk| hunk
+            .lines
+            .iter()
+            .any(|line| line.text == "unstaged" && line.new_line.is_some())));
+        // The old side is the index text, the new side the live worktree.
+        assert_eq!(file.old_content.as_deref(), Some("one\nstaged\n"));
+        assert_eq!(file.new_content.as_deref(), Some("one\nstaged\nunstaged\n"));
+
+        // A live scope: the version moves when the unstaged state does, and
+        // staging the edit empties the scope entirely.
+        std::fs::write(dir.path().join("a"), "one\nstaged\nunstaged\nmore\n").unwrap();
+        let moved = load_unstaged(dir.path()).await.unwrap();
+        assert_ne!(moved.version.unwrap(), version);
+        assert!(git(&["add", "-A"]).status.success());
+        let clean = load_unstaged(dir.path()).await.unwrap();
+        assert!(clean.files.is_empty());
+        assert!(clean
+            .version
+            .as_deref()
+            .is_some_and(|version| version.starts_with("changes-unstaged-v1:")));
+
+        // The sentinel reaches the same snapshot through the one review loader.
+        let via_rev = load_for_review(dir.path(), "main", Some(UNSTAGED_REV))
+            .await
+            .unwrap();
+        assert_eq!(via_rev.version, clean.version);
+    }
+
+    #[tokio::test]
+    async fn a_commit_snapshot_scopes_to_that_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.path().to_str().unwrap()])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-b", "main"]).status.success());
+        assert!(git(&["config", "user.name", "E2E"]).status.success());
+        assert!(git(&["config", "user.email", "e2e@weaver.test"])
+            .status
+            .success());
+        std::fs::write(dir.path().join("a"), "one\ntwo\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "base"]).status.success());
+        assert!(git(&["switch", "-c", "feature"]).status.success());
+        std::fs::write(dir.path().join("a"), "one\ntwo\nthree\nfour\n").unwrap();
+        std::fs::write(dir.path().join("b"), "brand new\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "extend and add"]).status.success());
+
+        let changes = load_commit(dir.path(), "HEAD").await.unwrap();
+        let version = changes.version.as_deref().unwrap();
+        assert!(version.starts_with("changes-commit-v1:"));
+        assert_eq!(
+            commit_for_version(version),
+            changes.head_oid.as_deref(),
+            "a commit snapshot's version must name the commit it reloads"
+        );
+        assert!(commit_for_version("changes-v1:abc").is_none());
+        let reference = match &changes.base {
+            ChangeBaseDto::Available { reference, oid: _ } => reference.clone(),
+            other => panic!("unexpected base: {other:?}"),
+        };
+        assert!(reference.starts_with("commit "));
+        assert_eq!(changes.head_oid.as_deref().map(str::len), Some(40));
+        assert_eq!(changes.totals.files, 2);
+        let by_path: std::collections::BTreeMap<String, &ChangeFileDto> = changes
+            .files
+            .iter()
+            .map(|file| (file.path.display.clone(), file))
+            .collect();
+        let a = by_path.get("a").unwrap();
+        assert_eq!(a.sources, vec![ChangeSourceDto::Committed]);
+        assert_eq!(a.hunks.len(), 1);
+        assert_eq!(
+            a.old_content.as_deref().map(|text| text.lines().count()),
+            Some(2)
+        );
+        assert_eq!(
+            a.new_content.as_deref().map(|text| text.lines().count()),
+            Some(4)
+        );
+        let b = by_path.get("b").unwrap();
+        assert_eq!(b.status, ChangeFileStatusDto::Added);
+        assert_eq!(b.old_content, None);
+        assert_eq!(b.new_content.as_deref(), Some("brand new\n"));
+        assert!(!changes.truncated);
+    }
+
+    #[tokio::test]
+    async fn a_commit_touching_more_than_max_files_marks_the_snapshot_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-C", dir.path().to_str().unwrap()])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-b", "main"]).status.success());
+        assert!(git(&["config", "user.name", "E2E"]).status.success());
+        assert!(git(&["config", "user.email", "e2e@weaver.test"])
+            .status
+            .success());
+        std::fs::write(dir.path().join("seed"), "base\n").unwrap();
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "base"]).status.success());
+        for index in 0..(MAX_FILES + 1) {
+            std::fs::write(dir.path().join(format!("f{index}")), "touched\n").unwrap();
+        }
+        assert!(git(&["add", "-A"]).status.success());
+        assert!(git(&["commit", "-m", "touch a file past the cap"])
+            .status
+            .success());
+
+        let changes = load_commit(dir.path(), "HEAD").await.unwrap();
+        assert!(
+            changes.truncated,
+            "the silent cap is the regression: the file cap must mark the snapshot truncated"
+        );
+        assert_eq!(changes.files.len(), MAX_FILES);
+        assert_eq!(changes.totals.files, (MAX_FILES + 1) as u32);
+    }
+
     #[test]
     fn parses_typed_hunks_and_enforces_side_ranges() {
         let patch = b"diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -2,2 +2,3 @@ fn main() {\n same\n-old\n+new\n+next\n";
@@ -1458,11 +2245,17 @@ mod tests {
                 content,
                 hunks,
                 truncated: false,
+                old_content: None,
+                new_content: None,
             }],
             truncated: false,
             limits: limits(),
         };
-        let anchor = ChangeAnchorDto {
+        // The server never trusts client text: the stored anchor is rebuilt
+        // from the snapshot. An anchor carrying text that does not match the
+        // current lines is a comment about code this version no longer has —
+        // rejected rather than silently re-pinned.
+        let real = ChangeAnchorDto {
             path: ChangePathDto {
                 bytes: path.bytes,
                 display: "spoofed.rs".to_string(),
@@ -1471,11 +2264,11 @@ mod tests {
             start_line: 3,
             end_line: 4,
             hunk_header: "@@ spoofed @@".to_string(),
-            context_before: vec!["spoofed before".to_string()],
-            selected: vec!["spoofed selection".to_string()],
-            context_after: vec!["spoofed after".to_string()],
+            context_before: vec!["same".to_string()],
+            selected: vec!["new".to_string(), "next".to_string()],
+            context_after: vec![],
         };
-        let canonical = validate_anchor(&changes, "changes-v1:test", &anchor).unwrap();
+        let canonical = validate_anchor(&changes, "changes-v1:test", &real).unwrap();
         assert_eq!(canonical.path.display, "src/a.rs");
         assert_eq!(canonical.hunk_header, "@@ -2,2 +2,3 @@ fn main() {");
         assert_eq!(canonical.context_before, vec!["same"]);
@@ -1483,9 +2276,37 @@ mod tests {
         assert!(canonical.context_after.is_empty());
         let wrong_side = ChangeAnchorDto {
             side: ChangeSideDto::Old,
-            ..anchor
+            ..real.clone()
         };
         assert!(validate_anchor(&changes, "changes-v1:test", &wrong_side).is_err());
+
+        // Drifted text: the lines at the range exist but no longer hold what
+        // the comment was written against.
+        let drifted_selected = ChangeAnchorDto {
+            selected: vec!["drifted".to_string(), "next".to_string()],
+            ..real.clone()
+        };
+        let err = validate_anchor(&changes, "changes-v1:test", &drifted_selected).unwrap_err();
+        assert!(err.to_string().contains("re-anchor"), "{err}");
+        // Context drift is not selection drift: a comment is about its own
+        // lines, not its neighbors, so a changed context saves with the
+        // context re-derived from the snapshot.
+        let drifted_before = ChangeAnchorDto {
+            context_before: vec!["drifted before".to_string()],
+            ..real.clone()
+        };
+        let canonical = validate_anchor(&changes, "changes-v1:test", &drifted_before).unwrap();
+        assert_eq!(canonical.context_before, vec!["same"]);
+
+        // Anchors with no recorded text cannot be verified and keep the
+        // contiguity-only rule (older API callers).
+        let unverifiable = ChangeAnchorDto {
+            context_before: vec![],
+            selected: vec![],
+            context_after: vec![],
+            ..real
+        };
+        assert!(validate_anchor(&changes, "changes-v1:test", &unverifiable).is_ok());
     }
 
     #[test]
@@ -1567,7 +2388,9 @@ mod tests {
             base_view(&changes),
             ("origin/main", Some(upstream.as_str()))
         );
-        assert_eq!(paths(&changes), vec!["mine.txt", "dirty.txt"]);
+        // One path order across tracked and untracked: `dirty.txt` (untracked)
+        // sits beside `mine.txt` (committed), not parked at the end.
+        assert_eq!(paths(&changes), vec!["dirty.txt", "mine.txt"]);
     }
 
     /// A local base left behind by an upstream rebase must not drag the commits
@@ -1609,6 +2432,81 @@ mod tests {
             }
         ));
         assert_eq!(base_view(&changes), ("origin/nope", None));
+    }
+
+    /// An unstaged edit is the primary Changes-tab case: `--raw` can only
+    /// spell the all-zero hash for its new side, so the working-tree file is
+    /// the real post-image — expansion content must come from it.
+    #[tokio::test]
+    async fn an_unstaged_edit_carries_working_tree_content_for_expansion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(&tmp);
+        commit(dir, "base.txt");
+        // The unstaged post-image: raw `--raw` can only name it with the
+        // all-zero hash.
+        std::fs::write(dir.join("base.txt"), "base.txt\nedited\n").unwrap();
+
+        let changes = load(dir, "main").await.unwrap();
+        let file = changes
+            .files
+            .iter()
+            .find(|file| file.path.display == "base.txt")
+            .expect("the edited file is in the change set");
+        assert_eq!(file.sources, vec![ChangeSourceDto::Unstaged]);
+        assert_eq!(file.old_content.as_deref(), Some("base.txt\n"));
+        assert_eq!(file.new_content.as_deref(), Some("base.txt\nedited\n"));
+    }
+
+    /// The content budget closes at the first file that does not fit:
+    /// files after it get no expansion content even if a later one is small
+    /// enough for the crumbs — the alternative reads every remaining blob
+    /// pair just to decline.
+    #[tokio::test]
+    async fn the_expansion_budget_closes_at_the_first_file_that_does_not_fit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = repo(&tmp);
+        // Path order decides who gets served: a1 and b1 drain the budget,
+        // c1 overflows what remains and closes it, and d1 — small enough to
+        // have fit — reads as exhausted.
+        let fill = |ch: char, size: usize| ch.to_string().repeat(size - 1) + "\n";
+        for name in ["a1", "b1", "c1", "d1"] {
+            let size = match name {
+                "a1" => 131_072,
+                "b1" => 100_000,
+                "c1" => 40_000,
+                _ => 5_000,
+            };
+            std::fs::write(dir.join(name), fill('x', size)).unwrap();
+        }
+        git_setup(dir, &["add", "-A"]);
+        git_setup(dir, &["commit", "-q", "-m", "base"]);
+        for name in ["a1", "b1", "c1", "d1"] {
+            let size = match name {
+                "a1" => 131_072,
+                "b1" => 100_000,
+                "c1" => 40_000,
+                _ => 5_000,
+            };
+            std::fs::write(dir.join(name), fill('y', size)).unwrap();
+        }
+
+        let changes = load(dir, "main").await.unwrap();
+        let content = |name: &str| {
+            changes
+                .files
+                .iter()
+                .find(|file| file.path.display == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .new_content
+                .as_deref()
+                .map(str::len)
+        };
+        assert_eq!(content("a1"), Some(131_072));
+        assert_eq!(content("b1"), Some(100_000));
+        // c1's 80_000-byte cost overflowed the ~62 KiB left after b1.
+        assert_eq!(content("c1"), None);
+        // d1 would have fit the crumbs, but the budget had closed.
+        assert_eq!(content("d1"), None);
     }
 
     #[test]

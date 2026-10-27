@@ -258,8 +258,10 @@ test.describe('staged artifact reviews', () => {
     );
     await page.getByTestId('submit-review').click();
     await submit;
-    await expect(tray).toContainText('Review submitted');
-    await expect(page.getByTestId('submit-review')).toHaveCount(0);
+    await expect(tray).toContainText('Review · 0 pending');
+    // The quiescent envelope keeps its submit button, disabled until
+    // something new is queued.
+    await expect(page.getByTestId('submit-review')).toBeDisabled();
   });
 
   test('preserves a long document and in-flight overall draft through pop and dock', async ({
@@ -430,7 +432,6 @@ test.describe('staged artifact reviews', () => {
       data: {
         id: review.id,
         expected_revision: review.draft_revision,
-        acknowledge_outdated: false,
       },
     });
     expect(submitResponse.ok()).toBe(true);

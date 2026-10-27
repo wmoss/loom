@@ -88,9 +88,10 @@ change set. Comments can be edited, deleted, and re-anchored before submission.
 Every persisted mutation carries the current `expected_revision` and advances a
 monotonic draft revision. A stale mutation returns the authoritative review so
 the client can reload it for inspection instead of silently merging competing
-edits. Moving a draft to a newer subject version is guarded: old anchors must be
-re-anchored or explicitly acknowledged, while an overall-only draft can retarget
-directly.
+edits. The captured subject version is provenance — quoted by delivery, gating
+nothing. Staleness is a property of what a comment anchors at: decided where the
+anchor renders, flagged when its lines hold changed text, and cleared by
+re-anchoring.
 
 Draft mutations are creator-private and emit no branch-wide event. Other tabs
 owned by that creator refresh their draft when they regain focus. Text still in
@@ -101,15 +102,18 @@ that would lose it are blocked with a save-or-cancel instruction.
 
 `Submit review` performs one transaction:
 
-1. Verify the optimistic draft revision and current subject version.
+1. Verify the optimistic draft revision.
 2. Freeze the overall note and comments.
 3. Render the exact delivery message on the server.
 4. Record one `review_submitted` event.
 5. Enqueue one delivery item.
 
-The submitted review is immutable. Any authenticated operator may resolve or
-reopen a submitted comment or retry failed delivery, but only the draft creator
-may mutate or discard draft content.
+A submitted review stays open to its reviewer: new comments attach to it
+exactly like draft comments, thread replies queue past the delivered cursor,
+and a changed overall note rides the next follow-up round — one submission
+sends everything together. Any authenticated operator may resolve or reopen a
+submitted comment or retry failed delivery; only the review's creator may
+submit it, and only a draft may be discarded.
 
 ACP delivery enters a protected conversation inbox separate from retractable
 operator prompts. Inbox consumption, journal delivery key, and live-turn claim

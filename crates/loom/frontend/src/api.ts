@@ -606,7 +606,11 @@ export const listArtifactReviews = (id: string, name: string) =>
     session: id,
   });
 
-export const getChanges = (id: string) => invokeOperation('sessions.changes', { session: id });
+export const getChanges = (id: string, rev?: string) =>
+  invokeOperation('sessions.changes', { session: id, ...(rev ? { rev } : {}) });
+
+export const getSessionCommits = (id: string) =>
+  invokeOperation('sessions.commits', { session: id });
 
 export const listChangesReviews = (id: string) =>
   invokeOperation('reviews.list', {
@@ -642,6 +646,13 @@ export const updateReview = (
   body: Omit<OperationInput<'reviews.update'>, 'id'>,
 ) => invokeOperation('reviews.update', { id: reviewId, ...body });
 
+export const replyReviewComment = (session: string, commentId: number, body: string) =>
+  invokeOperation('reviews.comments.reply', {
+    session,
+    comment_id: commentId,
+    body,
+  });
+
 export const deleteReviewComment = (
   reviewId: number,
   commentId: number,
@@ -658,16 +669,8 @@ export const deleteReviewComment = (
 export const discardReview = (reviewId: number, expectedRevision: number) =>
   invokeOperation('reviews.discard', { id: reviewId, expected_revision: expectedRevision });
 
-export const submitReview = (
-  reviewId: number,
-  body: { expected_revision: number; acknowledge_outdated: boolean },
-) => invokeOperation('reviews.submit', { id: reviewId, ...body });
-
-export const retargetReviewToCurrent = (reviewId: number, expectedRevision: number) =>
-  invokeOperation('reviews.retarget', {
-    id: reviewId,
-    expected_revision: expectedRevision,
-  });
+export const submitReview = (reviewId: number, body: { expected_revision: number }) =>
+  invokeOperation('reviews.submit', { id: reviewId, ...body });
 
 export const retryReviewDelivery = (reviewId: number) =>
   invokeOperation('reviews.retry_delivery', { id: reviewId });

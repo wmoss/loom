@@ -21,9 +21,10 @@ import {
   discardReview,
   listArtifactReviews,
   retryReviewDelivery,
-  retargetReviewToCurrent,
   resolveThread,
+  replyReviewComment,
   setReviewCommentResolution,
+  getMe,
   submitReview,
   updateReview,
   updateReviewComment,
@@ -168,8 +169,8 @@ const overallNote = ref('');
 const summarySaving = ref(false);
 const summaryDirty = ref(false);
 let summarySaveTimer: ReturnType<typeof setTimeout> | null = null;
-const acknowledgeOutdated = ref(false);
 const submitting = ref(false);
+
 const discarding = ref(false);
 const layoutBusy = ref(false);
 let releaseLayoutBarrier: (() => void) | null = null;
@@ -177,6 +178,61 @@ let layoutReturnFocus: HTMLElement | null = null;
 const reanchorCommentId = ref<number | null>(null);
 
 const draft = computed(() => reviews.value.find((review) => review.status === 'draft') ?? null);
+
+// The signed-in operator: only a review's creator may submit it.
+const operator = ref('');
+void getMe()
+  .then((me) => {
+    operator.value = me.username ?? '';
+  })
+  .catch(() => {});
+
+/** The creator's submitted review with undelivered follow-up work — the
+ * pending surface beside (and in the tray, in place of) a draft. One submit
+ * sends its new comments and thread replies together. */
+const submittedEnvelopes = computed(() =>
+  reviews.value
+    .filter(
+      (review) =>
+        review.status === 'submitted' &&
+        !review.legacy &&
+        review.id > 0 &&
+        review.created_by === operator.value,
+    )
+    .sort((a, b) => b.id - a.id),
+);
+
+/** The envelope a fresh composer comment attaches to when no draft is open:
+ * the newest submitted one, pending or not. */
+const openEnvelope = computed(() => submittedEnvelopes.value[0] ?? null);
+
+const continuation = computed(() => (draft.value ? null : openEnvelope.value));
+
+// The follow-up surface's note seeds the tray once the signed-in operator is
+// known: editing it queues for the next round, like a pending comment.
+watch([openEnvelope, draft], () => {
+  // Seed whenever the no-draft-with-envelope state is (re)entered: a fresh
+  // operator arrival, a draft submitting into its envelope, or a peer's
+  // submit that opened one mid-review.
+  const envelope = openEnvelope.value;
+  if (draft.value || !envelope || summaryDirty.value) return;
+  draftController.reconcile(envelope);
+});
+
+/** Pending comments on the submitting surface whose anchors no longer locate
+ * in the rendered document — the tray's staleness signal. */
+const staleCommentIds = computed(() => {
+  const surface = draft.value ?? continuation.value;
+  if (!surface) return [];
+  const ids = new Set(
+    orphaned.value
+      .filter((entry) => entry.review.id === surface.id && entry.comment.status === 'pending')
+      .map((entry) => entry.comment.id),
+  );
+  return surface.comments
+    .filter((comment) => comment.status === 'pending' && ids.has(comment.id))
+    .map((comment) => comment.id);
+});
 const draftEntries = computed<ReviewEntry[]>(() =>
   (draft.value?.comments ?? []).map((comment) => ({ review: draft.value!, comment })),
 );
@@ -243,7 +299,7 @@ function setCommentMutationError(commentId: number, error: unknown): string {
 
 const draftController = new ReviewDraftController<Review>({
   async saveSummary(item, summary) {
-    let current = item;
+    let current = item ?? openEnvelope.value;
     if (!current) {
       if (!summary.trim()) return null;
       current = await createReview(props.id, {
@@ -632,6 +688,7 @@ async function createPendingComment() {
     const updated = await draftController.command(async (current) => {
       const review =
         current ??
+        openEnvelope.value ??
         (await createReview(props.id, {
           subject_kind: 'artifact',
           subject_key: props.artifactName,
@@ -668,17 +725,33 @@ function cancelPendingComment() {
   void nextTick(() => reviewTrayRef.value?.focusToggle());
 }
 
-async function editComment(payload: { commentId: number; body: string }) {
-  if (!draft.value) return;
-  commentErrors.value[payload.commentId] = '';
-  try {
+/** Runs a pending-comment mutation against the surface that owns the
+ * comment: the open draft through its controller, or the submitted review
+ * still carrying it — its undelivered comments are as editable as draft
+ * ones. */
+async function mutateComment(run: (review: Review) => Promise<Review>): Promise<void> {
+  if (draft.value) {
     await draftController.command(async (current) => {
       if (!current) throw new Error('review draft is no longer available');
-      return updateReviewComment(current.id, payload.commentId, {
-        expected_revision: current.draft_revision,
-        body: payload.body,
-      });
+      return run(current);
     });
+    return;
+  }
+  const target = continuation.value;
+  if (!target) throw new Error('review draft is no longer available');
+  replaceReview(await run(target));
+}
+
+async function editComment(payload: { commentId: number; body: string }) {
+  if (!draft.value && !continuation.value) return;
+  commentErrors.value[payload.commentId] = '';
+  try {
+    await mutateComment((review) =>
+      updateReviewComment(review.id, payload.commentId, {
+        expected_revision: review.draft_revision,
+        body: payload.body,
+      }),
+    );
     reviewNotice.value = 'Pending comment updated.';
   } catch (e) {
     setCommentMutationError(payload.commentId, e);
@@ -686,13 +759,12 @@ async function editComment(payload: { commentId: number; body: string }) {
 }
 
 async function removeComment(commentId: number) {
-  if (!draft.value) return;
+  if (!draft.value && !continuation.value) return;
   commentErrors.value[commentId] = '';
   try {
-    await draftController.command(async (current) => {
-      if (!current) throw new Error('review draft is no longer available');
-      return deleteReviewComment(current.id, commentId, current.draft_revision);
-    });
+    await mutateComment((review) =>
+      deleteReviewComment(review.id, commentId, review.draft_revision),
+    );
     if (activeId.value === commentId) activeId.value = null;
     if (reanchorCommentId.value === commentId) reanchorCommentId.value = null;
     reviewNotice.value = 'Pending comment deleted.';
@@ -711,12 +783,15 @@ async function setResolution(review: Review, commentId: number, resolved: boolea
       if (!resolved) return;
       await resolveThread(props.id, props.artifactName, -review.id);
       await loadReviews();
+      closeComment(commentId);
     } else {
       const updated = await setReviewCommentResolution(review.id, commentId, resolved);
       replaceReview({
         ...review,
         comments: review.comments.map((comment) => (comment.id === updated.id ? updated : comment)),
       });
+      // Resolving closes the thread, once the request has actually landed.
+      if (resolved) closeComment(commentId);
     }
     reviewNotice.value = resolved ? 'Review comment resolved.' : 'Review comment reopened.';
   } catch (e) {
@@ -752,7 +827,6 @@ async function discardDraft() {
     reanchorCommentId.value = null;
     overallNote.value = '';
     summaryDirty.value = false;
-    acknowledgeOutdated.value = false;
     trayOpen.value = false;
     reviewNotice.value = 'Draft review discarded.';
     await nextTick();
@@ -767,41 +841,32 @@ async function discardDraft() {
   }
 }
 
-async function retargetDraft() {
-  if (!draft.value || draft.value.comments.length) return;
-  trayError.value = '';
-  try {
-    const updated = await draftController.command(async (current) => {
-      if (!current) throw new Error('review draft is no longer available');
-      return retargetReviewToCurrent(current.id, current.draft_revision);
-    });
-    acknowledgeOutdated.value = false;
-    reviewNotice.value = `Review target moved to revision ${updated.subject.version}.`;
-  } catch (error) {
-    trayError.value = mutationMessage(error);
-  }
-}
-
 async function submitDraft() {
-  if (!draft.value || submitting.value) return;
+  // One submission path for both surfaces: an unsaved comment edit blocks
+  // either one, the freeze flushes a dirty note onto its review first — a
+  // draft or the still-open envelope alike — then whatever is queued is sent.
+  if (submitting.value) return;
+  if (!draft.value && !continuation.value) return;
   if (!(await focusUnsavedComment('submitting the review'))) return;
   submitting.value = true;
   trayError.value = '';
   try {
     const submitted = await draftController.freeze(async (current) => {
-      if (!current) throw new Error('review draft is no longer available');
-      const result = await submitReview(current.id, {
-        expected_revision: current.draft_revision,
-        acknowledge_outdated: acknowledgeOutdated.value,
+      const target = current ?? continuation.value;
+      if (!target) throw new Error('review draft is no longer available');
+      const result = await submitReview(target.id, {
+        expected_revision: target.draft_revision,
       });
       replaceReview(result);
       return { draft: null, result };
     });
     activeId.value = null;
     reanchorCommentId.value = null;
-    overallNote.value = '';
     summaryDirty.value = false;
-    acknowledgeOutdated.value = false;
+    // Freeze's own clear (its null hand-back resets the note) races the
+    // seeding watch's microtask, so the envelope's note is seeded
+    // deterministically here, after the freeze fully settles.
+    if (!draft.value && openEnvelope.value) draftController.reconcile(openEnvelope.value);
     reviewNotice.value =
       submitted.delivery_state === 'delivered'
         ? 'Review submitted to the conversation.'
@@ -844,6 +909,7 @@ async function onCommentEvent(
       'review_submitted',
       'review_delivery',
       'review_comment_resolved',
+      'review_comment_replied',
     ].includes(kind)
   ) {
     return;
@@ -959,6 +1025,12 @@ function renderCard(entry: ReviewEntry): VNode {
       reanchoring: entry.comment.id === reanchorCommentId.value,
       error: commentErrors.value[entry.comment.id] ?? '',
       deleteAction: removeComment,
+      replyAction: (commentId: number, body: string) =>
+        replyReviewComment(props.id, commentId, body),
+      reanchorable: true,
+      // The artifact's staleness is the anchor no longer locating in the
+      // rendered document — the same marker the changes surface carries.
+      stale: orphaned.value.some((candidate) => candidate.comment.id === entry.comment.id),
       onFocus: focusComment,
       onClose: closeComment,
       onEdit: editComment,
@@ -1156,26 +1228,26 @@ const DocBody = () => {
 
     <ReviewTray
       ref="reviewTrayRef"
+      :floating="true"
       :reviews="reviews"
       :draft="draft"
       :open="trayOpen"
       :overall-note="overallNote"
       :summary-saving="summarySaving"
-      :acknowledge-outdated="acknowledgeOutdated"
       :error="trayError"
       :layout-busy="layoutBusy"
       :submitting="submitting"
       :discarding="discarding"
       :delivery-errors="deliveryErrors"
+      :continuation="continuation"
+      :stale-comment-ids="staleCommentIds"
       subject-label="artifact"
       :discard-action="discardDraft"
       @update:open="trayOpen = $event"
       @update:overall-note="editOverallValue"
-      @update:acknowledge-outdated="acknowledgeOutdated = $event"
       @navigate="navigateDraft"
       @focus-comment="focusComment"
       @save-overall="saveOverallNote"
-      @retarget="retargetDraft"
       @submit="submitDraft"
       @retry="retryDelivery"
     />
