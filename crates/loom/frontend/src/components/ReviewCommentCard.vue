@@ -340,7 +340,7 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
         class="shrink-0 rounded bg-block-soft px-1.5 py-0.5 text-2xs font-medium text-block"
         data-testid="stale-card-marker"
       >
-        Revision {{ comment.subject_version }} · stale
+        Stale
       </span>
       <span
         v-else-if="comment.status === 'resolved'"

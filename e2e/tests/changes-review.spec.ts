@@ -315,7 +315,7 @@ test('a changed line keeps its comment in place, marked stale', async ({ page, w
     .locator('[data-review-card]')
     .filter({ hasText: 'About the beta line.' });
   await expect(staleCard).toBeVisible();
-  await expect(staleCard.getByTestId('stale-card-marker')).toContainText('stale');
+  await expect(staleCard.getByTestId('stale-card-marker')).toContainText('Stale');
 
   // The tray warns in red, non-blocking; the row carries the same flag, and
   // there is no acknowledgement checkbox any more.
