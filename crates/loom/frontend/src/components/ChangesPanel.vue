@@ -52,6 +52,7 @@ import { buildChangeFileTree, type FileTreeNode } from '../lib/changeFileTree';
 import { theme } from '../theme';
 import CommitList from './CommitList.vue';
 import ReviewCommentCard from './ReviewCommentCard.vue';
+import ReviewNavOverlay from './ReviewNavOverlay.vue';
 import ReviewTray from './ReviewTray.vue';
 
 const props = defineProps<{ id: string }>();
@@ -314,6 +315,30 @@ const changeCommentEntries = computed<ReviewCommentEntry[]>(() =>
       .map((comment) => ({ review, comment })),
   ),
 );
+
+/** The wayfinding pill's list: every comment not yet resolved, in the order
+ * the diff reads them — file by file, old side before new, line by line —
+ * with comments whose file left the view last, like the outdated section
+ * that carries them. Pending, submitted, and stale comments all count; a
+ * resolved thread is done, wherever it sits. */
+const unresolvedCommentIds = computed(() => {
+  const files = changes.value?.files ?? [];
+  const fileOrder = (path: string) => {
+    const index = files.findIndex((file) => file.path.bytes === path);
+    return index === -1 ? files.length : index;
+  };
+  const sideOrder = (side: ChangeSide) => (side === 'old' ? 0 : 1);
+  return changeCommentEntries.value
+    .filter((entry) => entry.comment.status !== 'resolved')
+    .map((entry) => ({ entry, anchor: entry.comment.anchor as ChangeAnchor }))
+    .sort(
+      (a, b) =>
+        fileOrder(a.anchor.path.bytes) - fileOrder(b.anchor.path.bytes) ||
+        sideOrder(a.anchor.side) - sideOrder(b.anchor.side) ||
+        a.anchor.start_line - b.anchor.start_line,
+    )
+    .map(({ entry }) => entry.comment.id);
+});
 
 /** Comments — draft or submitted — that cannot sit at a line in this view:
  * the comment belongs to another snapshot (a different commit's diff, or the
@@ -1913,6 +1938,14 @@ function reviewAllFromPicker() {
         </article>
       </div>
     </div>
+
+    <!-- Pinned to the panel's lower-center while unresolved comments remain;
+         it rides above the scroller, not inside it. -->
+    <ReviewNavOverlay
+      :targets="unresolvedCommentIds"
+      :active-id="lastFocusedComment"
+      @jump="focusComment"
+    />
 
     <p v-if="notice" class="absolute bottom-1 left-3 text-2xs text-accent" role="status">
       {{ notice }}

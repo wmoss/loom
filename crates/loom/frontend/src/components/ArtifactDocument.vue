@@ -43,6 +43,7 @@ import {
 } from '../discussion-anchor';
 import { ReviewDraftController } from '../lib/reviewDraftController';
 import ReviewCommentCard from './ReviewCommentCard.vue';
+import ReviewNavOverlay from './ReviewNavOverlay.vue';
 import ReviewTray from './ReviewTray.vue';
 
 // Dock/pop swaps mounts of the same document. Keep a small in-memory scroll
@@ -431,6 +432,17 @@ function locateCycle() {
 
 watch(activeId, locateCycle);
 watch(allEntries, () => nextTick(locateCycle));
+
+/** The wayfinding pill's list: every comment not yet resolved, in the order
+ * the document reads them — located ones block by block as locateCycle laid
+ * them out, then the ones whose anchors no longer locate, like the cards
+ * they share a section with. Pending, submitted, and stale comments all
+ * count; a resolved thread is done, wherever it sits. */
+const unresolvedCommentIds = computed(() =>
+  [...[...cardsByBlock.value.values()].flat(), ...orphaned.value]
+    .filter((entry) => entry.comment.status !== 'resolved')
+    .map((entry) => entry.comment.id),
+);
 // --- keyboard/mouse selection affordance -----------------------------------
 
 const selectionButton = ref<{
@@ -1213,6 +1225,10 @@ const DocBody = () => {
         <DocBody />
       </article>
     </div>
+
+    <!-- Pinned to the panel's lower-center while unresolved comments remain;
+         it rides above the scroller, not inside it. -->
+    <ReviewNavOverlay :targets="unresolvedCommentIds" :active-id="activeId" @jump="focusComment" />
 
     <button
       v-if="selectionButton"

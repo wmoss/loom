@@ -117,7 +117,9 @@ submit it, and only a draft may be discarded. A reply continues the
 conversation wherever it left off — answering a resolved thread reopens it —
 and a reply's author may revise or retract their own words until the reviewed
 session has received them; delivered replies are history, like submitted
-comment content.
+comment content. A small pill pinned to the review surface counts the
+unresolved comments left and steps through them in reading order — pending,
+submitted, and stale comments alike; resolving them all rests it.
 
 ACP delivery enters a protected conversation inbox separate from retractable
 operator prompts. Inbox consumption, journal delivery key, and live-turn claim

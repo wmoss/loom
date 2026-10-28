@@ -49,6 +49,85 @@ function deferred() {
 }
 
 test.describe('staged artifact reviews', () => {
+  test('the unresolved pill navigates the artifact document', async ({ page, weaver }) => {
+    const session = await weaver.seedSession({
+      goal: 'navigate artifact reviews',
+      name: 'artifact-nav',
+    });
+    await weaver.writeArtifact(session, 'design', DOC, { title: 'Design notes' });
+    await page.goto(`${weaver.baseUrl}/s/${session.id}/artifacts/design`);
+    await expect(page.locator('.markdown-body h1')).toContainText('Design notes');
+
+    // Two threads at two places in the document, top to bottom. Pending
+    // words count as unresolved too — the pill is wayfinding, not a delivery
+    // state.
+    for (const [phrase, body] of [
+      ['collaborative editing', 'About the editing layer.'],
+      ['one explicit review submission', 'About the submission step.'],
+    ] as const) {
+      await selectPhrase(page, phrase);
+      await page.getByTestId('review-selection-button').click();
+      const composer = page.getByTestId('review-comment-composer');
+      await composer.locator('textarea').fill(body);
+      const saved = page.waitForResponse(
+        (response) =>
+          response.request().method() === 'POST' &&
+          new URL(response.url()).pathname === '/api/reviews/comments/create' &&
+          response.ok(),
+      );
+      await composer.getByRole('button', { name: 'Add pending comment' }).click();
+      await saved;
+      await expect(
+        page.locator('[data-review-card]').filter({ hasText: body }),
+      ).toBeVisible();
+    }
+
+    const pill = page.getByTestId('review-nav');
+    // The cursor follows the open comment: the composer's save left the
+    // second thread active.
+    await expect(pill).toContainText('2 / 2');
+
+    // Durable threads: submit, close the open card, and walk the document —
+    // the jump opens and centers the card it lands on, in reading order.
+    // (The tray opens on its own while words are pending; expand only if it
+    // rested minimized.)
+    const trayToggle = page.getByTestId('review-tray-toggle');
+    if ((await trayToggle.getAttribute('aria-expanded')) === 'false') await trayToggle.click();
+    await page.getByTestId('submit-review').click();
+    await expect(page.getByTestId('review-envelope-state')).toContainText('submitted');
+    // The tray rests minimized once nothing is pending; close it only if it
+    // stayed open — its panel overlays the page.
+    if ((await trayToggle.getAttribute('aria-expanded')) === 'true') await trayToggle.click();
+
+    // The submit collapses the cards; re-enter at the top of the document
+    // and walk down with the pill — the jump opens and centers the card it
+    // lands on, in reading order.
+    const cards = page.locator('[data-review-card]');
+    const collapsed = (text: string) =>
+      page.locator('[data-review-collapsed]').filter({ hasText: text });
+    await expect(cards).toHaveCount(0);
+
+    await collapsed('About the editing layer.').click();
+    await expect(pill).toContainText('1 / 2');
+    await pill.getByRole('button', { name: 'Next unresolved comment' }).click();
+    await expect(cards.filter({ hasText: 'About the submission step.' })).toBeVisible();
+    await expect(pill).toContainText('2 / 2');
+
+    // Resolving both rests the pill — no unresolved threads, no chrome. The
+    // jump left the bottom thread open; resolve it first, then the top.
+    await cards
+      .filter({ hasText: 'About the submission step.' })
+      .getByRole('button', { name: 'Resolve' })
+      .click();
+    await expect(pill).toContainText('1 / 1');
+    await collapsed('About the editing layer.').click();
+    await cards
+      .filter({ hasText: 'About the editing layer.' })
+      .getByRole('button', { name: 'Resolve' })
+      .click();
+    await expect(pill).toHaveCount(0);
+  });
+
   test('drafts, conflicts, re-anchors, and submits one coherent review', async ({
     page,
     weaver,
@@ -245,7 +324,17 @@ test.describe('staged artifact reviews', () => {
     await tray.getByRole('button', { name: /Explain prefix and suffix recovery/ }).click();
     const staleCard = page.locator('[data-review-card]');
     await staleCard.getByRole('button', { name: 'Re-anchor' }).click();
-    await selectPhrase(page, 'How can anchors survive');
+    // A review reload can re-render the document mid-step and drop the
+    // selection before the affordance lands; re-select until it holds.
+    await expect
+      .poll(
+        async () => {
+          await selectPhrase(page, 'How can anchors survive');
+          return page.getByTestId('review-selection-button').isVisible();
+        },
+        { timeout: 15_000 },
+      )
+      .toBe(true);
     await page.getByTestId('review-selection-button').click();
     await expect(staleCard).toContainText('How can anchors survive');
     await expect(page.getByTestId('review-stale-warning')).toBeHidden();

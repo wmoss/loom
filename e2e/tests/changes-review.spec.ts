@@ -640,6 +640,84 @@ test('submitted comments persist in the diff and resolve from collapsed', async 
   await expect(strip).toContainText('resolve.txt');
 });
 
+test('the unresolved pill jumps between threads and rests when none remain', async ({
+  page,
+  weaver,
+}) => {
+  const session = await weaver.seedSession({
+    goal: 'jump between unresolved threads',
+    name: 'review-nav',
+  });
+  const changedPath = join(session.work_dir, 'navigate.txt');
+  const lines = Array.from({ length: 12 }, (_, index) => `row ${index + 1}`);
+  writeFileSync(changedPath, lines.join('\n') + '\n');
+
+  await page.goto(`${weaver.baseUrl}/s/${session.id}/changes`);
+  const article = page.locator('article').filter({
+    has: page.getByRole('button', { name: /navigate\.txt/ }),
+  });
+  const composer = page.getByTestId('change-comment-composer');
+
+  // Three threads, three lines. Pending words count as unresolved too — the
+  // pill is wayfinding, not a delivery state.
+  for (const [line, body] of [
+    [2, 'Top thread.'],
+    [6, 'Middle thread.'],
+    [10, 'Bottom thread.'],
+  ] as const) {
+    await (await addWidgetButton(article, 'new', line)).click({ force: true });
+    await composer.locator('textarea').fill(body);
+    await composer.getByRole('button', { name: 'Add pending comment' }).click();
+  }
+
+  const pill = page.getByTestId('review-nav');
+  await expect(pill).toContainText('/ 3');
+  // Nothing has been navigated yet, so the cursor rests on the first thread —
+  // it follows the reader's clicks, not the composer's saves.
+  await expect(pill).toContainText('1 / 3');
+
+  // Durable threads: submit the review, then close the middle one — a
+  // resolved thread is done, wherever it sits. The cards stay open across
+  // the submit, so each Resolve works from its own open card.
+  await page.getByTestId('review-tray-toggle').click();
+  await page.getByTestId('submit-review').click();
+  await expect(page.getByTestId('review-envelope-state')).toContainText('submitted');
+  // The open tray overlays the page; close it before working the cards.
+  await page.getByTestId('review-tray-toggle').click();
+  const cards = article.locator('[data-review-card]');
+  await expect(cards).toHaveCount(3);
+
+  await cards
+    .filter({ hasText: 'Middle thread.' })
+    .getByRole('button', { name: 'Resolve' })
+    .click();
+  await expect(pill).toContainText('/ 2');
+
+  // Next jumps down the diff to the bottom thread, opening its card.
+  await pill.getByRole('button', { name: 'Next unresolved comment' }).click();
+  await expect(cards.filter({ hasText: 'Bottom thread.' })).toBeVisible();
+  await expect(pill).toContainText('2 / 2');
+  // Next again wraps to the top of the diff; previous wraps back down.
+  await pill.getByRole('button', { name: 'Next unresolved comment' }).click();
+  await expect(cards.filter({ hasText: 'Top thread.' })).toBeVisible();
+  await expect(pill).toContainText('1 / 2');
+  await pill.getByRole('button', { name: 'Previous unresolved comment' }).click();
+  await expect(cards.filter({ hasText: 'Bottom thread.' })).toBeVisible();
+
+  // Resolve the rest and the pill rests — no unresolved threads, no chrome.
+  await cards
+    .filter({ hasText: 'Bottom thread.' })
+    .getByRole('button', { name: 'Resolve' })
+    .click();
+  await expect(pill).toContainText('1 / 1');
+  await expect(pill.getByRole('button', { name: 'Next unresolved comment' })).toBeDisabled();
+  await cards
+    .filter({ hasText: 'Top thread.' })
+    .getByRole('button', { name: 'Resolve' })
+    .click();
+  await expect(pill).toHaveCount(0);
+});
+
 test('large files keep their syntax highlighting', async ({ page, weaver }) => {
   const session = await weaver.seedSession({
     goal: 'highlight large files',
