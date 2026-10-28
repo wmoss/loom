@@ -328,6 +328,59 @@ pub mod update {
     pub type Output = ReviewDto;
 }
 
+pub mod replies {
+    //! The reply thread's own words: the author of a reply may revise or
+    //! retract it while it is still on the reviewer's side of the delivered
+    //! cursor. Once the reviewed session has received an operator reply, it
+    //! joins history like submitted comment content.
+
+    pub(super) use super::prelude;
+
+    pub mod update {
+        use super::prelude::*;
+
+        /// Rewrite one reply's body in place.
+        ///
+        /// Reachable from both sides of the review loop, exactly as
+        /// `reviews.comments.reply` is: an operator rewrites their own replies
+        /// until the session receives them, the reviewed session revises its
+        /// own answers. Nobody else's words.
+        #[operation(id = "reviews.replies.update", actor = SessionSelf, scope = Session, risk = Write,
+                    grants = ["loom/reviews/write@v1"])]
+        pub struct Input {
+            /// The reply to rewrite, as `reviews.list` reports it.
+            #[operand(positional)]
+            pub reply_id: i64,
+            /// The replacement body.
+            pub body: String,
+            #[operand(context)]
+            pub session: String,
+        }
+
+        pub type Output = ReviewCommentDto;
+    }
+
+    pub mod delete {
+        use super::prelude::*;
+
+        /// Remove one reply from its thread.
+        ///
+        /// The same reach `reviews.replies.update` grants: the reply's own
+        /// author, before the reviewed session has received it.
+        #[operation(id = "reviews.replies.delete", actor = SessionSelf, scope = Session, risk = Write,
+                    grants = ["loom/reviews/write@v1"])]
+        pub struct Input {
+            /// The reply to delete, as `reviews.list` reports it.
+            #[operand(positional)]
+            pub reply_id: i64,
+            #[operand(context)]
+            pub session: String,
+        }
+
+        pub type Output = ReviewCommentDto;
+    }
+}
+
 static OPERATIONS: &[&OperationSpec] = &[
     get::SPEC,
     update::SPEC,
@@ -339,6 +392,8 @@ static OPERATIONS: &[&OperationSpec] = &[
     comments::delete::SPEC,
     comments::resolve::SPEC,
     comments::reply::SPEC,
+    replies::update::SPEC,
+    replies::delete::SPEC,
     submit::SPEC,
     retry_delivery::SPEC,
 ];

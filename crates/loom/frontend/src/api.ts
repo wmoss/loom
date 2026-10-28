@@ -653,6 +653,23 @@ export const replyReviewComment = (session: string, commentId: number, body: str
     body,
   });
 
+/** Rewrite one reply — the author's own words, before the session received
+ *  them. Returns the whole updated comment the reply belongs to. */
+export const updateReviewReply = (session: string, replyId: number, body: string) =>
+  invokeOperation('reviews.replies.update', {
+    session,
+    reply_id: replyId,
+    body,
+  });
+
+/** Retract one reply — same reach as the rewrite: its own author, while the
+ *  session has not received it yet. */
+export const deleteReviewReply = (session: string, replyId: number) =>
+  invokeOperation('reviews.replies.delete', {
+    session,
+    reply_id: replyId,
+  });
+
 export const deleteReviewComment = (
   reviewId: number,
   commentId: number,

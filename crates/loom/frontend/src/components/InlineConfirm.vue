@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, ref } from 'vue';
+import { computed, nextTick, ref } from 'vue';
 
 const props = withDefaults(
   defineProps<{
@@ -9,8 +9,11 @@ const props = withDefaults(
     confirmLabel?: string;
     action?: () => Promise<void>;
     danger?: boolean;
+    /** Compact sizing for the comment cards' control rows, where every
+     *  sibling button is `px-2 py-1 text-2xs`. */
+    dense?: boolean;
   }>(),
-  { disabled: false, confirmLabel: 'Confirm', action: undefined, danger: false },
+  { disabled: false, confirmLabel: 'Confirm', action: undefined, danger: false, dense: false },
 );
 
 const emit = defineEmits<{ confirm: [] }>();
@@ -19,6 +22,10 @@ const trigger = ref<HTMLButtonElement | null>(null);
 const confirmButton = ref<HTMLButtonElement | null>(null);
 const busy = ref(false);
 const error = ref('');
+
+/** One sizing for all three buttons, so the confirm row never towers over
+ *  the row it opened from. */
+const sizing = computed(() => (props.dense ? 'px-2 py-1 text-2xs' : 'px-3 py-1.5 text-xs'));
 
 async function show() {
   open.value = true;
@@ -62,7 +69,8 @@ async function confirm() {
       v-if="!open"
       ref="trigger"
       type="button"
-      class="btn-secondary px-3 py-1.5 text-xs"
+      class="btn-secondary"
+      :class="sizing"
       :disabled="disabled"
       @click="show"
     >
@@ -73,19 +81,14 @@ async function confirm() {
       <button
         ref="confirmButton"
         type="button"
-        class="rounded px-2.5 py-1 text-xs text-white"
-        :class="danger ? 'bg-block' : 'bg-accent'"
+        class="rounded text-white"
+        :class="[sizing, danger ? 'bg-block' : 'bg-accent']"
         :disabled="disabled || busy"
         @click="confirm"
       >
         {{ busy ? 'Working…' : confirmLabel }}
       </button>
-      <button
-        type="button"
-        class="btn-secondary px-2.5 py-1 text-xs"
-        :disabled="busy"
-        @click="cancel"
-      >
+      <button type="button" class="btn-secondary" :class="sizing" :disabled="busy" @click="cancel">
         Cancel
       </button>
       <span v-if="error" class="w-full text-xs text-block" role="alert">{{ error }}</span>

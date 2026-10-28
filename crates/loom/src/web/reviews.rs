@@ -614,6 +614,12 @@ pub(super) fn bound_operations() -> Vec<Bound> {
         register::<weaver_api::operations::reviews::comments::reply::Op, _, _>(
             comments_reply_operation,
         ),
+        register::<weaver_api::operations::reviews::replies::update::Op, _, _>(
+            replies_update_operation,
+        ),
+        register::<weaver_api::operations::reviews::replies::delete::Op, _, _>(
+            replies_delete_operation,
+        ),
         register::<weaver_api::operations::reviews::submit::Op, _, _>(submit_operation),
         register::<weaver_api::operations::reviews::retry_delivery::Op, _, _>(
             retry_delivery_operation,
@@ -822,15 +828,12 @@ async fn comments_reply_operation(
     context: OperationContext,
     input: weaver_api::operations::reviews::comments::reply::Input,
 ) -> ApiResult<weaver_api::operations::reviews::comments::reply::Output> {
-    let st = context.state;
     // The credential names the speaker, not the request operand — the scope
     // check admits ancestor sessions too, and a parent must not append to a
     // child's review answers in the child's name. The session author is the
     // token's own session; the core rejects any review that is not its own.
-    let author = match &context.principal.grant {
-        crate::auth::Grant::Session { session_id, .. } => review::ReplyAuthor::Session(session_id),
-        _ => review::ReplyAuthor::Operator(&context.principal.username),
-    };
+    let author = reply_author(&context.principal);
+    let st = context.state;
     let comment = review::reply_comment(&st.db, input.comment_id, author, &input.body)
         .await
         .map_err(|error| AppError::bad_request(error.to_string()))?;
@@ -855,6 +858,72 @@ async fn comments_reply_operation(
             }),
         );
     }
+    Ok(comment_dto(&comment))
+}
+
+/// The credential names the speaker, not the request operand — the reply
+/// append, rewrite and retract paths all resolve the author the same way, and
+/// the core rejects anyone but the reply's own author.
+fn reply_author(principal: &Principal) -> review::ReplyAuthor<'_> {
+    match &principal.grant {
+        crate::auth::Grant::Session { session_id, .. } => {
+            review::ReplyAuthor::Session(session_id.as_str())
+        }
+        _ => review::ReplyAuthor::Operator(&principal.username),
+    }
+}
+
+async fn replies_update_operation(
+    context: OperationContext,
+    input: weaver_api::operations::reviews::replies::update::Input,
+) -> ApiResult<weaver_api::operations::reviews::replies::update::Output> {
+    let author = reply_author(&context.principal);
+    let st = context.state;
+    let comment = review::update_reply(&st.db, input.reply_id, author, &input.body)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let item = review::get(&st.db, comment.review_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("submitted review"))?;
+    events::emit(
+        &st.bus,
+        &item.branch_id,
+        "review_reply_updated",
+        json!({
+            "review_id": item.id,
+            "comment_id": comment.id,
+            "session_id": item.session_id,
+            "subject_kind": item.subject_kind,
+            "subject_key": item.subject_key,
+        }),
+    );
+    Ok(comment_dto(&comment))
+}
+
+async fn replies_delete_operation(
+    context: OperationContext,
+    input: weaver_api::operations::reviews::replies::delete::Input,
+) -> ApiResult<weaver_api::operations::reviews::replies::delete::Output> {
+    let author = reply_author(&context.principal);
+    let st = context.state;
+    let comment = review::delete_reply(&st.db, input.reply_id, author)
+        .await
+        .map_err(|error| AppError::bad_request(error.to_string()))?;
+    let item = review::get(&st.db, comment.review_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("submitted review"))?;
+    events::emit(
+        &st.bus,
+        &item.branch_id,
+        "review_reply_deleted",
+        json!({
+            "review_id": item.id,
+            "comment_id": comment.id,
+            "session_id": item.session_id,
+            "subject_kind": item.subject_kind,
+            "subject_key": item.subject_key,
+        }),
+    );
     Ok(comment_dto(&comment))
 }
 

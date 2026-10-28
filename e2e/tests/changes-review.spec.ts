@@ -525,7 +525,8 @@ test('submitted comments persist in the diff and resolve from collapsed', async 
 
   // Reopening from the pill keeps the thread open for reading, and the
   // reviewer can keep talking in it: a reply lands as the next entry,
-  // attributed to the operator by name, without touching resolve state.
+  // attributed to the operator by name — and the reply reopens the closed
+  // thread on its own, whoever answers.
   await pill.click();
   const replied = page.waitForResponse(
     (response) =>
@@ -536,12 +537,55 @@ test('submitted comments persist in the diff and resolve from collapsed', async 
     .getByTestId('review-reply-composer')
     .locator('textarea')
     .fill('Closing after the checks pass.');
-  await page.getByTestId('review-reply-composer').getByRole('button', { name: 'Reply' }).click();
+  await card.getByTestId('submit-reply').click();
   await replied;
   const thread = card.getByTestId('review-comment-replies');
   await expect(thread).toContainText('Closing after the checks pass.');
   await expect(thread).toContainText('loom-e2e-owner');
-  await expect(card).toContainText('Resolved');
+  // The reply reopened the resolved thread: the header chip is gone and the
+  // resolution control offers Resolve again, not Reopen.
+  await expect(card.getByTestId('review-comment-header')).not.toContainText('Resolved');
+  await expect(card.getByRole('button', { name: 'Resolve' })).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Reopen' })).toHaveCount(0);
+
+  // The reviewer's own words stay theirs to revise — the reply carries Edit
+  // and Delete, the same affordances a pending comment has.
+  const edited = page.waitForResponse(
+    (response) =>
+      response.ok() && new URL(response.url()).pathname === '/api/reviews/replies/update',
+  );
+  await card.getByTestId('review-reply-edit-button').click();
+  await card.getByTestId('review-reply-edit').fill('Closing after the checks pass, all green.');
+  await card.getByRole('button', { name: 'Save' }).click();
+  await edited;
+  await expect(thread).toContainText('all green.');
+
+  // And they can be taken back entirely: a second reply, retracted before
+  // the session ever receives it.
+  const second = page.waitForResponse(
+    (response) =>
+      response.ok() && new URL(response.url()).pathname === '/api/reviews/comments/reply',
+  );
+  await card.getByRole('button', { name: 'Reply' }).click();
+  await page
+    .getByTestId('review-reply-composer')
+    .locator('textarea')
+    .fill('A reply to take back.');
+  await card.getByTestId('submit-reply').click();
+  await second;
+  await expect(thread).toContainText('A reply to take back.');
+  const retracting = page.waitForResponse(
+    (response) =>
+      response.ok() && new URL(response.url()).pathname === '/api/reviews/replies/delete',
+  );
+  await thread
+    .locator('> div')
+    .filter({ hasText: 'A reply to take back.' })
+    .getByRole('button', { name: 'Delete' })
+    .click();
+  await card.getByRole('button', { name: 'Delete reply' }).click();
+  await retracting;
+  await expect(thread).not.toContainText('A reply to take back.');
 
   // The operator reply does not dead-end in the UI: it queues on the review
   // and looks exactly like a pending comment does — and a brand-new comment
@@ -549,7 +593,7 @@ test('submitted comments persist in the diff and resolve from collapsed', async 
   const toggle = page.getByTestId('review-tray-toggle');
   await expect(toggle).toContainText('Review · 1 pending');
   if ((await toggle.getAttribute('aria-expanded')) === 'false') await toggle.click();
-  await expect(page.getByTestId('review-tray')).toContainText('Closing after the checks pass.');
+  await expect(page.getByTestId('review-tray')).toContainText('all green.');
   await (await addWidgetButton(article, 'new', 7)).click({ force: true });
   await page
     .getByTestId('change-comment-composer')
@@ -565,7 +609,7 @@ test('submitted comments persist in the diff and resolve from collapsed', async 
   await expect(toggle).toContainText('Review · 2 pending');
   if ((await toggle.getAttribute('aria-expanded')) === 'false') await toggle.click();
   await expect(page.getByTestId('review-tray')).toContainText('One more thing, brand new.');
-  await expect(page.getByTestId('review-tray')).toContainText('Closing after the checks pass.');
+  await expect(page.getByTestId('review-tray')).toContainText('all green.');
   const roundSubmitted = page.waitForResponse(
     (response) => response.ok() && new URL(response.url()).pathname === '/api/reviews/submit',
   );
@@ -575,14 +619,15 @@ test('submitted comments persist in the diff and resolve from collapsed', async 
   // The open tray overlays the page; close it before working the cards.
   await toggle.click();
 
-  // The header collapses an open thread, same as the Close button.
+  // The header collapses an open thread, same as the Close button. The reply
+  // reopened the thread earlier, so the pill reads Submitted, not Resolved.
   await card.getByTestId('review-comment-header').click();
-  await expect(pill).toContainText('Resolved');
-  // And it can be clicked open again to un-resolve.
-  await pill.click();
-  await card.getByRole('button', { name: 'Reopen' }).click();
-  await card.getByRole('button', { name: 'Close' }).click();
   await expect(pill).toContainText('Submitted');
+  // And it can be clicked open again to re-resolve — resolving collapses the
+  // thread on its own, the pill carrying the state.
+  await pill.click();
+  await card.getByRole('button', { name: 'Resolve' }).click();
+  await expect(pill).toContainText('Resolved');
 
   // When the anchored line later leaves the view, the submitted comment
   // persists under its own file's strip — the file still renders, so its

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
+import { me } from '../auth';
 import type { Anchor, ChangeAnchor, Review, ReviewComment } from '../types';
 import { timeAgo } from '../lib/time';
 import InlineConfirm from './InlineConfirm.vue';
@@ -15,6 +16,12 @@ const props = defineProps<{
   /** Appends one entry to the comment's reply thread and returns the updated
    *  comment; the card splices it into the review it already holds. */
   replyAction: (commentId: number, body: string) => Promise<ReviewComment>;
+  /** Rewrites one of the thread's own replies; same return contract as
+   *  `replyAction`. */
+  replyEditAction: (replyId: number, body: string) => Promise<ReviewComment>;
+  /** Retracts one of the thread's own replies; same return contract as
+   *  `replyAction`. */
+  replyDeleteAction: (replyId: number) => Promise<ReviewComment>;
   /** False when the comment anchors to a snapshot the host surface is not
    *  showing — re-anchoring it onto this view is a rejected cross-scope
    *  move, so the action hides instead of dead-ending. Pass it at every
@@ -146,6 +153,13 @@ const replyBody = ref('');
 const replySaving = ref(false);
 const replyError = ref('');
 const replyInput = ref<HTMLTextAreaElement | null>(null);
+const replyToggleEl = ref<HTMLButtonElement | null>(null);
+
+/** Splice an updated comment back into the review the card already holds. */
+function spliceComment(updated: ReviewComment) {
+  const index = props.review.comments.findIndex((item) => item.id === updated.id);
+  if (index >= 0) props.review.comments.splice(index, 1, updated);
+}
 
 function beginReply() {
   replying.value = true;
@@ -158,6 +172,7 @@ function cancelReply() {
   replying.value = false;
   replyBody.value = '';
   replyError.value = '';
+  void nextTick(() => replyToggleEl.value?.focus());
 }
 
 async function submitReply() {
@@ -166,9 +181,7 @@ async function submitReply() {
   replySaving.value = true;
   replyError.value = '';
   try {
-    const updated = await props.replyAction(props.comment.id, text);
-    const index = props.review.comments.findIndex((item) => item.id === props.comment.id);
-    if (index >= 0) props.review.comments.splice(index, 1, updated);
+    spliceComment(await props.replyAction(props.comment.id, text));
     replying.value = false;
     replyBody.value = '';
   } catch (cause) {
@@ -177,6 +190,74 @@ async function submitReply() {
     replySaving.value = false;
   }
 }
+
+// --- The reviewer's own replies stay theirs to revise or retract until the
+// session receives them — the same shape as a pending comment's Edit and
+// Delete, one delivery boundary earlier. ---
+const editingReplyId = ref<number | null>(null);
+const replyDraft = ref('');
+const replyEditSaving = ref(false);
+const replyEditError = ref('');
+const replyEditInput = ref<HTMLTextAreaElement | null>(null);
+
+/** The current operator's own words, still on the reviewer's side of the
+ * delivered-reply cursor. Session replies are the session's own record —
+ * the operator never rewrites those. */
+function editableReply(reply: ReviewComment['replies'][number]): boolean {
+  return (
+    reply.author_kind === 'operator' &&
+    reply.author === me.username &&
+    reply.id > props.review.reply_upto
+  );
+}
+
+function beginReplyEdit(reply: ReviewComment['replies'][number]) {
+  editingReplyId.value = reply.id;
+  replyDraft.value = reply.body;
+  replyEditError.value = '';
+  void nextTick(() => replyEditInput.value?.focus());
+}
+
+function cancelReplyEdit() {
+  editingReplyId.value = null;
+  replyDraft.value = '';
+  replyEditError.value = '';
+}
+
+async function saveReplyEdit(reply: ReviewComment['replies'][number]) {
+  const text = replyDraft.value.trim();
+  if (!text || replyEditSaving.value) return;
+  if (text === reply.body) {
+    cancelReplyEdit();
+    return;
+  }
+  replyEditSaving.value = true;
+  replyEditError.value = '';
+  try {
+    spliceComment(await props.replyEditAction(reply.id, text));
+    editingReplyId.value = null;
+    replyDraft.value = '';
+  } catch (cause) {
+    replyEditError.value = (cause as Error).message;
+  } finally {
+    replyEditSaving.value = false;
+  }
+}
+
+async function removeReply(replyId: number) {
+  spliceComment(await props.replyDeleteAction(replyId));
+}
+
+// A delivered or retracted reply stops being editable: the edit closes so
+// its textarea never outlives the words it was editing.
+watch(
+  () => [props.review.reply_upto, props.comment.replies] as const,
+  () => {
+    if (editingReplyId.value === null) return;
+    const reply = props.comment.replies?.find((item) => item.id === editingReplyId.value);
+    if (!reply || !editableReply(reply)) cancelReplyEdit();
+  },
+);
 
 /** A reply's speaker: the reviewed session, or the operator who joined. */
 function replySpeaker(reply: ReviewComment['replies'][number]): string {
@@ -316,9 +397,69 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
           </span>
           <span :title="reply.created_at">{{ timeAgo(reply.created_at) }}</span>
         </p>
-        <div class="comment-md chat-prose">
-          <MarkdownView :id="review.session_id" path="" :source="reply.body" />
-        </div>
+        <template v-if="editingReplyId === reply.id">
+          <textarea
+            v-model="replyDraft"
+            :disabled="replyEditSaving"
+            rows="2"
+            class="w-full resize-y rounded border border-line bg-input p-1.5 text-xs text-fg outline-none focus:border-accent"
+            data-testid="review-reply-edit"
+            @keydown.ctrl.enter.prevent="saveReplyEdit(reply)"
+            @keydown.meta.enter.prevent="saveReplyEdit(reply)"
+            @keydown.esc.stop.prevent="cancelReplyEdit"
+          ></textarea>
+          <div class="mt-1 flex items-center gap-1.5">
+            <button
+              type="button"
+              class="btn-primary px-2 py-1 text-2xs"
+              :disabled="!replyDraft.trim() || replyEditSaving"
+              @click.stop="saveReplyEdit(reply)"
+            >
+              {{ replyEditSaving ? 'Saving…' : 'Save' }}
+            </button>
+            <button
+              type="button"
+              class="btn-secondary px-2 py-1 text-2xs"
+              @click.stop="cancelReplyEdit"
+            >
+              Cancel
+            </button>
+          </div>
+          <p
+            v-if="replyEditError"
+            class="mt-1 rounded bg-block-soft px-2 py-1 text-2xs text-block"
+            role="alert"
+          >
+            {{ replyEditError }}
+          </p>
+        </template>
+        <template v-else>
+          <div class="comment-md chat-prose">
+            <MarkdownView :id="review.session_id" path="" :source="reply.body" />
+          </div>
+          <!-- The reviewer's own words, revised or retracted until the
+               session receives them — the same affordances a pending comment
+               carries. -->
+          <div v-if="editableReply(reply)" class="mt-1 flex items-center gap-1.5">
+            <button
+              type="button"
+              class="btn-secondary px-2 py-1 text-2xs"
+              data-testid="review-reply-edit-button"
+              @click.stop="beginReplyEdit(reply)"
+            >
+              Edit
+            </button>
+            <InlineConfirm
+              label="Delete"
+              message="Delete this reply?"
+              confirm-label="Delete reply"
+              danger
+              dense
+              :action="() => removeReply(reply.id)"
+              @click.stop
+            />
+          </div>
+        </template>
       </div>
     </div>
 
@@ -338,18 +479,6 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
         @keydown.meta.enter.prevent="submitReply"
         @keydown.esc.stop.prevent="cancelReply"
       ></textarea>
-      <div class="mt-1 flex justify-end gap-1.5">
-        <button type="button" class="btn-secondary px-2 py-1 text-2xs" @click.stop="cancelReply">
-          Cancel
-        </button>
-        <button
-          type="submit"
-          class="btn-primary px-2 py-1 text-2xs"
-          :disabled="!replyBody.trim() || replySaving"
-        >
-          {{ replySaving ? 'Sending…' : 'Reply' }}
-        </button>
-      </div>
       <p
         v-if="replyError"
         class="mt-1 rounded bg-block-soft px-2 py-1 text-2xs text-block"
@@ -359,6 +488,11 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
       </p>
     </form>
 
+    <!-- The control row. A thread puts Resolve first, Close beside it, and
+         Reply on the far right; opening the composer keeps Resolve and Close
+         put and turns Reply green beside a Cancel — one row, no duplicate
+         pair inside the composer. Pending comments keep their own row:
+         Edit, Re-anchor, Delete, Close. -->
     <div class="mt-2 flex flex-wrap items-center gap-1.5">
       <template v-if="comment.status === 'pending'">
         <button
@@ -400,44 +534,86 @@ function replySpeaker(reply: ReviewComment['replies'][number]): string {
           message="Delete this pending comment?"
           confirm-label="Delete comment"
           danger
+          dense
           :action="() => deleteAction(comment.id)"
           @click.stop
         />
+        <button
+          ref="closeEl"
+          type="button"
+          class="btn-secondary ml-auto px-2 py-1 text-2xs"
+          @click.stop="emit('close', comment.id)"
+        >
+          Close
+        </button>
       </template>
-      <button
-        v-if="!review.legacy && review.status === 'submitted' && comment.status !== 'pending'"
-        type="button"
-        class="btn-secondary px-2 py-1 text-2xs"
-        @click.stop="replying ? cancelReply() : beginReply()"
-      >
-        {{ replying ? 'Cancel reply' : 'Reply' }}
-      </button>
-      <button
-        v-if="!review.legacy && review.status === 'submitted' && comment.status !== 'pending'"
-        ref="resolutionEl"
-        type="button"
-        class="btn-secondary px-2 py-1 text-2xs"
-        @click.stop="emit('resolution', comment.id, comment.status !== 'resolved')"
-      >
-        {{ comment.status === 'resolved' ? 'Reopen' : 'Resolve' }}
-      </button>
-      <button
-        v-if="review.legacy && comment.status === 'open'"
-        ref="resolutionEl"
-        type="button"
-        class="btn-secondary px-2 py-1 text-2xs"
-        @click.stop="emit('resolution', comment.id, true)"
-      >
-        Resolve
-      </button>
-      <button
-        ref="closeEl"
-        type="button"
-        class="btn-secondary ml-auto px-2 py-1 text-2xs"
-        @click.stop="emit('close', comment.id)"
-      >
-        Close
-      </button>
+      <template v-else-if="!review.legacy && review.status === 'submitted'">
+        <button
+          ref="resolutionEl"
+          type="button"
+          class="btn-secondary px-2 py-1 text-2xs"
+          @click.stop="emit('resolution', comment.id, comment.status !== 'resolved')"
+        >
+          {{ comment.status === 'resolved' ? 'Reopen' : 'Resolve' }}
+        </button>
+        <button
+          ref="closeEl"
+          type="button"
+          class="btn-secondary px-2 py-1 text-2xs"
+          @click.stop="emit('close', comment.id)"
+        >
+          Close
+        </button>
+        <div class="ml-auto flex items-center gap-1.5">
+          <button
+            v-if="replying"
+            type="button"
+            class="btn-secondary px-2 py-1 text-2xs"
+            @click.stop="cancelReply"
+          >
+            Cancel
+          </button>
+          <button
+            v-if="replying"
+            type="button"
+            class="btn-primary px-2 py-1 text-2xs"
+            :disabled="!replyBody.trim() || replySaving"
+            data-testid="submit-reply"
+            @click.stop="submitReply"
+          >
+            {{ replySaving ? 'Sending…' : 'Reply' }}
+          </button>
+          <button
+            v-else
+            ref="replyToggleEl"
+            type="button"
+            class="btn-secondary px-2 py-1 text-2xs"
+            @click.stop="beginReply"
+          >
+            Reply
+          </button>
+        </div>
+      </template>
+      <template v-else>
+        <button
+          v-if="review.legacy && comment.status === 'open'"
+          ref="resolutionEl"
+          type="button"
+          class="btn-secondary px-2 py-1 text-2xs"
+          @click.stop="emit('resolution', comment.id, true)"
+        >
+          Resolve
+        </button>
+        <button
+          ref="closeEl"
+          type="button"
+          class="btn-secondary px-2 py-1 text-2xs"
+          :class="{ 'ml-auto': review.legacy }"
+          @click.stop="emit('close', comment.id)"
+        >
+          Close
+        </button>
+      </template>
     </div>
     <p v-if="error" class="mt-2 rounded bg-block-soft px-2 py-1 text-2xs text-block" role="alert">
       {{ error }}

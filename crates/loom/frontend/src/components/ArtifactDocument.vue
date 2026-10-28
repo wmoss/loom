@@ -18,11 +18,13 @@ import {
   addReviewComment,
   createReview,
   deleteReviewComment,
+  deleteReviewReply,
   discardReview,
   listArtifactReviews,
   retryReviewDelivery,
   resolveThread,
   replyReviewComment,
+  updateReviewReply,
   setReviewCommentResolution,
   getMe,
   submitReview,
@@ -910,6 +912,8 @@ async function onCommentEvent(
       'review_delivery',
       'review_comment_resolved',
       'review_comment_replied',
+      'review_reply_updated',
+      'review_reply_deleted',
     ].includes(kind)
   ) {
     return;
@@ -1027,6 +1031,9 @@ function renderCard(entry: ReviewEntry): VNode {
       deleteAction: removeComment,
       replyAction: (commentId: number, body: string) =>
         replyReviewComment(props.id, commentId, body),
+      replyEditAction: (replyId: number, body: string) =>
+        updateReviewReply(props.id, replyId, body),
+      replyDeleteAction: (replyId: number) => deleteReviewReply(props.id, replyId),
       reanchorable: true,
       // The artifact's staleness is the anchor no longer locating in the
       // rendered document — the same marker the changes surface carries.

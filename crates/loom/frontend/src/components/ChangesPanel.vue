@@ -19,6 +19,7 @@ import {
   replyReviewComment,
   setReviewCommentResolution,
   deleteReviewComment,
+  deleteReviewReply,
   discardReview,
   getChanges,
   getSessionCommits,
@@ -28,6 +29,7 @@ import {
   submitReview,
   updateReview,
   updateReviewComment,
+  updateReviewReply,
   ApiError,
 } from '../api';
 import type {
@@ -974,6 +976,16 @@ function replyToComment(commentId: number, body: string) {
   return replyReviewComment(props.id, commentId, body);
 }
 
+/** Rewrites one of the reviewer's own thread replies. */
+function editReply(replyId: number, body: string) {
+  return updateReviewReply(props.id, replyId, body);
+}
+
+/** Retracts one of the reviewer's own thread replies. */
+function deleteReply(replyId: number) {
+  return deleteReviewReply(props.id, replyId);
+}
+
 async function removeComment(commentId: number) {
   try {
     await mutateComment((review) =>
@@ -1162,6 +1174,8 @@ for (const kind of [
   'review_delivery',
   'review_comment_resolved',
   'review_comment_replied',
+  'review_reply_updated',
+  'review_reply_deleted',
 ]) {
   events.on(kind, () => {
     if (refreshTimer != null) clearTimeout(refreshTimer);
@@ -1671,6 +1685,8 @@ function reviewAllFromPicker() {
                 :error="commentErrors[entry.comment.id] ?? ''"
                 :delete-action="removeComment"
                 :reply-action="replyToComment"
+                :reply-edit-action="editReply"
+                :reply-delete-action="deleteReply"
                 :reanchorable="inViewScope(entry.comment)"
                 @focus="openComment"
                 @close="closeComment"
@@ -1829,6 +1845,8 @@ function reviewAllFromPicker() {
                       :error="commentErrors[entry.comment.id] ?? ''"
                       :delete-action="removeComment"
                       :reply-action="replyToComment"
+                      :reply-edit-action="editReply"
+                      :reply-delete-action="deleteReply"
                       :reanchorable="true"
                       :stale="commentStale(entry)"
                       @focus="openComment"
@@ -1879,6 +1897,8 @@ function reviewAllFromPicker() {
                   :error="commentErrors[entry.comment.id] ?? ''"
                   :delete-action="removeComment"
                   :reply-action="replyToComment"
+                  :reply-edit-action="editReply"
+                  :reply-delete-action="deleteReply"
                   :reanchorable="inViewScope(entry.comment)"
                   @focus="openComment"
                   @close="closeComment"

@@ -1045,6 +1045,117 @@ pub async fn reply_comment(
     .bind(body)
     .execute(&mut *tx)
     .await?;
+    // A reply is a conversation continuing — it reopens a thread someone
+    // closed, whoever answers. The resolve bit stays with `resolve`; it just
+    // yields to new words.
+    sqlx::query(
+        "UPDATE review_comments SET status = 'submitted', updated_at = ?
+         WHERE id = ? AND status = 'resolved'",
+    )
+    .bind(now_iso())
+    .bind(comment_id)
+    .execute(&mut *tx)
+    .await?;
+    let mut comment = sqlx::query_as::<_, ReviewComment>(&format!("{SELECT_COMMENT} WHERE id = ?"))
+        .bind(comment_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    attach_replies(&mut *tx, std::slice::from_mut(&mut comment)).await?;
+    tx.commit().await?;
+    Ok(comment)
+}
+
+/// One author's own words, checked against the reply row: the speaker who
+/// wrote a reply may rewrite it, and nobody else may — not another operator,
+/// not the reviewed session.
+async fn require_reply_authorship(
+    tx: &mut crate::db::DbTransaction<'_>,
+    reply_id: i64,
+    author: ReplyAuthor<'_>,
+) -> Result<(i64, i64)> {
+    let (comment_id, review_id): (i64, i64) = sqlx::query_as(
+        "SELECT comment_id, (SELECT review_id FROM review_comments WHERE id = review_comment_replies.comment_id)
+         FROM review_comment_replies WHERE id = ?",
+    )
+    .bind(reply_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| anyhow!("review reply not found"))?;
+    let (status, review_session, reply_upto): (String, String, i64) =
+        sqlx::query_as("SELECT status, session_id, reply_upto FROM reviews WHERE id = ?")
+            .bind(review_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if status != "submitted" {
+        bail!("reply threads attach to submitted reviews only; this one is {status}");
+    }
+    let (author_kind, author_name): (String, String) =
+        sqlx::query_as("SELECT author_kind, author FROM review_comment_replies WHERE id = ?")
+            .bind(reply_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    match author {
+        ReplyAuthor::Operator(name) if author_kind == "operator" && author_name == name => {}
+        ReplyAuthor::Session(session_id)
+            if author_kind == "session" && review_session == session_id => {}
+        _ => bail!("only the reply's own author may rewrite it"),
+    }
+    // Delivered words are history: the reviewed session has already read an
+    // operator reply at or below the cursor, so it freezes exactly like
+    // submitted comment content. A session's own replies are not
+    // delivery-tracked — the reviewer reads them live — so they stay the
+    // session's to revise.
+    if author_kind == "operator" && reply_id <= reply_upto {
+        bail!("this reply already reached the session; delivered words are history");
+    }
+    Ok((comment_id, review_id))
+}
+
+/// Rewrite one reply's body in place. Only the reply's own author, and only
+/// words the reviewed session has not received yet. The comment a reply
+/// answers never changes.
+pub async fn update_reply(
+    db: &Db,
+    reply_id: i64,
+    author: ReplyAuthor<'_>,
+    body: &str,
+) -> Result<ReviewComment> {
+    let body = body.trim();
+    if body.is_empty() {
+        bail!("reply body must not be empty");
+    }
+    if body.len() > MAX_COMMENT_BYTES {
+        bail!("reply exceeds the 8 KiB comment limit");
+    }
+    let mut tx = crate::db::begin_immediate(db).await?;
+    let (comment_id, _) = require_reply_authorship(&mut tx, reply_id, author).await?;
+    sqlx::query("UPDATE review_comment_replies SET body = ? WHERE id = ?")
+        .bind(body)
+        .bind(reply_id)
+        .execute(&mut *tx)
+        .await?;
+    let mut comment = sqlx::query_as::<_, ReviewComment>(&format!("{SELECT_COMMENT} WHERE id = ?"))
+        .bind(comment_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    attach_replies(&mut *tx, std::slice::from_mut(&mut comment)).await?;
+    tx.commit().await?;
+    Ok(comment)
+}
+
+/// Remove one reply from its thread. The same reach `update_reply` grants: the
+/// reply's own author, before the reviewed session has received it.
+pub async fn delete_reply(
+    db: &Db,
+    reply_id: i64,
+    author: ReplyAuthor<'_>,
+) -> Result<ReviewComment> {
+    let mut tx = crate::db::begin_immediate(db).await?;
+    let (comment_id, _) = require_reply_authorship(&mut tx, reply_id, author).await?;
+    sqlx::query("DELETE FROM review_comment_replies WHERE id = ?")
+        .bind(reply_id)
+        .execute(&mut *tx)
+        .await?;
     let mut comment = sqlx::query_as::<_, ReviewComment>(&format!("{SELECT_COMMENT} WHERE id = ?"))
         .bind(comment_id)
         .fetch_one(&mut *tx)
@@ -3204,6 +3315,173 @@ mod tests {
         let preview = preview_message(&live);
         assert!(preview.contains("follow-up feedback"), "{preview}");
         assert!(preview.contains("and here is my answer"), "{preview}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_reopens_a_resolved_thread() {
+        let (db, artifact) = seeded().await;
+        let first = add(
+            &db,
+            &draft(&db, &artifact, "alice").await,
+            "the original line",
+        )
+        .await;
+        let submitted = submit(&db, first.id, "alice", first.draft_revision)
+            .await
+            .unwrap();
+        let comment_id = submitted.review.comments[0].id;
+        let resolved = set_comment_resolved(&db, first.id, comment_id, true)
+            .await
+            .unwrap();
+        assert_eq!(resolved.status, "resolved");
+
+        // A reply is the conversation continuing: whoever answers reopens
+        // the closed thread, and it stays open until resolved again.
+        let answered = reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Operator("bob"),
+            "one more thing",
+        )
+        .await
+        .unwrap();
+        assert_eq!(answered.status, "submitted", "{answered:?}");
+        let closed_again = set_comment_resolved(&db, first.id, comment_id, true)
+            .await
+            .unwrap();
+        assert_eq!(closed_again.status, "resolved");
+        let session_answer = reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Session("session-1"),
+            "the session answers",
+        )
+        .await
+        .unwrap();
+        assert_eq!(session_answer.status, "submitted");
+    }
+
+    #[tokio::test]
+    async fn the_author_revises_their_own_reply() {
+        let (db, artifact) = seeded().await;
+        let first = add(&db, &draft(&db, &artifact, "alice").await, "change this").await;
+        let submitted = submit(&db, first.id, "alice", first.draft_revision)
+            .await
+            .unwrap();
+        let comment_id = submitted.review.comments[0].id;
+        let with_reply = reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Operator("alice"),
+            "first take",
+        )
+        .await
+        .unwrap();
+        let reply_id = with_reply.replies[0].id;
+
+        // Only the reply's own author rewrites it — not another operator.
+        let err = update_reply(&db, reply_id, ReplyAuthor::Operator("bob"), "not mine")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("own author"), "{err}");
+
+        // The author revises in place: the thread gains no second entry.
+        let revised = update_reply(&db, reply_id, ReplyAuthor::Operator("alice"), "second take")
+            .await
+            .unwrap();
+        assert_eq!(revised.replies.len(), 1);
+        assert_eq!(revised.replies[0].body, "second take");
+
+        // Retraction removes the words, same reach.
+        let retracted = delete_reply(&db, reply_id, ReplyAuthor::Operator("alice"))
+            .await
+            .unwrap();
+        assert!(retracted.replies.is_empty());
+
+        // A session's reply stays the session's own words: no operator may
+        // rewrite or retract them, the session revises its own answer.
+        let answered = reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Session("session-1"),
+            "the session answers",
+        )
+        .await
+        .unwrap();
+        let session_reply = answered
+            .replies
+            .iter()
+            .find(|reply| reply.author_kind == "session")
+            .unwrap();
+        let err = update_reply(
+            &db,
+            session_reply.id,
+            ReplyAuthor::Operator("alice"),
+            "words in its mouth",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("own author"), "{err}");
+        let err = delete_reply(&db, session_reply.id, ReplyAuthor::Operator("alice"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("own author"), "{err}");
+        let revised = update_reply(
+            &db,
+            session_reply.id,
+            ReplyAuthor::Session("session-1"),
+            "the session answers, revised",
+        )
+        .await
+        .unwrap();
+        assert!(revised
+            .replies
+            .iter()
+            .any(|reply| reply.body.contains("revised")));
+    }
+
+    #[tokio::test]
+    async fn a_delivered_reply_freezes_like_submitted_comment_content() {
+        let (db, artifact) = seeded().await;
+        let first = add(&db, &draft(&db, &artifact, "alice").await, "change this").await;
+        let submitted = submit(&db, first.id, "alice", first.draft_revision)
+            .await
+            .unwrap();
+        let comment_id = submitted.review.comments[0].id;
+        let lease = claim_delivery(&db, first.id).await.unwrap().unwrap();
+        assert!(mark_delivered(&db, first.id, &lease.token).await.unwrap());
+
+        // An operator reply rides a follow-up round out to the session...
+        reply_comment(
+            &db,
+            comment_id,
+            ReplyAuthor::Operator("alice"),
+            "final words",
+        )
+        .await
+        .unwrap();
+        submit(&db, first.id, "alice", submitted.review.draft_revision)
+            .await
+            .unwrap();
+        let lease = claim_delivery(&db, first.id).await.unwrap().unwrap();
+        assert!(mark_delivered(&db, first.id, &lease.token).await.unwrap());
+        let reply_id: i64 =
+            sqlx::query_scalar("SELECT id FROM review_comment_replies WHERE comment_id = ?")
+                .bind(comment_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+
+        // ... and freezes at the cursor: the session has read it, so it is
+        // history — the author can no longer rewrite or retract it.
+        let err = update_reply(&db, reply_id, ReplyAuthor::Operator("alice"), "too late")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("history"), "{err}");
+        let err = delete_reply(&db, reply_id, ReplyAuthor::Operator("alice"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("history"), "{err}");
     }
 
     #[tokio::test]
