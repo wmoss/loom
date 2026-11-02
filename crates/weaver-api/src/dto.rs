@@ -2878,6 +2878,10 @@ pub struct SessionArchiveResult {
     pub archived: bool,
     pub kind: String,
     pub branch: String,
+    /// How many descendant sessions rode along on this archive. Always `0`
+    /// for a `launch_attempt`.
+    #[serde(default)]
+    pub children_archived: i64,
     #[serde(default)]
     pub warnings: Vec<String>,
 }

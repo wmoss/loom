@@ -792,6 +792,30 @@ pub async fn handoff_capable_for_branch(db: &Db, branch_id: &str) -> Result<Vec<
         .await?)
 }
 
+/// Every session below `id` in the launch tree — its children, and theirs —
+/// in tree order (nearest generation first). Terminal rows are excluded: this
+/// is the "who is still live under this parent" read the archive-children
+/// paths use.
+pub async fn live_descendants(db: &Db, id: &str) -> Result<Vec<Session>> {
+    let query = format!(
+        "WITH RECURSIVE tree(sid, depth) AS ( \
+           SELECT id, 0 FROM sessions WHERE id = ? \
+           UNION ALL \
+           SELECT child.id, tree.depth + 1 \
+           FROM sessions child JOIN tree ON child.parent_session_id = tree.sid \
+         ) \
+         SELECT {SESSION_COLUMNS} FROM sessions JOIN tree ON sessions.id = tree.sid \
+         WHERE tree.sid != ? AND status NOT IN ('done', 'error', 'archived') \
+         ORDER BY tree.depth, created_at"
+    );
+    let rows = sqlx::query_as::<_, Session>(&query)
+        .bind(id)
+        .bind(id)
+        .fetch_all(db)
+        .await?;
+    Ok(rows)
+}
+
 /// `(Session, Branch)` for a session id. None if the session is missing.
 pub async fn with_branch(db: &Db, id: &str) -> Result<Option<(Session, Branch)>> {
     let Some(session) = get(db, id).await? else {
@@ -1730,6 +1754,64 @@ mod tests {
         assert_eq!(
             after_warm_delete, visible_revision,
             "warm removal does not invalidate visible layout"
+        );
+    }
+
+    /// `live_descendants` walks the launch tree transitively, nearest
+    /// generation first, and skips rows nothing can archive.
+    #[tokio::test]
+    async fn live_descendants_walks_the_tree_and_skips_terminal_rows() {
+        let db = crate::db::connect_in_memory().await.unwrap();
+
+        async fn insert_child(db: &Db, id: &str, parent: &str, status: &str) {
+            let branch = branch_id(db, &format!("weaver/{id}")).await;
+            insert(db, &new_session(id, &branch, None)).await.unwrap();
+            sqlx::query("UPDATE sessions SET parent_session_id = ?, status = ? WHERE id = ?")
+                .bind(parent)
+                .bind(status)
+                .bind(id)
+                .execute(db)
+                .await
+                .unwrap();
+        }
+
+        let root_branch = branch_id(&db, "weaver/root").await;
+        insert(&db, &new_session("root", &root_branch, None))
+            .await
+            .unwrap();
+
+        insert_child(&db, "child", "root", "running").await;
+        insert_child(&db, "grandchild", "child", "suspended").await;
+        insert_child(&db, "done-child", "root", "done").await;
+        insert_child(&db, "archived-child", "root", "archived").await;
+        // A session in another tree must not be swept in.
+        insert_child(&db, "orphan", "nobody", "running").await;
+
+        let ids: Vec<String> = live_descendants(&db, "root")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["child".to_string(), "grandchild".to_string()],
+            "nearest generation first, terminal rows excluded"
+        );
+        let child_tree: Vec<String> = live_descendants(&db, "child")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(
+            child_tree,
+            vec!["grandchild".to_string()],
+            "the walk starts from any node"
+        );
+        assert!(
+            live_descendants(&db, "orphan").await.unwrap().is_empty(),
+            "a leaf has no descendants"
         );
     }
 

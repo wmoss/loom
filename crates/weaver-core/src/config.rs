@@ -30,6 +30,9 @@ pub const DEFAULT_GITHUB_POLL: bool = true;
 /// Whether loom archives a session automatically once its pull request merges.
 /// On by default — a merged branch's worktree has served its purpose.
 pub const DEFAULT_GITHUB_ARCHIVE_ON_MERGE: bool = true;
+/// Whether archiving a session also archives the children it launched.
+/// Off by default — children are archived only when asked for.
+pub const DEFAULT_ARCHIVE_CHILDREN: bool = false;
 /// The phrase an `issue_comment` must begin with to trigger a loom session via
 /// the GitHub webhook. Fixed (not free-text) in v1 to shrink the abuse surface.
 pub const DEFAULT_GITHUB_TRIGGER_PHRASE: &str = "@loom";
@@ -697,6 +700,22 @@ pub const REGISTRY: &[SettingSpec] = &[
             in a container where the default home isn't a mounted volume.",
         kind: SettingKind::String,
         default: "",
+        group: "Sessions",
+        options: &[],
+    },
+    SettingSpec {
+        key: "session.archive_children",
+        label: "When archiving a session, include its children",
+        description: "When enabled, archiving a session also archives the \
+            sessions it launched — its children, and theirs — whatever drove \
+            the archive: the command line, a merged pull request, a \
+            background retention path, or the Archive button (whose \
+            confirmation then starts with the child checkbox ticked). \
+            Each child's own `auto-archive: disabled` opt-out still holds on \
+            the automatic paths. Off by default: only the named session is \
+            archived unless its children are asked for.",
+        kind: SettingKind::Bool,
+        default: "false",
         group: "Sessions",
         options: &[],
     },

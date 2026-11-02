@@ -55,18 +55,24 @@ const fixedPermissionId = Number(process.env.FAKE_ACP_PERMISSION_ID || "0");
 const fixedOutput =
   process.env.FAKE_ACP_FIXED_OUTPUT_B64 === undefined
     ? undefined
-    : Buffer.from(process.env.FAKE_ACP_FIXED_OUTPUT_B64, "base64").toString("utf8");
+    : Buffer.from(process.env.FAKE_ACP_FIXED_OUTPUT_B64, "base64").toString(
+        "utf8",
+      );
 const summaryOutput =
   process.env.FAKE_ACP_SUMMARY_OUTPUT_B64 === undefined
     ? undefined
-    : Buffer.from(process.env.FAKE_ACP_SUMMARY_OUTPUT_B64, "base64").toString("utf8");
+    : Buffer.from(process.env.FAKE_ACP_SUMMARY_OUTPUT_B64, "base64").toString(
+        "utf8",
+      );
 let promptActive = false;
 const steeringQueue = [];
 let promptEpoch = 0;
 let promptResources = [];
 let poisoned = false;
 const singlePrompt = process.env.FAKE_ACP_SINGLE_PROMPT === "1";
-const setupUnavailableAttempts = Number(process.env.FAKE_ACP_UNAVAILABLE_ATTEMPTS || "0");
+const setupUnavailableAttempts = Number(
+  process.env.FAKE_ACP_UNAVAILABLE_ATTEMPTS || "0",
+);
 let setupAttempts = 0;
 const pending = new Map(); // our request id -> resolver awaiting the client's response
 
@@ -84,7 +90,11 @@ function rejectMethod(id, method) {
   });
 }
 function notify(update) {
-  send({ jsonrpc: JSONRPC, method: "session/update", params: { sessionId, update } });
+  send({
+    jsonrpc: JSONRPC,
+    method: "session/update",
+    params: { sessionId, update },
+  });
 }
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -106,12 +116,15 @@ const modeNames = {
   plan: "Plan",
 };
 const MODES = (
-  process.env.FAKE_ACP_MODES || "auto,default,acceptEdits,bypassPermissions,plan"
+  process.env.FAKE_ACP_MODES ||
+  "auto,default,acceptEdits,bypassPermissions,plan"
 )
   .split(",")
   .filter(Boolean)
   .map((id) => ({ id, name: modeNames[id] || id }));
-const modelValues = (process.env.FAKE_ACP_MODELS || "fake-fast,fake-deep").split(",");
+const modelValues = (
+  process.env.FAKE_ACP_MODELS || "fake-fast,fake-deep"
+).split(",");
 let currentModel = modelValues[0];
 let currentEffort = "medium";
 let currentMode = "default";
@@ -181,9 +194,16 @@ function advertiseCommands() {
 }
 
 function askPermission(name) {
-  const reqId = fixedPermissionId || 10000 + pending.size + Math.floor(Math.random() * 1000);
+  const reqId =
+    fixedPermissionId ||
+    10000 + pending.size + Math.floor(Math.random() * 1000);
   const toolCallId = "perm-tool-" + reqId;
-  const toolCall = { toolCallId, title: "Edit " + name, kind: "edit", status: "pending" };
+  const toolCall = {
+    toolCallId,
+    title: "Edit " + name,
+    kind: "edit",
+    status: "pending",
+  };
   const options = [
     { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
     { optionId: "allow-always", name: "Always allow", kind: "allow_always" },
@@ -203,8 +223,14 @@ async function handleLoad(id, params) {
   sessionId = params.sessionId;
   additionalDirectories = params.additionalDirectories || [];
   // Replay a tiny scripted history as the spec's load notifications.
-  notify({ sessionUpdate: "user_message_chunk", content: { type: "text", text: "earlier question" } });
-  notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "earlier answer" } });
+  notify({
+    sessionUpdate: "user_message_chunk",
+    content: { type: "text", text: "earlier question" },
+  });
+  notify({
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "text", text: "earlier answer" },
+  });
   // Some adapters replay an unanswered request and cannot complete load until
   // the client answers it. Tests opt into that setup-time handshake shape.
   if (loadPermission) await askPermission(loadPermission);
@@ -217,33 +243,88 @@ async function handleLoad(id, params) {
 
 async function runToken(tok) {
   if (tok === "directories") {
-    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: JSON.stringify(additionalDirectories) } });
+    notify({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: JSON.stringify(additionalDirectories) },
+    });
   } else if (tok.startsWith("say:")) {
     const text = tok.slice(4);
     const half = Math.ceil(text.length / 2);
-    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: text.slice(0, half) } });
+    notify({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: text.slice(0, half) },
+    });
     await sleep(5);
-    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: text.slice(half) } });
+    notify({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: text.slice(half) },
+    });
   } else if (tok === "tool-update-between-chunks") {
     const toolCallId = "interleaved-tool";
-    notify({ sessionUpdate: "tool_call", toolCallId, title: "Background tool", kind: "execute", status: "in_progress" });
-    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "R" } });
-    notify({ sessionUpdate: "tool_call_update", toolCallId, status: "in_progress" });
-    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "erunning" } });
-    notify({ sessionUpdate: "tool_call_update", toolCallId, status: "completed" });
+    notify({
+      sessionUpdate: "tool_call",
+      toolCallId,
+      title: "Background tool",
+      kind: "execute",
+      status: "in_progress",
+    });
+    notify({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "R" },
+    });
+    notify({
+      sessionUpdate: "tool_call_update",
+      toolCallId,
+      status: "in_progress",
+    });
+    notify({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "erunning" },
+    });
+    notify({
+      sessionUpdate: "tool_call_update",
+      toolCallId,
+      status: "completed",
+    });
   } else if (tok === "tool-update-without-start") {
     const toolCallId = "update-only-tool";
-    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "before" } });
-    notify({ sessionUpdate: "tool_call_update", toolCallId, title: "Tool", status: "completed" });
-    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "after" } });
+    notify({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "before" },
+    });
+    notify({
+      sessionUpdate: "tool_call_update",
+      toolCallId,
+      title: "Tool",
+      status: "completed",
+    });
+    notify({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "after" },
+    });
   } else if (tok === "thought-between-chunks") {
-    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "R" } });
-    notify({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "checking" } });
-    notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "erunning" } });
+    notify({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "R" },
+    });
+    notify({
+      sessionUpdate: "agent_thought_chunk",
+      content: { type: "text", text: "checking" },
+    });
+    notify({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "erunning" },
+    });
   } else if (tok.startsWith("think:")) {
-    notify({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: tok.slice(6) } });
+    notify({
+      sessionUpdate: "agent_thought_chunk",
+      content: { type: "text", text: tok.slice(6) },
+    });
   } else if (tok.startsWith("echo:")) {
-    notify({ sessionUpdate: "user_message_chunk", content: { type: "text", text: tok.slice(5) } });
+    notify({
+      sessionUpdate: "user_message_chunk",
+      content: { type: "text", text: tok.slice(5) },
+    });
   } else if (tok.startsWith("toolwait:")) {
     const [, delay, ...titleParts] = tok.split(":");
     const toolCallId = "call-wait-" + Math.floor(Math.random() * 100000);
@@ -256,10 +337,16 @@ async function runToken(tok) {
     });
     await sleepCancellable(Number(delay));
     if (!cancelled) {
-      notify({ sessionUpdate: "tool_call_update", toolCallId, status: "completed" });
+      notify({
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        status: "completed",
+      });
     }
   } else if (tok.startsWith("toolfail")) {
-    const title = tok.includes(":") ? tok.slice(tok.indexOf(":") + 1) : "Failing tool";
+    const title = tok.includes(":")
+      ? tok.slice(tok.indexOf(":") + 1)
+      : "Failing tool";
     const toolCallId = "call-fail-" + Math.floor(Math.random() * 100000);
     notify({
       sessionUpdate: "tool_call",
@@ -269,7 +356,9 @@ async function runToken(tok) {
       name: "exec_command",
       rawInput: { command: title },
       status: "in_progress",
-      content: [{ type: "content", content: { type: "text", text: "exit 1: boom" } }],
+      content: [
+        { type: "content", content: { type: "text", text: "exit 1: boom" } },
+      ],
     });
     await sleep(10);
     notify({ sessionUpdate: "tool_call_update", toolCallId, status: "failed" });
@@ -281,11 +370,18 @@ async function runToken(tok) {
       title: `View Image ${path}`,
       kind: "read",
       status: "completed",
-      content: [{ type: "content", content: { type: "resource_link", uri: path, name: path } }],
+      content: [
+        {
+          type: "content",
+          content: { type: "resource_link", uri: path, name: path },
+        },
+      ],
       locations: [{ path }],
     });
   } else if (tok === "image" || tok.startsWith("image:")) {
-    const title = tok.includes(":") ? tok.slice(tok.indexOf(":") + 1) : "Read screenshot.png";
+    const title = tok.includes(":")
+      ? tok.slice(tok.indexOf(":") + 1)
+      : "Read screenshot.png";
     const toolCallId = "call-image-" + Math.floor(Math.random() * 100000);
     notify({
       sessionUpdate: "tool_call",
@@ -315,7 +411,8 @@ async function runToken(tok) {
   } else if (tok.startsWith("tool:")) {
     const rest = tok.slice(5);
     const [kind, title] = rest.split(":");
-    const toolCallId = "call-" + kind + "-" + Math.floor(Math.random() * 100000);
+    const toolCallId =
+      "call-" + kind + "-" + Math.floor(Math.random() * 100000);
     const content =
       kind === "edit"
         ? [
@@ -333,13 +430,18 @@ async function runToken(tok) {
       title: title || "Tool " + kind,
       kind,
       name: kind === "execute" ? "exec_command" : kind,
-      rawInput: kind === "execute" ? { command: title || "Tool " + kind } : null,
+      rawInput:
+        kind === "execute" ? { command: title || "Tool " + kind } : null,
       status: "in_progress",
       content,
       locations: [{ path: "/w/file.rs", line: 1 }],
     });
     await sleep(10);
-    notify({ sessionUpdate: "tool_call_update", toolCallId, status: "completed" });
+    notify({
+      sessionUpdate: "tool_call_update",
+      toolCallId,
+      status: "completed",
+    });
   } else if (tok === "plan") {
     notify({
       sessionUpdate: "plan",
@@ -350,7 +452,11 @@ async function runToken(tok) {
     });
   } else if (tok.startsWith("usage:")) {
     const [, used, size] = tok.split(":");
-    notify({ sessionUpdate: "usage_update", used: Number(used), size: Number(size) });
+    notify({
+      sessionUpdate: "usage_update",
+      used: Number(used),
+      size: Number(size),
+    });
   } else if (tok.startsWith("task-notification:")) {
     const [, delay, ...textParts] = tok.split(":");
     const text = textParts.join(":");
@@ -379,13 +485,20 @@ async function runToken(tok) {
     await sleepCancellable(Number(process.env.FAKE_ACP_COMPACT_DELAY || "0"));
   } else if (tok.startsWith("permission:")) {
     const outcome = await askPermission(tok.slice(11));
-    if (!outcome || !outcome.outcome || outcome.outcome.outcome === "cancelled") {
+    if (
+      !outcome ||
+      !outcome.outcome ||
+      outcome.outcome.outcome === "cancelled"
+    ) {
       cancelled = true;
     }
   } else if (tok === "resources") {
     notify({
       sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: promptResources.map((r) => r.name).join(",") },
+      content: {
+        type: "text",
+        text: promptResources.map((r) => r.name).join(","),
+      },
     });
   }
 }
@@ -407,7 +520,9 @@ async function handlePrompt(id, params) {
   const epoch = ++promptEpoch;
   cancelled = false;
   promptActive = true;
-  promptResources = (params.prompt || []).filter((b) => b.type === "resource_link");
+  promptResources = (params.prompt || []).filter(
+    (b) => b.type === "resource_link",
+  );
   // The script is the prompt's first paragraph only. A real launch prompt
   // appends orientation prose (the entrance note, which echoes the session
   // title — i.e. the script itself) after a blank line; parsing past it would
@@ -429,12 +544,18 @@ async function handlePrompt(id, params) {
   }
   if (fixedOutput !== undefined) {
     if (fixedOutput.length > 0) {
-      notify({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: fixedOutput } });
+      notify({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: fixedOutput },
+      });
     }
     if (id !== null) respond(id, { stopReason: "end_turn" });
     return;
   }
-  if (summaryOutput !== undefined && text.startsWith("Summarize this coding session")) {
+  if (
+    summaryOutput !== undefined &&
+    text.startsWith("Summarize this coding session")
+  ) {
     await sleepCancellable(Number(process.env.FAKE_ACP_SUMMARY_DELAY || "0"));
     if (summaryOutput.length > 0) {
       notify({
@@ -460,7 +581,8 @@ async function handlePrompt(id, params) {
     }
   }
   promptActive = false;
-  if (id !== null) respond(id, { stopReason: cancelled ? "cancelled" : "end_turn" });
+  if (id !== null)
+    respond(id, { stopReason: cancelled ? "cancelled" : "end_turn" });
 }
 
 function handleSteering(id, params) {
@@ -487,7 +609,9 @@ function handleMessage(msg) {
   // Integration tests use this to model an adapter process that stays alive
   // but never answers one setup stage — the production failure behind a create
   // request that otherwise waits forever.
-  const ignoredMethods = new Set((process.env.FAKE_ACP_IGNORE_METHOD || "").split(",").filter(Boolean));
+  const ignoredMethods = new Set(
+    (process.env.FAKE_ACP_IGNORE_METHOD || "").split(",").filter(Boolean),
+  );
   if (ignoredMethods.has(msg.method)) return;
   if (
     (msg.method === "session/new" || msg.method === "session/load") &&
@@ -513,7 +637,9 @@ function handleMessage(msg) {
         protocolVersion: 1,
         agentCapabilities: { loadSession: true, promptCapabilities: {} },
         agentInfo: { name: agentName, version: agentVersion },
-        ...(steeringSupported ? { _meta: { steering: { supported: true } } } : {}),
+        ...(steeringSupported
+          ? { _meta: { steering: { supported: true } } }
+          : {}),
       });
       break;
     case "session/new":
@@ -531,7 +657,10 @@ function handleMessage(msg) {
       break;
     case "session/set_mode":
       currentMode = msg.params.modeId;
-      notify({ sessionUpdate: "current_mode_update", currentModeId: msg.params.modeId });
+      notify({
+        sessionUpdate: "current_mode_update",
+        currentModeId: msg.params.modeId,
+      });
       respond(msg.id, {});
       break;
     case "session/set_config_option":
@@ -548,13 +677,17 @@ function handleMessage(msg) {
           send({
             jsonrpc: JSONRPC,
             id: msg.id,
-            error: { code: -32602, message: `Model ${msg.params.value} is not available` },
+            error: {
+              code: -32602,
+              message: `Model ${msg.params.value} is not available`,
+            },
           });
           break;
         }
         currentModel = msg.params.value;
       }
-      if (msg.params.configId === "thought_level") currentEffort = msg.params.value;
+      if (msg.params.configId === "thought_level")
+        currentEffort = msg.params.value;
       if (msg.params.configId === "mode") currentMode = msg.params.value;
       if (msg.params.configId === "fast-mode") fastMode = msg.params.value;
       respond(msg.id, { configOptions: configOptions() });

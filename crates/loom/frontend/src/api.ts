@@ -201,7 +201,28 @@ export const decidePermissionRequest = (
 /** Durable automation launch reservations, including failures that never
  *  produced a usable session. */
 export const listRuns = () => invokeOperation('runs.list', {});
-export const archiveSession = (id: string) => invokeOperation('sessions.archive', { session: id });
+/** Archive a session, keeping its branch, conversation, and Loom history.
+ * `children` decides whether the sessions it launched ride along; leaving it
+ * out follows the server's `session.archive_children` setting. */
+export const archiveSession = (id: string, children?: boolean) =>
+  invokeOperation('sessions.archive', { session: id, children });
+/** The server-wide `session.archive_children` default, so the archive
+ * confirmation's child checkbox starts the way the operator set it. Accepts
+ * the same truthy spellings the server's `get_bool` does; reads best-effort:
+ * an unreachable settings call leaves the box unchecked. */
+export async function archiveChildrenDefault(): Promise<boolean> {
+  try {
+    const res = await invokeOperation('settings.get', {});
+    const value =
+      res.settings
+        .find((setting) => setting.key === 'session.archive_children')
+        ?.value?.trim()
+        .toLowerCase() ?? '';
+    return ['true', '1', 'yes', 'on'].includes(value);
+  } catch {
+    return false;
+  }
+}
 /** Suspend a session: stop its runtime to free memory, keeping the session,
  *  worktree, and branch in place. */
 export const suspendSession = (id: string) => invokeOperation('sessions.suspend', { session: id });

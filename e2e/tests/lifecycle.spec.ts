@@ -155,7 +155,7 @@ test.describe('session lifecycle actions', () => {
     const dialog = page.getByTestId('confirm-dialog');
     await expect(dialog).toContainText('Archive this session?');
     await expect(dialog.getByTestId('confirm-dialog-option')).toContainText(
-      'Also archive 1 child session',
+      'Also archive child sessions',
     );
     await dialog.getByTestId('confirm-dialog-option').getByRole('checkbox').check();
     await page.getByTestId('confirm-dialog-confirm').click();
@@ -176,11 +176,51 @@ test.describe('session lifecycle actions', () => {
     await page.getByTestId('action-archive').click();
     const dialog = page.getByTestId('confirm-dialog');
     await expect(dialog.getByTestId('confirm-dialog-option')).toContainText(
-      'Also archive 1 child session',
+      'Also archive child sessions',
     );
     await page.getByTestId('confirm-dialog-confirm').click();
     await expect.poll(async () => (await weaver.getSession(parent.id)).status).toBe('archived');
     expect((await weaver.getSession(child.id)).status).not.toBe('archived');
+  });
+
+  // The checkbox's starting state is the UI contract; the sweep itself is
+  // covered by the archive integration tests. The add-on only renders when a
+  // child exists, so the pair seeds one.
+  test('the archive-children setting pre-ticks the confirmation', async ({ page, weaver }) => {
+    const parent = await weaver.seedSession({ goal: 'Setting parent', name: 'setting-parent' });
+    await weaver.seedSession({
+      goal: 'Setting child',
+      name: 'setting-child',
+      parent: parent.branch.id,
+    });
+
+    const patch = await fetch(`${weaver.baseUrl}/api/settings/patch`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ changes: { 'session.archive_children': true } }),
+    });
+    expect(patch.ok).toBeTruthy();
+
+    try {
+      await page.goto(`${weaver.baseUrl}/s/${parent.id}`);
+      await page.getByRole('button', { name: /Details/ }).click();
+      await page.getByTestId('action-archive').click();
+      const dialog = page.getByTestId('confirm-dialog');
+      await expect(dialog.getByTestId('confirm-dialog-option')).toContainText(
+        'Also archive child sessions',
+      );
+      // The checkbox starts ticked from the setting — the user can still uncheck it.
+      await expect(dialog.getByTestId('confirm-dialog-option').getByRole('checkbox')).toBeChecked();
+    } finally {
+      // The setting is worker-global and the per-test reset does not clear
+      // it — restore it however the assertions went.
+      const restore = await fetch(`${weaver.baseUrl}/api/settings/patch`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ changes: { 'session.archive_children': null } }),
+      });
+      expect(restore.ok).toBeTruthy();
+    }
   });
 
   test('bulk archive from the selection toolbar can include children', async ({ page, weaver }) => {
@@ -197,7 +237,7 @@ test.describe('session lifecycle actions', () => {
     const dialog = page.getByTestId('confirm-dialog');
     await expect(dialog).toContainText('Archive 1 selected session?');
     await expect(dialog.getByTestId('confirm-dialog-option')).toContainText(
-      'Also archive 1 child session',
+      'Also archive child sessions',
     );
     await dialog.getByTestId('confirm-dialog-option').getByRole('checkbox').check();
     await page.getByTestId('confirm-dialog-confirm').click();

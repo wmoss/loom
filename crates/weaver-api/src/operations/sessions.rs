@@ -32,6 +32,11 @@ pub mod archive {
     pub struct Input {
         #[operand(context)]
         pub session: String,
+        /// Whether to also archive the sessions this one launched — its
+        /// children, and theirs. Unspecified follows the
+        /// `session.archive_children` setting; the archive confirmation offers
+        /// the same choice pre-ticked to that setting.
+        pub children: Option<bool>,
     }
 
     pub type Output = SessionArchiveResult;

@@ -412,16 +412,10 @@ export function lifecycleActions(s: SessionSummary): LifecycleAction[] {
   return actions;
 }
 
-// The count phrase every archive confirmation option shares, so the singular
-// and plural read the same wherever children can ride along.
-export const childSessionsPhrase = (count: number): string =>
-  `${count} child session${count === 1 ? '' : 's'}`;
-
 // One index of session parentage, shared by every surface that asks "who
-// launched this session": the fleet tree (SessionList), the archive
-// confirmation's child count, and any other ancestry read. Parentage is the
-// persisted `parent_session_id`, else the legacy branch-id `parent_id` when
-// it names exactly one row.
+// launched this session" — the fleet tree (SessionList) and any other
+// ancestry read. Parentage is the persisted `parent_session_id`, else the
+// legacy branch-id `parent_id` when it names exactly one row.
 export interface SessionAncestry {
   parentOf(session: SessionSummary): SessionSummary | undefined;
   childrenOf(id: string): SessionSummary[];
@@ -451,23 +445,28 @@ export function sessionAncestry(sessions: SessionSummary[]): SessionAncestry {
   return { parentOf, childrenOf: (id) => children.get(id) ?? [] };
 }
 
-// The sessions whose delegation thread roots at `id`, in tree order: direct
-// children first, then their children, transitively. The visited set cuts
-// cycles that corrupt legacy ancestry can contain.
-export function sessionDescendants(sessions: SessionSummary[], id: string): SessionSummary[] {
-  const { childrenOf } = sessionAncestry(sessions);
-  const out: SessionSummary[] = [];
-  const seen = new Set<string>([id]);
-  function visit(root: string) {
-    for (const child of childrenOf(root)) {
-      if (seen.has(child.id)) continue;
-      seen.add(child.id);
-      out.push(child);
-      visit(child.id);
+// Whether an archive of `id` would sweep anything at all: some loaded live
+// session's `parent_session_id` chain reaches `id` — the same edges the
+// server's `live_descendants` walk follows (including through terminal
+// intermediates), reduced to a yes/no. The archive prompts hide their add-on
+// when this is false; they then leave the request's `children` operand unset
+// so the server's own default still covers a stale snapshot.
+export function hasLiveDescendants(sessions: SessionSummary[], id: string): boolean {
+  const byId = new Map(sessions.map((session) => [session.id, session]));
+  const isLive = (session: SessionSummary) =>
+    !['done', 'error', 'archived'].includes(session.status);
+  const descendsFromId = (session: SessionSummary): boolean => {
+    const walked = new Set<string>();
+    let current: SessionSummary | undefined = session;
+    while (current?.parent_session_id) {
+      if (current.parent_session_id === id) return true;
+      if (walked.has(current.id)) return false; // corrupt ancestry cycle
+      walked.add(current.id);
+      current = byId.get(current.parent_session_id);
     }
-  }
-  visit(id);
-  return out;
+    return false;
+  };
+  return sessions.some((session) => isLive(session) && descendsFromId(session));
 }
 
 // ---------------------------------------------------------------------------
