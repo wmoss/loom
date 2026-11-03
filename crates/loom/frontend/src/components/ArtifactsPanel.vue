@@ -670,6 +670,16 @@ onUnmounted(() => {
             }}{{ a.archived_at ? ' · archived' : '' }} · v{{ a.rev }}
           </option>
         </select>
+        <button
+          type="button"
+          class="shrink-0 rounded border border-line px-1.5 py-0.5 text-xs"
+          :class="showArchived ? 'text-fg' : 'text-muted'"
+          data-testid="artifact-show-archived-mobile"
+          :title="showArchived ? 'Hide archived artifacts' : 'Include archived artifacts'"
+          @click="toggleArchived"
+        >
+          {{ showArchived ? 'Hide archived' : 'Archived' }}
+        </button>
       </div>
 
       <!-- Compact list: a dropdown header for the desktop split rail. -->
@@ -686,6 +696,16 @@ onUnmounted(() => {
             }}{{ a.archived_at ? ' · archived' : '' }} · v{{ a.rev }}
           </option>
         </select>
+        <button
+          type="button"
+          class="shrink-0 rounded border border-line px-1.5 py-0.5 text-xs"
+          :class="showArchived ? 'text-fg' : 'text-muted'"
+          data-testid="artifact-show-archived-compact"
+          :title="showArchived ? 'Hide archived artifacts' : 'Include archived artifacts'"
+          @click="toggleArchived"
+        >
+          {{ showArchived ? 'Hide archived' : 'Archived' }}
+        </button>
       </div>
 
       <!-- Viewer -->

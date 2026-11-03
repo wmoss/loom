@@ -875,8 +875,25 @@ async fn artifact_archive_hides_until_all_and_restore_is_lossless() {
         "a repo-shared document is visible from another session"
     );
 
+    // One open discussion thread, so archiving can be shown to keep it.
+    env.run(&[
+        "artifacts",
+        "comment",
+        "brief",
+        "--quote",
+        "Body.",
+        "note",
+        "this",
+    ]);
+
     let out = env.run(&["artifacts", "archive", "brief", "--repo"]);
     assert_eq!(out.trim(), "archived brief (rev 1)");
+
+    // A thread opened before archiving still lists afterwards: history and
+    // discussion are not part of the visibility state.
+    assert!(env
+        .run(&["artifacts", "threads", "brief"])
+        .contains("Body."));
 
     // Gone from both sessions' default listings, still reachable by name.
     assert!(!env.run(&["artifacts", "ls"]).contains("brief"));
@@ -914,6 +931,13 @@ async fn artifact_archive_hides_until_all_and_restore_is_lossless() {
     assert!(
         refusal.contains("archived"),
         "refusal names the state: {refusal}"
+    );
+    // Resolution, not the flag, decides: without `--repo` this branch has no
+    // copy, so the name resolves to the same archived shared row and is refused.
+    let refused_plain = env.run_raw(&["artifacts", "write", "brief"]);
+    assert!(
+        !refused_plain.status.success(),
+        "a plain write resolves the archived shared artifact and is refused"
     );
 
     // Restore is lossless: same revision, visible to both sessions again.
