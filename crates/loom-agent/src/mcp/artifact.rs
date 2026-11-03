@@ -226,7 +226,15 @@ mod tests {
     #[test]
     fn capability_sets_are_grouped_by_grant() {
         assert_eq!(expand_tool_set("loom/artifacts/read@v1").unwrap().len(), 4);
-        assert_eq!(expand_tool_set("loom/artifacts/write@v1").unwrap().len(), 4);
+        // write, archive, restore, delete, comment, resolve.
+        let write = expand_tool_set("loom/artifacts/write@v1").unwrap();
+        assert_eq!(write.len(), 6);
+        assert!(write
+            .iter()
+            .any(|rule| rule == "mcp__loom__artifact_archive"));
+        assert!(write
+            .iter()
+            .any(|rule| rule == "mcp__loom__artifact_restore"));
         assert!(expand_tool_set("mcp/artifact/read@v1").is_none());
     }
 }
