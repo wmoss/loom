@@ -161,9 +161,6 @@ pub mod restore {
     use super::prelude::*;
 
     /// Restore an archived artifact, making it visible in listings again.
-    ///
-    /// Restoring is lossless: the envelope, its revisions, reviews, and review
-    /// threads were never removed.
     #[operation(id = "artifacts.restore", actor = SessionSelf, scope = Branch, risk = Write,
                 grants = ["loom/artifacts/write@v1"], cli = "artifacts restore",
                 render = custom)]

@@ -25,8 +25,6 @@ fn row(artifact: &ArtifactMeta) -> String {
     } else {
         format!("  {}", artifact.title)
     };
-    // Archiving is a visibility state, so `--all` has to say which rows it is
-    // showing or the listing reads as if nothing changed.
     let archived = if artifact.archived_at.is_some() {
         "  [archived]"
     } else {

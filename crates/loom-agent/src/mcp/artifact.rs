@@ -88,12 +88,6 @@ fn repo_scope(arguments: &Value) -> Result<bool> {
     }
 }
 
-/// `all` in this adapter's arguments: include archived artifacts. Anything but a
-/// literal `true` keeps the default (hidden).
-fn include_archived(arguments: &Value) -> bool {
-    matches!(arguments.get("all"), Some(Value::Bool(true)))
-}
-
 fn call_boxed(name: &str, arguments: Value) -> ToolFuture {
     let name = name.to_string();
     Box::pin(async move { call_tool(&name, arguments).await })
@@ -135,7 +129,7 @@ async fn with_dashboard_url(
             let mut artifacts = client
                 .invoke::<artifacts::list::Op>(&artifacts::list::Input {
                     repo,
-                    all: include_archived(&arguments),
+                    all: matches!(arguments.get("all"), Some(Value::Bool(true))),
                     branch: branch.to_string(),
                 })
                 .await?;

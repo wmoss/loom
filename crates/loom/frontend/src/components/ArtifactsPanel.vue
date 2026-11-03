@@ -59,8 +59,6 @@ const router = useRouter();
 
 const list = ref<ArtifactMeta[]>([]);
 const listError = ref('');
-/** Whether retired documents are listed. Off by default so the pane stays a
- *  list of what is live; archived rows are still reachable by deep link. */
 const showArchived = ref(false);
 
 // True once we're the visible surface. Default-on so the panel works standalone.

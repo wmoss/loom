@@ -39,8 +39,6 @@ pub struct Artifact {
     /// The latest revision number (joined from `artifact_versions`); 0 when the
     /// artifact somehow has no version (never, post-[`write`]).
     pub rev: i64,
-    /// When the artifact was archived, or `None` while it is active. Archiving
-    /// only hides it from listings; the envelope and its versions stay.
     pub archived_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,

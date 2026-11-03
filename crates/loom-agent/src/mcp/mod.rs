@@ -1312,9 +1312,6 @@ mod tests {
                 "loom/channels/write@v1",
                 "sha256:1b4861c1299557e09ae666883f0fe58a9f26f50503c4ab6ed7c5ff87c9889aa5",
             ),
-            // Artifacts: `archive`/`restore` joined the write set, `list` gained
-            // `all`, and ArtifactMeta gained `archived_at` — membership and
-            // schemas both moved with migration 21.
             (
                 "loom/artifacts/read@v1",
                 "sha256:0d30a77b6ce8298c95eb36217e6c0217c0e8b15756fad577659a3d8eab94795b",
