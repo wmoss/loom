@@ -31,6 +31,8 @@ fn exports() -> &'static [Export] {
             export::<artifacts::list::Op>("list"),
             export::<artifacts::get::Op>("get"),
             export::<artifacts::write::Op>("write"),
+            export::<artifacts::archive::Op>("archive"),
+            export::<artifacts::restore::Op>("restore"),
             export::<artifacts::delete::Op>("delete"),
             export::<artifacts::history::Op>("history"),
             export::<artifacts::threads::list::Op>("threads"),
@@ -63,7 +65,9 @@ fn capability_sets() -> &'static [CapabilitySet] {
 fn describe_capability(grant: &str) -> &'static str {
     match grant {
         "loom/artifacts/read@v1" => "List and read versioned artifacts and their discussions.",
-        "loom/artifacts/write@v1" => "Write, delete, comment on, and resolve versioned artifacts.",
+        "loom/artifacts/write@v1" => {
+            "Write, archive, restore, delete, comment on, and resolve versioned artifacts."
+        }
         _ => "Versioned artifact operations.",
     }
 }
@@ -82,6 +86,12 @@ fn repo_scope(arguments: &Value) -> Result<bool> {
         "repo" => Ok(true),
         value => bail!("scope must be 'branch' or 'repo', got '{value}'"),
     }
+}
+
+/// `all` in this adapter's arguments: include archived artifacts. Anything but a
+/// literal `true` keeps the default (hidden).
+fn include_archived(arguments: &Value) -> bool {
+    matches!(arguments.get("all"), Some(Value::Bool(true)))
 }
 
 fn call_boxed(name: &str, arguments: Value) -> ToolFuture {
@@ -125,6 +135,7 @@ async fn with_dashboard_url(
             let mut artifacts = client
                 .invoke::<artifacts::list::Op>(&artifacts::list::Input {
                     repo,
+                    all: include_archived(&arguments),
                     branch: branch.to_string(),
                 })
                 .await?;

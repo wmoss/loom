@@ -1590,6 +1590,9 @@ pub struct ArtifactMeta {
     pub branch_id: Option<String>,
     /// The latest revision number.
     pub rev: i64,
+    /// When the artifact was archived, or `null` while it is active. Archiving
+    /// only hides it from listings; the document and its history remain.
+    pub archived_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
