@@ -70,7 +70,7 @@ running server's machine-readable contract.
 
 Session **Review → Artifacts** lists branch and shared documents, renders a
 selected revision, and exposes source editing as a secondary mode. Saving an
-edit creates a new revision. `Archived` in the list header includes retired
+edit creates a new revision. `Show archived` in the list header includes retired
 documents, and an archived document's toolbar offers Restore instead of Edit.
 The panel can dock in the work area or open beside Conversation/Agent without
 creating a global Artifacts destination.

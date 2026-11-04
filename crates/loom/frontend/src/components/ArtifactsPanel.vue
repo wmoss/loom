@@ -406,39 +406,27 @@ async function remove() {
 const archiving = ref(false);
 const restoring = ref(false);
 
-// Archiving is reversible, so the confirmation is a heads-up, not a barrier: on
-// a shared document it removes the doc from every session's list.
 async function archive() {
   const identity = loaded.value;
   if (!identity || archiving.value) return;
   const name = identity.name;
-  const shared = identity.view.meta.branch_id == null;
-  await confirmAction({
-    title: `Archive artifact "${name}"?`,
-    description: shared
-      ? 'It leaves the artifact list of every session in this repo. Nothing is deleted — the "Archived" toggle restores it.'
-      : 'It leaves this session\'s artifact list. Nothing is deleted — the "Archived" toggle restores it.',
-    confirmLabel: 'Archive',
-    action: async () => {
-      archiving.value = true;
-      viewError.value = '';
-      try {
-        await archiveArtifact(props.id, name);
-        // Keep it on screen while archived rows are visible, so the toolbar
-        // flips to Restore in place; otherwise fall back like a delete.
-        if (showArchived.value) {
-          await loadList();
-          await openArtifact(name, undefined, { keepMode: true });
-        } else {
-          await advanceAfterRemoval();
-        }
-      } catch (e) {
-        viewError.value = (e as Error).message;
-      } finally {
-        archiving.value = false;
-      }
-    },
-  });
+  archiving.value = true;
+  viewError.value = '';
+  try {
+    await archiveArtifact(props.id, name);
+    // Keep it on screen while archived rows are visible, so the toolbar
+    // flips to Restore in place; otherwise fall back like a delete.
+    if (showArchived.value) {
+      await loadList();
+      await openArtifact(name, undefined, { keepMode: true });
+    } else {
+      await advanceAfterRemoval();
+    }
+  } catch (e) {
+    viewError.value = (e as Error).message;
+  } finally {
+    archiving.value = false;
+  }
 }
 
 async function restore() {
@@ -610,10 +598,10 @@ onUnmounted(() => {
             class="rounded px-1 py-0.5 normal-case tracking-normal hover:bg-subtle"
             :class="showArchived ? 'text-fg' : 'text-faint'"
             data-testid="artifact-show-archived"
-            :title="showArchived ? 'Hide archived artifacts' : 'Include archived artifacts'"
+            :title="showArchived ? 'Hide archived artifacts' : 'Show archived artifacts'"
             @click="toggleArchived"
           >
-            {{ showArchived ? 'Hide archived' : 'Archived' }}
+            {{ showArchived ? 'Hide archived' : 'Show archived' }}
           </button>
         </div>
         <div class="min-h-0 flex-1 overflow-auto py-1 text-sm">
@@ -673,10 +661,10 @@ onUnmounted(() => {
           class="shrink-0 rounded border border-line px-1.5 py-0.5 text-xs"
           :class="showArchived ? 'text-fg' : 'text-muted'"
           data-testid="artifact-show-archived-mobile"
-          :title="showArchived ? 'Hide archived artifacts' : 'Include archived artifacts'"
+          :title="showArchived ? 'Hide archived artifacts' : 'Show archived artifacts'"
           @click="toggleArchived"
         >
-          {{ showArchived ? 'Hide archived' : 'Archived' }}
+          {{ showArchived ? 'Hide archived' : 'Show archived' }}
         </button>
       </div>
 
@@ -699,10 +687,10 @@ onUnmounted(() => {
           class="shrink-0 rounded border border-line px-1.5 py-0.5 text-xs"
           :class="showArchived ? 'text-fg' : 'text-muted'"
           data-testid="artifact-show-archived-compact"
-          :title="showArchived ? 'Hide archived artifacts' : 'Include archived artifacts'"
+          :title="showArchived ? 'Hide archived artifacts' : 'Show archived artifacts'"
           @click="toggleArchived"
         >
-          {{ showArchived ? 'Hide archived' : 'Archived' }}
+          {{ showArchived ? 'Hide archived' : 'Show archived' }}
         </button>
       </div>
 

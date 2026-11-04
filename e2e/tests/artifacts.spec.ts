@@ -212,7 +212,6 @@ test.describe('artifacts surface', () => {
 
     // Archive from the toolbar: it leaves the list, the rest stays.
     await page.getByTestId('artifact-archive').click();
-    await page.getByTestId('confirm-dialog-confirm').click();
     await expect(page.locator('[data-artifact="stale-brief"]')).toHaveCount(0);
     await expect(page.locator('[data-artifact="keep"]')).toBeVisible();
 
