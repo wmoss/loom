@@ -436,7 +436,12 @@ function openStream() {
     const d = ev.data as { artifact?: string; thread?: number };
     commentsRef.value?.onCommentEvent('comment_resolved', d);
   });
-  for (const kind of ['review_submitted', 'review_delivery', 'review_comment_resolved']) {
+  for (const kind of [
+    'review_submitted',
+    'review_delivery',
+    'review_comment_resolved',
+    'review_comment_replied',
+  ]) {
     source.on(kind, (ev) => {
       const d = ev.data as {
         subject_key?: string;

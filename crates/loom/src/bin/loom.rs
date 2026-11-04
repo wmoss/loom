@@ -1030,7 +1030,7 @@ mod tests {
     /// Every `loom review` word still parses, and each reaches the half that
     /// owns it.
     ///
-    /// The bundle is split: five commands come from their operation's
+    /// The bundle is split: four commands come from their operation's
     /// declaration and are dispatched generically, and the rest stay
     /// hand-written because one declaration cannot express what they do. A
     /// command silently changing sides is exactly the drift this catches.
@@ -1104,15 +1104,7 @@ mod tests {
             ],
             vec!["loom", "review", "resolve", "4", "9"],
             vec!["loom", "review", "reopen", "4", "9"],
-            vec![
-                "loom",
-                "review",
-                "submit",
-                "4",
-                "--revision",
-                "2",
-                "--acknowledge-outdated",
-            ],
+            vec!["loom", "review", "submit", "4", "--revision", "2"],
         ] {
             let spelled = args.join(" ");
             assert!(
@@ -1141,10 +1133,6 @@ mod tests {
             (
                 vec!["loom", "review", "discard", "4", "--revision", "2"],
                 "reviews.discard",
-            ),
-            (
-                vec!["loom", "review", "retarget", "4", "--revision", "2"],
-                "reviews.retarget",
             ),
             (
                 vec!["loom", "review", "retry", "4"],

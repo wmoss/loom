@@ -1,6 +1,6 @@
 use std::path::Path as FsPath;
 use weaver_api::operations::sessions as ops;
-use weaver_api::ChangeSetDto;
+use weaver_api::{ChangeFileContentDto, ChangeSetDto};
 
 use super::operations::{register, Bound, OperationContext};
 use super::{require_session, ApiResult};
@@ -8,13 +8,37 @@ use super::{require_session, ApiResult};
 /// The `sessions.changes` operation binding, folded into the `sessions`
 /// bundle by [`super::sessions::bound_operations`].
 pub(super) fn bound_operations() -> Vec<Bound> {
-    vec![register::<ops::changes::Op, _, _>(op_changes)]
+    vec![
+        register::<ops::changes::get::Op, _, _>(op_changes),
+        register::<ops::changes::content::Op, _, _>(op_changes_content),
+    ]
+}
+
+/// The `sessions.changes.content` binding: one file's whole text, read on
+/// demand when the snapshot's bounds left it out.
+async fn op_changes_content(
+    context: OperationContext,
+    input: ops::changes::content::Input,
+) -> ApiResult<ChangeFileContentDto> {
+    let (session, branch) = require_session(&context.state.db, &input.session).await?;
+    Ok(crate::changes::file_contents(
+        FsPath::new(&session.work_dir),
+        &branch.base_branch,
+        input.rev.as_deref(),
+        &input.path,
+    )
+    .await?)
 }
 
 async fn op_changes(
     context: OperationContext,
-    input: ops::changes::Input,
+    input: ops::changes::get::Input,
 ) -> ApiResult<ChangeSetDto> {
     let (session, branch) = require_session(&context.state.db, &input.session).await?;
-    Ok(crate::changes::load(FsPath::new(&session.work_dir), &branch.base_branch).await?)
+    Ok(crate::changes::load_for_review(
+        FsPath::new(&session.work_dir),
+        &branch.base_branch,
+        input.rev.as_deref(),
+    )
+    .await?)
 }

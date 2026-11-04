@@ -72,10 +72,22 @@ async fn enqueue_review_once(
     .execute(&mut *tx)
     .await?;
     if completed.rows_affected() == 1 {
+        // The delivered cursors move here, never at submit (see
+        // review::mark_delivered for the terminal twin of this transition).
+        let (comment_upto, reply_upto, delivered_summary): (i64, i64, String) = sqlx::query_as(
+            "SELECT comment_upto, reply_upto, summary FROM review_delivery_outbox WHERE review_id = ?",
+        )
+        .bind(item.id)
+        .fetch_one(&mut *tx)
+        .await?;
         sqlx::query(
-            "UPDATE reviews SET delivery_state = 'delivered', delivery_error = NULL
+            "UPDATE reviews SET delivery_state = 'delivered', delivery_error = NULL,
+                 comment_upto = ?, reply_upto = ?, delivered_summary = ?
              WHERE id = ? AND delivery_state = 'delivering'",
         )
+        .bind(comment_upto)
+        .bind(reply_upto)
+        .bind(delivered_summary)
         .bind(item.id)
         .execute(&mut *tx)
         .await?;
@@ -195,7 +207,13 @@ pub async fn deliver_review(state: &AppState, review_id: i64) -> Result<()> {
         // Another delivery path owns the live lease or already completed it.
         return Ok(());
     };
-    let payload = review::structured_message(&review);
+    // A follow-up round's payload was frozen at submit — comments and
+    // replies together — so a retry re-sends byte-identical text. The
+    // initial submission carries none and builds from the durable review.
+    let payload = match &lease.payload {
+        Some(frozen) => frozen.clone(),
+        None => review::structured_message(&review),
+    };
     let result: Result<()> = async {
         if target.protocol == "acp" {
             let appended =

@@ -30,15 +30,6 @@ impl Render for reviews::discard::Op {
     }
 }
 
-impl Render for reviews::retarget::Op {
-    fn text(output: &ReviewDto, _: &NoView) -> String {
-        format!(
-            "review {} targets {} version {} · draft revision {}",
-            output.id, output.subject.key, output.subject.version, output.draft_revision
-        )
-    }
-}
-
 impl Render for reviews::retry_delivery::Op {
     fn text(output: &ReviewDto, _: &NoView) -> String {
         format!("review {} · delivery {}", output.id, output.delivery_state)
