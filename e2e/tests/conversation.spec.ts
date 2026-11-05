@@ -153,17 +153,26 @@ function footDistance(conv: ReturnType<Page['getByTestId']>) {
   return conv.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
 }
 
-/** Simulate the display-toggle reset some browsers (notably Safari) apply to a
- *  scroll container hidden by `v-show`: lay it out, zero its offset, hide it again
- *  — all before paint, so Vue still believes the pane is hidden. The return path
- *  must put the reader back without relying on the browser's own restoration. */
+/** Emulate the display-toggle reset some browsers (notably Safari) apply to a
+ *  scroll container hidden by `v-show`. The real hidden ancestor is the work-area
+ *  wrapper, not the scroller's direct parent: lay that pane out invisibly, zero
+ *  the offset so the browser's saved position is genuinely lost, let the scroll
+ *  event dispatch while the app still treats the pane as inactive, then hide it
+ *  again. The return path must restore the reader's place itself. */
 async function dropHiddenScrollOffset(conv: ReturnType<Page['getByTestId']>) {
-  await conv.evaluate((el) => {
-    const wrapper = el.parentElement as HTMLElement;
-    const previous = wrapper.style.display;
-    wrapper.style.display = 'block';
+  await conv.evaluate(async (el) => {
+    let pane = el.parentElement as HTMLElement | null;
+    while (pane && getComputedStyle(pane).display !== 'none') pane = pane.parentElement;
+    if (!pane) throw new Error('conversation pane is not hidden');
+    const previousDisplay = pane.style.display;
+    pane.style.display = 'block';
+    pane.style.visibility = 'hidden';
     el.scrollTop = 0;
-    wrapper.style.display = previous;
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+    pane.style.visibility = '';
+    pane.style.display = previousDisplay;
   });
 }
 
@@ -521,10 +530,10 @@ test.describe('conversation view', () => {
     const link = conv.getByRole('link', { name: 'plan' });
     await expect(link).toBeVisible({ timeout: 30_000 });
     await link.scrollIntoViewIfNeeded();
-    // Let the scroll settle so the pin releases at this reading position.
-    await page.waitForTimeout(200);
+    // The link sits below the fold, so the reader is off the foot and the pin
+    // has released — the state the return must preserve.
+    await expect.poll(() => footDistance(conv)).toBeGreaterThan(120);
     const before = await conv.evaluate((el) => el.scrollTop);
-    expect(before).toBeGreaterThan(300);
 
     await link.click();
     await expect(page).toHaveURL(`${weaver.baseUrl}/s/${s.id}/artifacts/plan`);

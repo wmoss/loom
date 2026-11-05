@@ -8,7 +8,13 @@
 
 import { ref, watch, onScopeDispose, nextTick, type Ref } from 'vue';
 
-export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTMLElement | null>) {
+export function useFollowFoot(
+  scrollEl: Ref<HTMLElement | null>,
+  bodyEl: Ref<HTMLElement | null>,
+  /** Whether the hosting pane is on screen. When supplied, the pane state owns
+   *  the hidden→shown edge instead of inferring it from layout notifications. */
+  active?: Ref<boolean>,
+) {
   // Starts pinned, so a fresh chat scrolls to the foot as soon as it has height.
   const pinned = ref(true);
 
@@ -18,7 +24,7 @@ export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTM
   // cannot put it back when the element was not laid out as the navigation
   // landed — so remember the position while visible and restore it on return.
   let lastTop = 0;
-  let visible = true;
+  let visible = active ? active.value : true;
 
   function laidOut(el: HTMLElement): boolean {
     return el.getClientRects().length > 0;
@@ -43,7 +49,7 @@ export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTM
     const el = scrollEl.value;
     if (!el) return;
     // Hidden (display:none): the offset reads zero and writing it would discard
-    // the reader's place. The show-edge observer follows once it is laid out.
+    // the reader's place. The show edge follows once it is laid out.
     if (!laidOut(el)) return;
     el.scrollTop = el.scrollHeight;
     autoScrollTarget = el.scrollTop; // the clamped position actually applied
@@ -59,6 +65,18 @@ export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTM
     }
     if (!laidOut(el)) return;
     el.scrollTop = lastTop;
+  }
+  /** Handle a hidden pane becoming visible: follow the foot or restore the place. */
+  function returnToView() {
+    const el = scrollEl.value;
+    if (!el || !laidOut(el)) return;
+    const returning = !visible;
+    visible = true;
+    if (returning) {
+      restorePlace();
+    } else if (pinned.value) {
+      scrollToBottom();
+    }
   }
   /** Post-mutation follow: scroll after the DOM settles, only while pinned. */
   function autoFollow() {
@@ -85,6 +103,26 @@ export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTM
     lastTop = el.scrollTop;
   }
 
+  if (active) {
+    // Own the edge from the pane state. The hide half runs before the DOM flips
+    // so a reset scroll event is ignored; the show half runs after the pane has
+    // been laid out again.
+    watch(
+      active,
+      (now) => {
+        if (!now) visible = false;
+      },
+      { flush: 'sync' },
+    );
+    watch(
+      active,
+      (now) => {
+        if (now) nextTick(returnToView);
+      },
+      { flush: 'post' },
+    );
+  }
+
   // Browser scroll anchoring must be off on the container: when a late-painting
   // block lands above the viewport, anchoring silently moves scrollTop to keep
   // the view stable — a scroll we didn't make, at a position that no longer
@@ -96,7 +134,7 @@ export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTM
     el.style.overflowAnchor = 'none';
     // A replaced scroller (a fresh transcript load) starts in whatever layout
     // state the pane is in; only a later show edge should restore the place.
-    visible = laidOut(el);
+    if (!active) visible = laidOut(el);
   });
 
   let bodyRO: ResizeObserver | null = null;
@@ -106,18 +144,24 @@ export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTM
     bodyRO ??= new ResizeObserver(() => {
       const scroller = scrollEl.value;
       if (!scroller) return;
-      const nowVisible = laidOut(scroller);
-      if (!nowVisible) {
+      if (!laidOut(scroller)) {
+        // Any unrendered layout (the work-area tab, a docked artifact, or the
+        // kept-alive page being parked off-screen) means the next render is a
+        // return whose place must be restored.
         visible = false;
         return;
       }
-      const returning = !visible;
-      visible = true;
-      if (returning) {
-        restorePlace();
-      } else if (pinned.value) {
-        scrollToBottom();
+      if (active) {
+        // The pane state also owns hide/show, covering an engine that coalesces
+        // or skips the layout edge; layout notifications handle the rest.
+        if (!visible) {
+          if (active.value) returnToView();
+        } else if (pinned.value) {
+          scrollToBottom();
+        }
+        return;
       }
+      returnToView();
     });
     bodyRO.observe(el);
   });

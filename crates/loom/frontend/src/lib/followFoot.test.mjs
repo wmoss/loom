@@ -47,7 +47,7 @@ class FakeScroller {
   }
 }
 
-async function harness() {
+async function harness({ withActive = false } = {}) {
   const previousRO = globalThis.ResizeObserver;
   let onResize = null;
   globalThis.ResizeObserver = class {
@@ -60,8 +60,9 @@ async function harness() {
   const scroller = new FakeScroller();
   const scrollEl = ref(null);
   const bodyEl = ref(null);
+  const active = withActive ? ref(true) : undefined;
   const scope = effectScope();
-  const foot = scope.run(() => useFollowFoot(scrollEl, bodyEl));
+  const foot = scope.run(() => useFollowFoot(scrollEl, bodyEl, active));
   // Mirror mount: the refs start null and receive their elements after render.
   scrollEl.value = scroller;
   bodyEl.value = {};
@@ -69,6 +70,7 @@ async function harness() {
   return {
     scroller,
     foot,
+    active,
     resize: () => onResize?.(),
     done: () => {
       scope.stop();
@@ -131,6 +133,72 @@ test('a pinned reader returns to the newest exchange, not the old offset', async
     h.resize();
     assert.equal(h.foot.pinned.value, true);
     assert.equal(h.scroller.scrollTop, h.scroller.maxTop);
+  } finally {
+    h.done();
+  }
+});
+
+test('a pane-signal show restores without a layout notification', async () => {
+  const h = await harness({ withActive: true });
+  try {
+    h.resize();
+    h.scroller.scrollTop = 400;
+    h.foot.trackPin();
+
+    h.scroller.hide();
+    h.active.value = false;
+    await nextTick();
+
+    // The pane comes back, but the engine dropped the hidden offset and never
+    // delivered a ResizeObserver callback for the show.
+    h.scroller.show();
+    h.active.value = true;
+    await nextTick();
+    await nextTick();
+    assert.equal(h.scroller.scrollTop, 400);
+  } finally {
+    h.done();
+  }
+});
+
+test('a hidden pane signal ignores reset scroll events while laid out', async () => {
+  const h = await harness({ withActive: true });
+  try {
+    h.resize();
+    h.scroller.scrollTop = 400;
+    h.foot.trackPin();
+
+    // The artifact is stable, but a transient layout (or a browser reset) puts
+    // the scroller back at the top while the pane signal still says hidden.
+    h.active.value = false;
+    await nextTick();
+    h.scroller.scrollTop = 0;
+    h.foot.trackPin();
+
+    h.scroller.show();
+    h.active.value = true;
+    await nextTick();
+    await nextTick();
+    assert.equal(h.scroller.scrollTop, 400);
+  } finally {
+    h.done();
+  }
+});
+
+test('a layout hide/show restores while the pane signal stays active', async () => {
+  const h = await harness({ withActive: true });
+  try {
+    h.resize();
+    h.scroller.scrollTop = 400;
+    h.foot.trackPin();
+
+    // Keep-alive deactivation parks the page: the tab still says active, but the
+    // pane leaves the layout until the user returns.
+    h.scroller.hide();
+    h.resize();
+    h.scroller.show();
+    h.resize();
+    assert.equal(h.scroller.scrollTop, 400);
   } finally {
     h.done();
   }
