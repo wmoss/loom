@@ -6,11 +6,23 @@
 // ResizeObserver on the transcript body does the following; a one-shot scroll
 // after nextTick would race the paint and strand the view mid-history.
 
-import { ref, watch, onUnmounted, nextTick, type Ref } from 'vue';
+import { ref, watch, onScopeDispose, nextTick, type Ref } from 'vue';
 
 export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTMLElement | null>) {
   // Starts pinned, so a fresh chat scrolls to the foot as soon as it has height.
   const pinned = ref(true);
+
+  // The reader's place. A chat pane is hidden with `display:none` while an
+  // artifact is docked over it (and on the route to/from that artifact). Some
+  // browsers drop a hidden scroll container's offset, and history restoration
+  // cannot put it back when the element was not laid out as the navigation
+  // landed — so remember the position while visible and restore it on return.
+  let lastTop = 0;
+  let visible = true;
+
+  function laidOut(el: HTMLElement): boolean {
+    return el.getClientRects().length > 0;
+  }
 
   // Whether the stream is scrolled to (near) its foot. A missing scroll root
   // counts as "at the bottom" (nothing scrolled yet).
@@ -30,8 +42,23 @@ export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTM
   function scrollToBottom() {
     const el = scrollEl.value;
     if (!el) return;
+    // Hidden (display:none): the offset reads zero and writing it would discard
+    // the reader's place. The show-edge observer follows once it is laid out.
+    if (!laidOut(el)) return;
     el.scrollTop = el.scrollHeight;
     autoScrollTarget = el.scrollTop; // the clamped position actually applied
+    lastTop = el.scrollTop;
+  }
+  /** Put the reader back where they left unless they were following the foot. */
+  function restorePlace() {
+    const el = scrollEl.value;
+    if (!el) return;
+    if (pinned.value) {
+      scrollToBottom();
+      return;
+    }
+    if (!laidOut(el)) return;
+    el.scrollTop = lastTop;
   }
   /** Post-mutation follow: scroll after the DOM settles, only while pinned. */
   function autoFollow() {
@@ -47,11 +74,15 @@ export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTM
   function trackPin() {
     const el = scrollEl.value;
     if (!el) return;
+    // A hide/reset scroll event carries a meaningless zero and must not release
+    // the reader's saved place.
+    if (!visible || !laidOut(el)) return;
     if (autoScrollTarget != null) {
       if (Math.abs(el.scrollTop - autoScrollTarget) < 1) return; // our echo — the pin stands
       autoScrollTarget = null; // the reader has scrolled since — fall through and derive
     }
     pinned.value = nearBottom();
+    lastTop = el.scrollTop;
   }
 
   // Browser scroll anchoring must be off on the container: when a late-painting
@@ -61,7 +92,11 @@ export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTM
   // away and wrongly release the pin. This surface has exactly two legitimate
   // scrollers: this composable and the reader.
   watch(scrollEl, (el) => {
-    if (el) el.style.overflowAnchor = 'none';
+    if (!el) return;
+    el.style.overflowAnchor = 'none';
+    // A replaced scroller (a fresh transcript load) starts in whatever layout
+    // state the pane is in; only a later show edge should restore the place.
+    visible = laidOut(el);
   });
 
   let bodyRO: ResizeObserver | null = null;
@@ -69,11 +104,24 @@ export function useFollowFoot(scrollEl: Ref<HTMLElement | null>, bodyEl: Ref<HTM
     bodyRO?.disconnect();
     if (!el) return;
     bodyRO ??= new ResizeObserver(() => {
-      if (pinned.value) scrollToBottom();
+      const scroller = scrollEl.value;
+      if (!scroller) return;
+      const nowVisible = laidOut(scroller);
+      if (!nowVisible) {
+        visible = false;
+        return;
+      }
+      const returning = !visible;
+      visible = true;
+      if (returning) {
+        restorePlace();
+      } else if (pinned.value) {
+        scrollToBottom();
+      }
     });
     bodyRO.observe(el);
   });
-  onUnmounted(() => {
+  onScopeDispose(() => {
     bodyRO?.disconnect();
     bodyRO = null;
   });
