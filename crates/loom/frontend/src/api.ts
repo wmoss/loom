@@ -627,7 +627,18 @@ export const listArtifactReviews = (id: string, name: string) =>
     session: id,
   });
 
-export const getChanges = (id: string) => invokeOperation('sessions.changes', { session: id });
+export const getChanges = (id: string, rev?: string) =>
+  invokeOperation('sessions.changes', { session: id, ...(rev ? { rev } : {}) });
+
+/** Whole-file text for one file of a change-set, on demand. The snapshot
+ *  op attaches whole-file text only within its bounds, and the renderer
+ *  cannot offer hunk expansion without it — this reads what those bounds
+ *  left out, one mounted file at a time. */
+export const getChangesFileContent = (id: string, rev: string | null, path: string) =>
+  invokeOperation('sessions.changes.content', { session: id, rev, path });
+
+export const getSessionCommits = (id: string) =>
+  invokeOperation('sessions.commits', { session: id });
 
 export const listChangesReviews = (id: string) =>
   invokeOperation('reviews.list', {
@@ -663,6 +674,30 @@ export const updateReview = (
   body: Omit<OperationInput<'reviews.update'>, 'id'>,
 ) => invokeOperation('reviews.update', { id: reviewId, ...body });
 
+export const replyReviewComment = (session: string, commentId: number, body: string) =>
+  invokeOperation('reviews.comments.reply', {
+    session,
+    comment_id: commentId,
+    body,
+  });
+
+/** Rewrite one reply — the author's own words, before the session received
+ *  them. Returns the whole updated comment the reply belongs to. */
+export const updateReviewReply = (session: string, replyId: number, body: string) =>
+  invokeOperation('reviews.replies.update', {
+    session,
+    reply_id: replyId,
+    body,
+  });
+
+/** Retract one reply — same reach as the rewrite: its own author, while the
+ *  session has not received it yet. */
+export const deleteReviewReply = (session: string, replyId: number) =>
+  invokeOperation('reviews.replies.delete', {
+    session,
+    reply_id: replyId,
+  });
+
 export const deleteReviewComment = (
   reviewId: number,
   commentId: number,
@@ -679,16 +714,8 @@ export const deleteReviewComment = (
 export const discardReview = (reviewId: number, expectedRevision: number) =>
   invokeOperation('reviews.discard', { id: reviewId, expected_revision: expectedRevision });
 
-export const submitReview = (
-  reviewId: number,
-  body: { expected_revision: number; acknowledge_outdated: boolean },
-) => invokeOperation('reviews.submit', { id: reviewId, ...body });
-
-export const retargetReviewToCurrent = (reviewId: number, expectedRevision: number) =>
-  invokeOperation('reviews.retarget', {
-    id: reviewId,
-    expected_revision: expectedRevision,
-  });
+export const submitReview = (reviewId: number, body: { expected_revision: number }) =>
+  invokeOperation('reviews.submit', { id: reviewId, ...body });
 
 export const retryReviewDelivery = (reviewId: number) =>
   invokeOperation('reviews.retry_delivery', { id: reviewId });

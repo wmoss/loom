@@ -32,6 +32,7 @@ pub(crate) mod context;
 pub(crate) mod issue;
 pub(crate) mod messaging;
 pub(crate) mod permission;
+pub(crate) mod review;
 pub(crate) mod watch;
 
 // These stay hand-written rather than bound via `dispatch::bind` — see each
@@ -103,6 +104,7 @@ const ADAPTERS: &[&Adapter] = &[
     &session::ADAPTER,
     &messaging::ADAPTER,
     &permission::ADAPTER,
+    &review::ADAPTER,
     &watch::ADAPTER,
 ];
 
@@ -121,6 +123,16 @@ fn validate_adapters() {
     }
 }
 pub(crate) const ALLOWED_TOOLS_ENV: &str = "LOOM_MCP_ALLOWED_TOOLS";
+
+/// Reading submitted feedback on one's own work — and answering it — is
+/// inherent to every session, restricted or not: review delivery pastes the
+/// compact prompt into the session's conversation and points the agent at
+/// the `review_list` detail tool and the `review_comment_reply` response
+/// tool, so no profile restriction may strand that loop. `session_capabilities`
+/// holds these in the restricted token's floor;
+/// `effective_allowed_tool_rules_for` keeps the tools advertised.
+pub(crate) const INHERENT_REVIEW_GRANTS: &[&str] =
+    &["loom/reviews/read@v1", "loom/reviews/write@v1"];
 const BUILTIN_SERVER_NAME: &str = "loom";
 // Compute Engine's HTTP metadata endpoint is host-local and available on every
 // VM type; its HTTPS alternative is limited to Shielded VMs.
@@ -409,6 +421,11 @@ pub fn session_capabilities<'a>(
         "loom/permissions/read@v1".to_string(),
         "loom/permissions/request@v1".to_string(),
     ]);
+    capabilities.extend(
+        INHERENT_REVIEW_GRANTS
+            .iter()
+            .map(|grant| (*grant).to_string()),
+    );
     for set in sets {
         let grants = capability_set_grants(set);
         if grants.is_empty() && set.starts_with("loom/") {
@@ -513,6 +530,15 @@ pub fn effective_allowed_tool_rules_for(
     let mut rules = expand_tool_sets(&profile.allowed_tool_rules()?)?;
     for rule in rules_for_snapshot(snapshot)? {
         push_unique(&mut rules, rule);
+    }
+    // The inherent capabilities are advertised alongside whatever the profile
+    // narrows to — the same grants `session_capabilities` floors onto a
+    // restricted token would be pointless if the tools never reached the
+    // agent's tool list.
+    for grant in INHERENT_REVIEW_GRANTS {
+        for rule in expand_tool_sets(&[(*grant).to_string()])? {
+            push_unique(&mut rules, rule);
+        }
     }
     Ok(rules)
 }
@@ -1124,6 +1150,7 @@ mod tests {
                 "loom/permissions/read@v1",
                 "loom/permissions/request@v1",
             ];
+            expected_grants.extend_from_slice(super::INHERENT_REVIEW_GRANTS);
             expected_grants.extend_from_slice(grants);
             expected_grants.sort();
             assert_eq!(
@@ -1323,6 +1350,14 @@ mod tests {
             (
                 "loom/issues/read@v1",
                 "sha256:37e9afd58241a3dc68edde6a4521b02afdd0f445d4eae6910da54fea05763803",
+            ),
+            (
+                "loom/reviews/read@v1",
+                "sha256:94bc671c1def9c4272ebef62049c0f4cf70e1130347bacb32719a989a2a3af49",
+            ),
+            (
+                "loom/reviews/write@v1",
+                "sha256:eeca593097e7223bfd09aceef438d6ff86616241c2f9910dbe51d35e9dfaae1f",
             ),
             (
                 "loom/issues/write@v1",

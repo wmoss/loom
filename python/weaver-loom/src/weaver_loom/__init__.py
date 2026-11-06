@@ -351,9 +351,14 @@ class Client:
         reply = self._request("POST", "/sessions/preview", {"session": key, "lines": lines})
         return (reply or {}).get("screen", "")
 
-    def changes(self, key):
-        """Typed, bounded worktree changes relative to the session's local base."""
-        return self._request("POST", "/sessions/changes", {"session": key})
+    def changes(self, key, rev=None):
+        """Typed, bounded worktree changes relative to the session's local
+        base, one commit's own changes (``rev^..rev``) when ``rev`` is an
+        oid, or the working tree's unstaged edits when ``rev="unstaged"``."""
+        body = {"session": key}
+        if rev is not None:
+            body["rev"] = rev
+        return self._request("POST", "/sessions/changes", body)
 
     def programs(self):
         """The builtin watch program registry."""

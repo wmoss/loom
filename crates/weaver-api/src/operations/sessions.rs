@@ -77,17 +77,72 @@ pub mod wake {
 }
 
 pub mod changes {
+    //! The session's change-set snapshots, and the on-demand whole-file
+    //! text the snapshots' bounds may have left out.
+    pub(super) use super::prelude;
+
+    pub mod get {
+        use super::prelude::*;
+
+        /// The session's uncommitted worktree changes against its base branch, or —
+        /// with `rev` — the diff that one commit introduces, or with
+        /// `rev = "unstaged"` the working tree's unstaged edits alone.
+        #[operation(id = "sessions.changes", actor = SessionSelf, scope = Session, risk = Read,
+                    grants = ["loom/sessions/read@v1"], cli = "sessions changes")]
+        pub struct Input {
+            /// Which commit to review: the snapshot becomes `rev^..rev`, that
+            /// commit's own changes. The literal `unstaged` scopes to the
+            /// working tree's unstaged edits against the index. Omitted means
+            /// the whole branch state.
+            pub rev: Option<String>,
+            #[operand(context)]
+            pub session: String,
+        }
+
+        pub type Output = ChangeSetDto;
+    }
+
+    pub mod content {
+        use super::prelude::*;
+
+        /// Whole-file text for one file of a change-set, on demand.
+        ///
+        /// The snapshot op attaches whole-file text only within its bounds
+        /// — most change-sets never need more — and the renderer cannot
+        /// offer hunk expansion without it. This reads one file's both
+        /// sides under a roomier bound, since the response carries one file
+        /// rather than a change-set's worth. `rev` scopes exactly as
+        /// `sessions.changes` does; a side the snapshot does not hold
+        /// reads as absent, never as an error.
+        #[operation(id = "sessions.changes.content", actor = SessionSelf, scope = Session, risk = Read,
+                    grants = ["loom/sessions/read@v1"])]
+        pub struct Input {
+            /// Same scope spelling as `sessions.changes`.
+            pub rev: Option<String>,
+            /// The file whose whole text to read, by the `bytes` path
+            /// identity `sessions.changes` reports for it.
+            pub path: String,
+            #[operand(context)]
+            pub session: String,
+        }
+
+        pub type Output = ChangeFileContentDto;
+    }
+}
+
+pub mod commits {
     use super::prelude::*;
 
-    /// The session's uncommitted worktree changes against its base branch.
-    #[operation(id = "sessions.changes", actor = SessionSelf, scope = Session, risk = Read,
-                grants = ["loom/sessions/read@v1"], cli = "sessions changes")]
+    /// The session branch's own commits, from the fork point with its base
+    /// branch, newest first.
+    #[operation(id = "sessions.commits", actor = SessionSelf, scope = Session, risk = Read,
+                grants = ["loom/sessions/read@v1"], cli = "sessions commits")]
     pub struct Input {
         #[operand(context)]
         pub session: String,
     }
 
-    pub type Output = ChangeSetDto;
+    pub type Output = SessionCommitsDto;
 }
 
 pub mod chat {
@@ -1486,7 +1541,9 @@ static OPERATIONS: &[&OperationSpec] = &[
     wake::SPEC,
     handoff::SPEC,
     handoff::resolve::SPEC,
-    changes::SPEC,
+    changes::get::SPEC,
+    changes::content::SPEC,
+    commits::SPEC,
     chat::SPEC,
     conversation::SPEC,
     conversation::block::SPEC,

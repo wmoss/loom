@@ -4,7 +4,8 @@ import { shallowRef } from 'vue';
 // panes and their guarded route changes live in SessionDetail. Publish only the
 // active page's small UI controller here: no session data is duplicated, and a
 // cached/deactivated detail unregisters before another one takes over.
-export type MobileSessionSurface = 'terminal' | 'conversation' | 'artifacts' | 'changes' | 'shells';
+export type MobileSessionSurface =
+  'terminal' | 'conversation' | 'artifacts' | 'commits' | 'changes' | 'shells';
 
 export interface MobileSessionNavigation {
   id: string;

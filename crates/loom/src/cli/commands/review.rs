@@ -5,7 +5,7 @@
 //! `add`, `edit` and `reanchor` build a `ReviewAnchorDto`, or a joined
 //! multi-word body, out of flags. `submit` updates the summary first when one is
 //! given. `resolve` and `reopen` are two spellings of one operation differing
-//! only in the `resolved` they send. The rest — `show`, `discard`, `retarget`,
+//! only in the `resolved` they send. The rest — `show`, `discard`,
 //! `delete-comment`, `retry` — are declared in
 //! `weaver_api::operations::reviews` and merge in beside these.
 
@@ -79,7 +79,7 @@ pub enum ReviewCmd {
     Resolve { review_id: i64, comment_id: i64 },
     /// Reopen one resolved review comment.
     Reopen { review_id: i64, comment_id: i64 },
-    /// Submit the immutable review and enqueue one structured conversation message.
+    /// Submit the review and enqueue one structured conversation message.
     Submit {
         review_id: i64,
         /// Draft revision shown by `loom review ls` or the previous mutation.
@@ -87,9 +87,6 @@ pub enum ReviewCmd {
         revision: i64,
         #[arg(long, default_value = "")]
         summary: String,
-        /// Intentionally submit anchors from an older artifact revision.
-        #[arg(long)]
-        acknowledge_outdated: bool,
     },
 }
 
@@ -109,15 +106,13 @@ pub async fn run_review(cmd: ReviewCmd) -> Result<()> {
                 return Ok(());
             }
             for review in reviews {
-                let stale = if review.outdated { " stale" } else { "" };
                 println!(
-                    "#{} {} · draft rev {} · {} comments · {}{}",
+                    "#{} {} · draft rev {} · {} comments · {}",
                     review.id,
                     review.status,
                     review.draft_revision,
                     review.comments.len(),
                     review.delivery_state,
-                    stale
                 );
                 for comment in review.comments {
                     println!(
@@ -260,7 +255,6 @@ pub async fn run_review(cmd: ReviewCmd) -> Result<()> {
                     id: draft.id,
                     expected_revision: draft.draft_revision,
                     summary: (Some(summary)).clone(),
-                    subject_version: None.clone(),
                 })
                 .await?;
             println!(
@@ -301,7 +295,6 @@ pub async fn run_review(cmd: ReviewCmd) -> Result<()> {
             review_id,
             revision,
             summary,
-            acknowledge_outdated,
         } => {
             let revision = if summary.is_empty() {
                 revision
@@ -311,7 +304,6 @@ pub async fn run_review(cmd: ReviewCmd) -> Result<()> {
                         id: review_id,
                         expected_revision: revision,
                         summary: (Some(summary)).clone(),
-                        subject_version: None.clone(),
                     })
                     .await?
                     .draft_revision
@@ -320,7 +312,6 @@ pub async fn run_review(cmd: ReviewCmd) -> Result<()> {
                 .invoke::<reviews::submit::Op>(&reviews::submit::Input {
                     id: review_id,
                     expected_revision: revision,
-                    acknowledge_outdated,
                 })
                 .await?;
             println!(
