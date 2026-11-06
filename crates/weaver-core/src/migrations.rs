@@ -128,6 +128,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "review_threads",
         include_str!("../migrations/0021_review_threads.sql"),
     ),
+    (
+        22,
+        "artifact_archive",
+        include_str!("../migrations/0022_artifact_archive.sql"),
+    ),
 ];
 
 /// Latest core schema version compiled into this binary.
