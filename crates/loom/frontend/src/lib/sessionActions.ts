@@ -1,5 +1,6 @@
 import { ref } from 'vue';
 import {
+  archiveChildrenDefault,
   archiveSession,
   clearSessionTag,
   invokeOperation,
@@ -15,8 +16,7 @@ import { useFleet } from './sessionsStore';
 import {
   AUTO_ARCHIVE_DISABLED_VALUE,
   AUTO_ARCHIVE_KEY,
-  childSessionsPhrase,
-  sessionDescendants,
+  hasLiveDescendants,
   type LifecycleVerb,
 } from './sessionState';
 
@@ -143,37 +143,28 @@ export function useSessionActions(
       await reload();
     });
 
-  const archive = () => {
+  const archive = async () => {
     const id = getId();
-    const children = sessionDescendants(
-      useFleet().sessions.value.filter((session) => session.status !== 'archived'),
-      id,
-    );
+    // Offer the add-on only when the loaded snapshot shows something the
+    // server's sweep would take. Hidden, the request leaves the operand unset
+    // so the setting still covers a child the snapshot missed.
+    const hasChildren = hasLiveDescendants(useFleet().sessions.value, id);
+    const checked = hasChildren && (await archiveChildrenDefault());
     return confirmAction({
       title: 'Archive this session?',
       description:
         'Its terminal and worktree will be removed. The branch, conversation, placement, and Loom history remain recoverable in History.',
       confirmLabel: 'Archive session',
       danger: true,
-      option: children.length
-        ? { label: `Also archive ${childSessionsPhrase(children.length)}` }
-        : undefined,
+      option: hasChildren ? { label: 'Also archive child sessions', checked } : undefined,
       action: async ({ optionChecked }) => {
         error.value = '';
         notice.value = '';
-        const res = (await archiveSession(id)) as { branch: string };
-        if (!optionChecked) {
-          notice.value = `Archived ${res.branch}.`;
-        } else {
-          const results = await Promise.allSettled(
-            children.map((child) => archiveSession(child.id)),
-          );
-          const failed = results.filter((result) => result.status === 'rejected').length;
-          const scope = childSessionsPhrase(children.length);
-          notice.value = failed
-            ? `Archived ${res.branch}; ${failed} of ${scope} failed to archive.`
-            : `Archived ${res.branch} and ${scope}.`;
-        }
+        const res = await archiveSession(id, hasChildren ? optionChecked : undefined);
+        const children = res.children_archived;
+        const scope = children ? ` and ${children} child session${children === 1 ? '' : 's'}` : '';
+        notice.value = `Archived ${res.branch}${scope}.`;
+        if (res.warnings.length) notice.value += ` ${res.warnings.join(' ')}`;
         await reload();
       },
     });

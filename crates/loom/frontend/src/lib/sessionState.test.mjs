@@ -4,12 +4,12 @@ import {
   canSend,
   conversationState,
   effectiveAttention,
+  hasLiveDescendants,
   lifecycleActions,
   messageOf,
   remedyAction,
   remedyButtonAction,
   sessionAncestry,
-  sessionDescendants,
   transitionProgress,
 } from './sessionState.ts';
 
@@ -71,51 +71,6 @@ function summary(id, branchId, parentSessionId = null, parentId = null) {
   };
 }
 
-test('descendants follow the delegation thread transitively', () => {
-  const sessions = [
-    summary('root', 'b-root'),
-    summary('child-a', 'b-a', 'root'),
-    summary('grandchild', 'b-gg', 'child-a'),
-    summary('child-b', 'b-b', 'root'),
-    summary('unrelated', 'b-other', 'elsewhere'),
-  ];
-
-  assert.deepEqual(
-    sessionDescendants(sessions, 'root').map((session) => session.id),
-    ['child-a', 'grandchild', 'child-b'],
-  );
-  assert.deepEqual(
-    sessionDescendants(sessions, 'child-a').map((session) => session.id),
-    ['grandchild'],
-  );
-  assert.deepEqual(sessionDescendants(sessions, 'unrelated'), []);
-});
-
-test('descendants fall back to the legacy branch-id parent when unambiguous', () => {
-  const sessions = [summary('root', 'b-root'), summary('legacy-child', 'b-legacy', null, 'b-root')];
-
-  assert.deepEqual(
-    sessionDescendants(sessions, 'root').map((session) => session.id),
-    ['legacy-child'],
-  );
-});
-
-test('descendants survive a corrupt legacy ancestry cycle', () => {
-  const sessions = [
-    summary('root', 'b-root'),
-    // A cycle detached from any root: b and c name each other's branches as
-    // parents, so the walk must terminate rather than recurse forever.
-    summary('a', 'b-a', null, 'b-c'),
-    summary('c', 'b-c', null, 'b-a'),
-  ];
-
-  assert.deepEqual(sessionDescendants(sessions, 'root'), []);
-  assert.deepEqual(
-    sessionDescendants(sessions, 'a').map((session) => session.id),
-    ['c'],
-  );
-});
-
 test('the shared ancestry index answers parent and children both ways', () => {
   const sessions = [
     summary('root', 'b-root'),
@@ -138,6 +93,39 @@ test('the shared ancestry index answers parent and children both ways', () => {
   const dangling = sessionAncestry([root, orphan]);
   assert.equal(dangling.parentOf(orphan), undefined);
   assert.deepEqual(dangling.childrenOf('root'), []);
+  // The same fallback does resolve an unambiguous legacy-only child.
+  const legacy = summary('legacy-child', 'b-legacy', null, 'b-root');
+  assert.equal(sessionAncestry([root, legacy]).parentOf(legacy)?.id, 'root');
+});
+
+test('the archive gate matches what the server sweep would take', () => {
+  const sessions = [
+    summary('root', 'b-root'),
+    summary('child', 'b-child', 'root'),
+    // Terminal rows are never swept, but the walk goes through them.
+    { ...summary('done-child', 'b-done', 'root'), status: 'done' },
+    summary('grandchild', 'b-gg', 'done-child'),
+    // Legacy branch-id parentage is display-only; the sweep never walks it.
+    summary('legacy-child', 'b-legacy', null, 'b-root'),
+  ];
+
+  assert.equal(hasLiveDescendants(sessions, 'root'), true, 'live child');
+  assert.equal(
+    hasLiveDescendants([sessions[0], sessions[2]], 'root'),
+    false,
+    'only a terminal child',
+  );
+  assert.equal(
+    hasLiveDescendants([sessions[0], sessions[2], sessions[3]], 'root'),
+    true,
+    'a live grandchild under the terminal child still sweeps',
+  );
+  assert.equal(
+    hasLiveDescendants([sessions[0], sessions[4]], 'root'),
+    false,
+    'a legacy-only child never sweeps',
+  );
+  assert.equal(hasLiveDescendants(sessions, 'child'), false, 'a leaf offers no add-on');
 });
 
 test('a suspended session reads as dormant but reachable', () => {

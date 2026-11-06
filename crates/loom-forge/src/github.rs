@@ -2275,6 +2275,144 @@ mod tests {
         assert!(!f.work_dir.exists());
     }
 
+    /// A second worktree plus a session row parented at the fixture's session —
+    /// the minimum for the merge path's archive-children behaviour.
+    async fn child_fixture(f: &Fixture) -> std::path::PathBuf {
+        let work_dir = f
+            .work_dir
+            .parent()
+            .unwrap()
+            .join("child")
+            .display()
+            .to_string();
+        git(
+            Path::new(&f.branch.repo_root),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "weaver/child",
+                work_dir.as_str(),
+                "main",
+            ],
+        );
+        let branch = branch_mod::upsert(&f.state.db, &f.branch.repo_root, "weaver/child", "main")
+            .await
+            .unwrap();
+        session_mod::insert(
+            &f.state.db,
+            &crate::session::NewSession {
+                id: "ghchild1".to_string(),
+                branch_id: branch.id,
+                work_dir: work_dir.clone(),
+                term_session: format!("weaver-ghtest-child-{}", std::process::id()),
+                agent_kind: "shell".to_string(),
+                model: String::new(),
+                effort: String::new(),
+                status: "running".to_string(),
+                github_repo: None,
+                parent_branch_id: None,
+                managed_by: None,
+                created_by: None,
+                protocol: "terminal".to_string(),
+                origin: "agent".to_string(),
+                class: "interactive".to_string(),
+                tracking_issue_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE sessions SET parent_session_id = ? WHERE id = ?")
+            .bind(&f.session.id)
+            .bind("ghchild1")
+            .execute(&f.state.db)
+            .await
+            .unwrap();
+        std::path::PathBuf::from(work_dir)
+    }
+
+    #[tokio::test]
+    async fn merged_pr_archives_children_when_the_setting_is_on() {
+        let f = fixture().await;
+        let child_work_dir = child_fixture(&f).await;
+        config::apply(
+            &f.state.db,
+            &[(
+                "session.archive_children".to_string(),
+                Some("true".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+
+        apply_snapshot(&f.state, &f.session, &f.branch, &snapshot("MERGED"), true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session_mod::get(&f.state.db, "ghchild1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "archived",
+            "the merge archive sweeps the children it launched"
+        );
+        assert!(!child_work_dir.exists());
+    }
+
+    /// The automatic sweep keeps every child's own `auto-archive: disabled`
+    /// opt-out — the same protection the parent gets — taking the child's
+    /// subtree with it.
+    #[tokio::test]
+    async fn merged_pr_sweep_respects_a_child_auto_archive_opt_out() {
+        let f = fixture().await;
+        let child_work_dir = child_fixture(&f).await;
+        config::apply(
+            &f.state.db,
+            &[(
+                "session.archive_children".to_string(),
+                Some("true".to_string()),
+            )],
+        )
+        .await
+        .unwrap();
+        let child_branch_id = session_mod::get(&f.state.db, "ghchild1")
+            .await
+            .unwrap()
+            .unwrap()
+            .branch_id;
+        tags::set(
+            &f.state.db,
+            &child_branch_id,
+            tags::AUTO_ARCHIVE_KEY,
+            tags::AUTO_ARCHIVE_DISABLED_VALUE,
+            "keep this child",
+            "manual",
+        )
+        .await
+        .unwrap();
+
+        apply_snapshot(&f.state, &f.session, &f.branch, &snapshot("MERGED"), true)
+            .await
+            .unwrap();
+
+        let parent = session_mod::get(&f.state.db, &f.session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.status, "archived");
+        let child = session_mod::get(&f.state.db, "ghchild1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.status, "running",
+            "a child's own opt-out holds even when the parent's archive sweeps"
+        );
+        assert!(child_work_dir.exists());
+    }
+
     #[tokio::test]
     async fn merged_pr_closes_the_branchs_claimed_issues() {
         let f = fixture().await;

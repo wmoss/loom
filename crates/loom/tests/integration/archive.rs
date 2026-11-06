@@ -309,3 +309,196 @@ async fn archive_keeps_branch_and_history() {
         .await
         .unwrap();
 }
+
+/// Launch a parent and a child delegated from it — the pair every
+/// archive-children test works over. Returns `(parent id, child branch id)`.
+async fn launch_parent_and_child(ts: &TestServer, label: &str) -> (String, String) {
+    let parent = ts
+        .client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": format!("{label} parent work"),
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": format!("{label}-parent"),
+            }),
+        )
+        .await
+        .unwrap();
+    let parent_id = parent["id"].as_str().unwrap().to_string();
+    let parent_branch = parent["branch"]["id"].as_str().unwrap().to_string();
+    let child = ts
+        .client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": format!("{label} child work"),
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": format!("{label}-child"),
+                "parent_branch": parent_branch,
+            }),
+        )
+        .await
+        .unwrap();
+    let child_id = child["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        child["parent_session_id"].as_str(),
+        Some(parent_id.as_str()),
+        "the child hangs off the parent session"
+    );
+    (parent_id, child_id)
+}
+
+/// With `session.archive_children` on, one archive sweeps the whole live
+/// subtree — children and grandchildren — and reports how many went. With it
+/// off (the default) only the named session goes.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_children_setting_sweeps_the_tree() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    // Off (the default): an archive leaves the tree it launched alone.
+    let (solo_parent, solo_child) = launch_parent_and_child(&ts, "default").await;
+    let res = client
+        .post("/api/sessions/archive", json!({ "session": solo_parent }))
+        .await
+        .unwrap();
+    assert_eq!(res["children_archived"], 0, "the default is off");
+    let view = client
+        .post("/api/sessions/get", json!({ "session": solo_child }))
+        .await
+        .unwrap();
+    assert_eq!(view["status"], "running", "the child outlives its parent");
+
+    let (parent_id, child_id) = launch_parent_and_child(&ts, "sweep").await;
+
+    // A grandchild delegated from the child keeps the walk honest: the sweep
+    // is transitive, not one generation deep.
+    let child_branch = client
+        .post("/api/sessions/get", json!({ "session": child_id }))
+        .await
+        .unwrap()["branch"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let grandchild = client
+        .post(
+            "/api/sessions/launch",
+            json!({
+                "goal": "grandchild work",
+                "cwd": ts.cwd(),
+                "agent": "shell",
+                "name": "sweep-grandchild",
+                "parent_branch": child_branch,
+            }),
+        )
+        .await
+        .unwrap();
+    let grandchild_id = grandchild["id"].as_str().unwrap().to_string();
+
+    client
+        .post(
+            "/api/settings/patch",
+            json!({ "changes": { "session.archive_children": true } }),
+        )
+        .await
+        .unwrap();
+
+    // The grandchild opts out of *automatic* archiving; a person's archive
+    // (this request) still sweeps it — the opt-out governs retention only,
+    // mirrored by the merge-path test for the automatic case.
+    client
+        .post(
+            "/api/sessions/tags/set",
+            json!({
+                "key": "auto-archive",
+                "value": "disabled",
+                "by": "manual",
+                "session": grandchild_id,
+            }),
+        )
+        .await
+        .unwrap();
+
+    let res = client
+        .post("/api/sessions/archive", json!({ "session": parent_id }))
+        .await
+        .unwrap();
+    assert_eq!(
+        res["children_archived"], 2,
+        "the child and grandchild ride along"
+    );
+
+    for id in [child_id.clone(), grandchild_id] {
+        let view = client
+            .post("/api/sessions/get", json!({ "session": id }))
+            .await
+            .unwrap();
+        assert_eq!(view["status"], "archived", "descendant {id} was archived");
+    }
+
+    // Archiving is idempotent: a row that is already archived — here by the
+    // sweep, in the fleet by a concurrent request of its own — answers
+    // success without a second teardown or a second counted child.
+    let res = client
+        .post(
+            "/api/sessions/archive",
+            json!({ "session": child_id, "children": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res["archived"], true);
+    assert_eq!(res["children_archived"], 0, "no-op archive counts nothing");
+    assert_eq!(res["warnings"].as_array().map(Vec::len), Some(0));
+}
+
+/// The request's `children` operand is an explicit choice that wins over the
+/// setting in either direction.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn archive_children_operand_overrides_the_setting() {
+    let ts = TestServer::start().await;
+    let client = &ts.client;
+
+    // Setting off, but the request asks: the child goes.
+    let (parent_id, child_id) = launch_parent_and_child(&ts, "asked").await;
+    let res = client
+        .post(
+            "/api/sessions/archive",
+            json!({ "session": parent_id, "children": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res["children_archived"], 1);
+    let view = client
+        .post("/api/sessions/get", json!({ "session": child_id }))
+        .await
+        .unwrap();
+    assert_eq!(view["status"], "archived");
+
+    // Setting on, but the request says no: this child survives.
+    client
+        .post(
+            "/api/settings/patch",
+            json!({ "changes": { "session.archive_children": true } }),
+        )
+        .await
+        .unwrap();
+    let (parent_id, child_id) = launch_parent_and_child(&ts, "kept").await;
+    let res = client
+        .post(
+            "/api/sessions/archive",
+            json!({ "session": parent_id, "children": false }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res["children_archived"], 0);
+    let view = client
+        .post("/api/sessions/get", json!({ "session": child_id }))
+        .await
+        .unwrap();
+    assert_eq!(view["status"], "running");
+}

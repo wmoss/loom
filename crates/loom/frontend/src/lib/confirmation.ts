@@ -2,6 +2,9 @@ import { reactive } from 'vue';
 
 export interface ConfirmationOption {
   label: string;
+  /** The checkbox's starting state — unchecked unless a caller (the archive
+   * prompt, from the `session.archive_children` setting) asks for it. */
+  checked?: boolean;
 }
 
 export interface ConfirmationOptions {
@@ -11,8 +14,9 @@ export interface ConfirmationOptions {
   action: (context: { optionChecked: boolean }) => Promise<void>;
   danger?: boolean;
   /** An inline checkbox under the description, for optional add-ons like
-   * archiving child sessions alongside the confirmed one. Unchecked by
-   * default; the checked state reaches `action` as `optionChecked`. */
+   * archiving child sessions alongside the confirmed one. Starts unchecked
+   * unless `checked` says otherwise; the checked state reaches `action` as
+   * `optionChecked`. */
   option?: ConfirmationOption;
 }
 
@@ -51,7 +55,7 @@ export function confirmAction(options: ConfirmationOptions): Promise<boolean> {
   confirmation.busy = false;
   confirmation.error = '';
   confirmation.optionLabel = options.option?.label ?? '';
-  confirmation.optionChecked = false;
+  confirmation.optionChecked = options.option?.checked ?? false;
   confirmation.open = true;
   action = options.action;
   return new Promise((resolve) => {

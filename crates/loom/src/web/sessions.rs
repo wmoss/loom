@@ -1820,26 +1820,29 @@ async fn op_archive(
         }
         Err(error) => return Err(error),
     };
-    let warnings = archive(st, &session, &branch).await.map_err(|error| {
-        // A refusal names a state the caller can act on (another transition
-        // owns the session); only a genuine failure becomes the reassuring
-        // 500.
-        if error.downcast_ref::<crate::lifecycle::Refusal>().is_some() {
-            return AppError::from(error);
-        }
-        AppError::internal(
-            format!(
-                "Could not finish archiving session {}. Its branch and conversation are safe; retry in a moment.",
-                session.id
-            ),
-            error,
-        )
-    })?;
+    let outcome = archive(st, &session, &branch, input.children)
+        .await
+        .map_err(|error| {
+            // A refusal names a state the caller can act on (another transition
+            // owns the session); only a genuine failure becomes the reassuring
+            // 500.
+            if error.downcast_ref::<crate::lifecycle::Refusal>().is_some() {
+                return AppError::from(error);
+            }
+            AppError::internal(
+                format!(
+                    "Could not finish archiving session {}. Its branch and conversation are safe; retry in a moment.",
+                    session.id
+                ),
+                error,
+            )
+        })?;
     Ok(SessionArchiveResult {
         archived: true,
         kind: "session".to_string(),
         branch: branch.branch,
-        warnings,
+        children_archived: outcome.children_archived,
+        warnings: outcome.warnings,
     })
 }
 
@@ -1870,6 +1873,7 @@ async fn op_archive_launch_attempt(
         archived: true,
         kind: "launch_attempt".to_string(),
         branch: session_id.to_string(),
+        children_archived: 0,
         warnings,
     })
 }

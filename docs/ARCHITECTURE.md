@@ -863,6 +863,24 @@ agent is gone, so a torn-down workstream can't still "need me" nor is it
 "resting", and the dashboard stops flagging or labelling it. The UI also treats
 any `archived` session as calm regardless of a stale tag left on the branch.
 
+By default an archive touches only the named session. The request may ask for
+the whole live subtree (`sessions.archive`'s tri-state `children` operand;
+`loom sessions archive --children`), and when it stays silent the
+`session.archive_children` setting decides (off by default, so the Archive
+prompt's child checkbox starts unticked). Both lifecycle entry points resolve
+it — `archive` (manual) and `auto_archive` (retention: the merge-archive
+poller, the idle reaper, the warm-adopt sweep) sweep the live descendants
+after their own archive completes — so no caller needs to know the default.
+The sweep is the private `lifecycle::sweep_children`: list the live
+descendants (`session::live_descendants`, the recursive `parent_session_id`
+walk), tear each down through `archive_locked` under one lock per child, and
+report a child that refuses or fails as a warning rather than failing the
+sweep. The frontend never archives children itself — every archive request
+carries the caller's boolean and the backend does the work. On the automatic
+entry point each child's own `auto-archive: disabled` opt-out is kept — a
+skipped child takes its whole subtree with it — while a manual archive, which
+ignores the parent's opt-out, ignores the children's too.
+
 Archiving also **captures the agent's conversation log** (`crate::chatlog`,
 inside the shared `web::archive`, so both the Archive button and the
 merge-archive poller get it). For a `terminal` session the agent's transcript
@@ -1031,9 +1049,10 @@ worktree removed, branch and weaver history kept. The worktree is removed with
 mean the workstream is done. The session-level `auto-archive: disabled` tag
 suppresses this without changing the global policy. Turn the behaviour off
 globally with `loom config set github.archive_on_merge false` (or in the
-settings pane).
-Both settings live in `weaver-core::config::registry()` under the **GitHub**
-group.
+settings pane). With `session.archive_children` on, the merge archive also
+sweeps the sessions the merged session launched.
+Both settings live in `weaver-core::config::registry()` — `github.archive_on_merge`
+under **GitHub**, `session.archive_children` under **Sessions**.
 
 GitHub snapshot logic lives in `crate::github`: `fetch_pr` (the single-PR App
 request used by manual refresh), `fetch_pr_batch` (the repository-wide App

@@ -399,6 +399,22 @@ loom config set github.archive_on_merge false   # keep the worktree after merge
 loom config set github.poll false               # stop polling GitHub entirely
 ```
 
+By default an archive touches only the session named — the sessions it
+launched stay live, and the dashboard's Archive prompt offers them as an
+opt-in checkbox (shown only when there are children to take). Operators who
+almost always want the whole tree can flip the default in **Settings** or from
+the CLI:
+
+```sh
+loom config set session.archive_children true  # children archive with their parent
+```
+
+With it on, any archive — from the command line, a merged pull request, or the
+background retention paths — takes the children along, and the Archive prompt
+starts with the checkbox ticked (still per-confirmation, and
+`loom sessions archive <session> --children=false` opts a single call back
+out).
+
 Polling is a quiet no-op for repositories without a GitHub remote, or wherever
 `gh` is not installed — nothing to configure to opt out there.
 

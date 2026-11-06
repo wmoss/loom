@@ -17,6 +17,7 @@ import ConfirmDialog from '../components/ConfirmDialog.vue';
 import SessionMailboxPreview from '../components/SessionMailboxPreview.vue';
 import SessionWorkbenchRow from '../components/SessionWorkbenchRow.vue';
 import {
+  archiveChildrenDefault,
   archiveSession,
   clearSessionTag,
   createSessionGroup,
@@ -35,12 +36,7 @@ import {
   updateSessionSpace,
 } from '../api';
 import { unmatchedAutomationRuns, unmatchedRunProjection } from '../lib/automationSessions';
-import {
-  childSessionsPhrase,
-  effectiveAttention,
-  sessionAncestry,
-  sessionDescendants,
-} from '../lib/sessionState';
+import { effectiveAttention, hasLiveDescendants, sessionAncestry } from '../lib/sessionState';
 import { sessionPathSegments } from '../lib/sessionTitle';
 import { useLayoutCommands } from '../lib/layoutCommands';
 import { confirmAction } from '../lib/confirmation';
@@ -1045,55 +1041,61 @@ function moveGroupToSpace(group: SessionGroup) {
 
 const archiveResult = ref('');
 // The one archive confirmation the app has (lib/confirmation, rendered by the
-// shell) also carries the optional add-on: children of the selected parents
-// that the selection itself doesn't cover can ride along, checked per dialog.
-function unselectedDescendants(ids: string[]): string[] {
-  const live = sessions.value.filter((session) => session.status !== 'archived');
-  const seen = new Set(ids);
-  const extra: string[] = [];
-  for (const id of ids) {
-    for (const child of sessionDescendants(live, id)) {
-      if (seen.has(child.id)) continue;
-      seen.add(child.id);
-      extra.push(child.id);
-    }
-  }
-  return extra;
-}
-function requestBulkArchive() {
+// shell) also carries the optional add-on: the selected sessions' children
+// can ride along, checked per dialog. The server owns the walk and the sweep —
+// archiving is idempotent, so a child that is both selected and swept is
+// archived once and never refuses mid-batch.
+async function requestBulkArchive() {
   const ids = [...selected.value];
   if (!ids.length) return;
-  const extraChildren = unselectedDescendants(ids);
-  void confirmAction({
+  // Offer the add-on only when the loaded snapshot shows something the
+  // server's sweep would take. Hidden, the batch leaves the operand unset so
+  // the setting still covers children the snapshot missed.
+  const hasChildren = ids.some((id) => hasLiveDescendants(sessions.value, id));
+  const checked = hasChildren && (await archiveChildrenDefault());
+  await confirmAction({
     title: `Archive ${ids.length} selected session${ids.length === 1 ? '' : 's'}?`,
     description:
       'Their terminals and worktrees will be removed. Branches, conversations, placement, and Loom history remain recoverable in History. Failures remain selected so they can be retried.',
     confirmLabel: 'Archive selected',
     danger: true,
-    option: extraChildren.length
-      ? { label: `Also archive ${childSessionsPhrase(extraChildren.length)}` }
-      : undefined,
+    option: hasChildren ? { label: 'Also archive child sessions', checked } : undefined,
     // The batch outlives the dialog: the server serializes teardowns behind
     // its lifecycle lock, so a large selection must not pin a modal. Confirm
     // resolves immediately and the archive-result banner reports the outcome.
     action: async ({ optionChecked }) => {
-      const targets = [...ids, ...(optionChecked ? extraChildren : [])];
-      void archiveBatch(targets);
+      void archiveBatch(ids, hasChildren ? optionChecked : undefined);
     },
   });
 }
 
-async function archiveBatch(targets: string[]) {
+async function archiveBatch(targets: string[], children: boolean | undefined) {
   error.value = '';
-  const results = await Promise.allSettled(targets.map((target) => archiveSession(target)));
+  const results = await Promise.allSettled(
+    targets.map((target) => archiveSession(target, children)),
+  );
   const failed = targets.filter((_, index) => results[index].status === 'rejected');
+  const swept = results.reduce(
+    (total, result) => total + (result.status === 'fulfilled' ? result.value.children_archived : 0),
+    0,
+  );
+  // A child that refused is a warning on an otherwise successful response;
+  // surfacing it keeps the banner from promising a sweep that only partly
+  // happened.
+  const warnings = results.flatMap((result) =>
+    result.status === 'fulfilled' ? result.value.warnings : [],
+  );
   const archived = targets.length - failed.length;
   selected.value = new Set(failed);
+  // `swept` can overlap the selection (a selected child its ancestor's sweep
+  // took first), so it never adds to the number — only to the wording.
   announcement.value = `Archived ${archived} session${archived === 1 ? '' : 's'}${
-    failed.length ? `; ${failed.length} failed and remain selected` : ''
+    swept ? ' along with their child sessions' : ''
+  }${failed.length ? `; ${failed.length} failed and remain selected` : ''}${
+    warnings.length ? `; ${warnings.length} warning${warnings.length === 1 ? '' : 's'}` : ''
   }`;
   archiveResult.value = announcement.value;
-  if (failed.length) error.value = announcement.value;
+  if (failed.length || warnings.length) error.value = announcement.value;
   await refresh();
 }
 

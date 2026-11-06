@@ -9,6 +9,7 @@
 //! avoided carries a [`Refusal`] inside it, so the REST adapter can recover
 //! the right status; anything else is a genuine 500.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
@@ -116,32 +117,55 @@ pub async fn rotate_session_token(
     Ok(())
 }
 
+/// What one archive did: its own teardown warnings, plus how many live
+/// descendants rode along and what their teardowns reported.
+#[derive(Debug, Default)]
+pub struct ArchiveOutcome {
+    pub warnings: Vec<String>,
+    pub children_archived: i64,
+}
+
 /// Archive from a retention/integration path unless this branch carries the
 /// explicit `auto-archive: disabled` opt-out. The check and teardown share the
 /// lifecycle lock, so setting the label before an automatic operation acquires
 /// the lock reliably prevents that operation; manual [`archive`] ignores it.
+///
+/// The session's live descendants follow the `session.archive_children`
+/// setting — resolved alongside [`archive`], so no caller of either entry
+/// point needs to know that default — and each child's own opt-out tag is
+/// kept, just like the parent's.
 pub async fn auto_archive(
     st: &AppState,
     session: &Session,
     _branch: &Branch,
-) -> Result<Option<Vec<String>>> {
-    let _lifecycle = crate::runtime::LIFECYCLE_LOCK.lock().await;
-    let Some((current_session, current_branch)) =
-        session_mod::with_branch(&st.db, &session.id).await?
-    else {
-        return Err(anyhow!("session not found"));
+) -> Result<Option<ArchiveOutcome>> {
+    let mut outcome = {
+        let _lifecycle = crate::runtime::LIFECYCLE_LOCK.lock().await;
+        let Some((current_session, current_branch)) =
+            session_mod::with_branch(&st.db, &session.id).await?
+        else {
+            return Err(anyhow!("session not found"));
+        };
+        if tags::auto_archive_disabled(&st.db, &current_branch.id).await? {
+            tracing::info!(
+                session = %current_session.id,
+                branch = %current_branch.id,
+                "automatic archive skipped by auto-archive: disabled tag"
+            );
+            return Ok(None);
+        }
+        ArchiveOutcome {
+            warnings: archive_locked(st, &current_session, &current_branch).await?,
+            children_archived: 0,
+        }
     };
-    if tags::auto_archive_disabled(&st.db, &current_branch.id).await? {
-        tracing::info!(
-            session = %current_session.id,
-            branch = %current_branch.id,
-            "automatic archive skipped by auto-archive: disabled tag"
-        );
-        return Ok(None);
+    // The sweep re-acquires the lifecycle lock per child, so it must run
+    // outside the guard this archive held. Automatic retention keeps every
+    // child's own opt-out, exactly as it kept the parent's.
+    if resolves_children(st, None).await {
+        sweep_children(st, &session.id, &mut outcome, true).await;
     }
-    archive_locked(st, &current_session, &current_branch)
-        .await
-        .map(Some)
+    Ok(Some(outcome))
 }
 
 /// Manual archive entry point. Refresh after acquiring the lifecycle lock so a
@@ -149,19 +173,34 @@ pub async fn auto_archive(
 /// than the stale row it resolved before waiting. The operation runs in a
 /// server-owned task because dropping an HTTP request future must not cancel
 /// teardown after its durable transition has been recorded.
-pub async fn archive(st: &AppState, session: &Session, _branch: &Branch) -> Result<Vec<String>> {
+///
+/// `children` is the request's explicit choice; `None` follows the
+/// `session.archive_children` setting.
+pub async fn archive(
+    st: &AppState,
+    session: &Session,
+    _branch: &Branch,
+    children: Option<bool>,
+) -> Result<ArchiveOutcome> {
     let st = st.clone();
     let session_id = session.id.clone();
     let (result_tx, result_rx) = oneshot::channel();
     weaver_core::spawn_boxed(Box::pin(async move {
         let result = async {
-            let _lifecycle = crate::runtime::LIFECYCLE_LOCK.lock().await;
-            let Some((current_session, current_branch)) =
-                session_mod::with_branch(&st.db, &session_id).await?
-            else {
-                return Err(anyhow!("session not found"));
-            };
-            archive_locked(&st, &current_session, &current_branch).await
+            let mut outcome = ArchiveOutcome::default();
+            {
+                let _lifecycle = crate::runtime::LIFECYCLE_LOCK.lock().await;
+                let Some((current_session, current_branch)) =
+                    session_mod::with_branch(&st.db, &session_id).await?
+                else {
+                    return Err(anyhow!("session not found"));
+                };
+                outcome.warnings = archive_locked(&st, &current_session, &current_branch).await?;
+            }
+            if resolves_children(&st, children).await {
+                sweep_children(&st, &session_id, &mut outcome, false).await;
+            }
+            Ok(outcome)
         }
         .await;
         let _ = result_tx.send(result);
@@ -169,6 +208,128 @@ pub async fn archive(st: &AppState, session: &Session, _branch: &Branch) -> Resu
     result_rx
         .await
         .map_err(|_| anyhow!("archive task stopped before reporting its result"))?
+}
+
+/// The effective child default for one archive: the request's explicit
+/// choice, else the `session.archive_children` setting (off unless the
+/// operator turned it on). This and [`sweep_children`] are the setting's only
+/// readers.
+async fn resolves_children(st: &AppState, explicit: Option<bool>) -> bool {
+    match explicit {
+        Some(explicit) => explicit,
+        None => {
+            crate::config::get_bool(
+                &st.db,
+                "session.archive_children",
+                crate::config::DEFAULT_ARCHIVE_CHILDREN,
+            )
+            .await
+        }
+    }
+}
+
+/// Archive every live descendant of `session_id`, nearest generation first. A
+/// child that refuses or fails is reported as a warning rather than failing
+/// the sweep: the parent is already archived, and the rest of the tree should
+/// not be held hostage by one child. Each child's warnings are prefixed with
+/// its session id so the caller can surface them as one list.
+///
+/// `respect_opt_out` mirrors the entry point's contract: an automatic archive
+/// keeps every child's `auto-archive: disabled` opt-out (a skipped child
+/// takes its whole subtree with it, logged and reported as a warning), while
+/// a manual archive — which ignores the parent's opt-out — ignores the
+/// children's too.
+async fn sweep_children(
+    st: &AppState,
+    session_id: &str,
+    outcome: &mut ArchiveOutcome,
+    respect_opt_out: bool,
+) {
+    let children = match session_mod::live_descendants(&st.db, session_id).await {
+        Ok(children) => children,
+        Err(error) => {
+            outcome
+                .warnings
+                .push(format!("could not list child sessions to archive: {error}"));
+            return;
+        }
+    };
+    // The nearest-generation order guarantees a parent is always visited
+    // before its children, so a skipped subtree is fully decided by the time
+    // its rows arrive.
+    let mut skipped_subtrees: HashSet<String> = HashSet::new();
+    for child in children {
+        if skipped_subtrees.contains(child.parent_session_id.as_deref().unwrap_or_default()) {
+            skipped_subtrees.insert(child.id.clone());
+            continue;
+        }
+        // One lock per child: siblings tear down one at a time, and no guard
+        // spans an `archive_locked` that could contend with another.
+        let _lifecycle = crate::runtime::LIFECYCLE_LOCK.lock().await;
+        let (current_session, current_branch) = match session_mod::with_branch(&st.db, &child.id)
+            .await
+        {
+            Ok(Some(found)) => found,
+            Ok(None) => continue,
+            Err(error) => {
+                outcome
+                    .warnings
+                    .push(format!("child {} could not be loaded: {error}", child.id));
+                tracing::warn!(session = %child.id, %error, "child sweep: could not load the row");
+                continue;
+            }
+        };
+        // Finished between the listing and this lock; its own children are
+        // still walked below, matching what the listing promised.
+        if session_mod::is_terminal(&current_session.status) {
+            continue;
+        }
+        if respect_opt_out {
+            let opted_out = match tags::auto_archive_disabled(&st.db, &current_branch.id).await {
+                Ok(opted_out) => opted_out,
+                Err(error) => {
+                    // An unreadable opt-out must not guess: keep the child.
+                    outcome.warnings.push(format!(
+                        "child {} kept: the auto-archive opt-out could not be checked: {error}",
+                        current_session.id
+                    ));
+                    tracing::warn!(session = %current_session.id, %error, "child sweep: opt-out check failed");
+                    skipped_subtrees.insert(current_session.id.clone());
+                    continue;
+                }
+            };
+            if opted_out {
+                outcome.warnings.push(format!(
+                    "child {} kept: auto-archive disabled",
+                    current_session.id
+                ));
+                tracing::info!(
+                    session = %current_session.id,
+                    branch = %current_branch.id,
+                    "child sweep skipped by auto-archive: disabled tag"
+                );
+                skipped_subtrees.insert(current_session.id.clone());
+                continue;
+            }
+        }
+        match archive_locked(st, &current_session, &current_branch).await {
+            Ok(warnings) => {
+                outcome.children_archived += 1;
+                outcome.warnings.extend(
+                    warnings
+                        .into_iter()
+                        .map(|warning| format!("child {}: {warning}", current_session.id)),
+                );
+            }
+            Err(error) => {
+                outcome.warnings.push(format!(
+                    "child {} failed to archive: {error}",
+                    current_session.id
+                ));
+                tracing::warn!(session = %current_session.id, %error, "child sweep: archive failed");
+            }
+        }
+    }
 }
 
 /// Close every active session owned by `username` after their access is
@@ -198,12 +359,12 @@ pub async fn close_sessions_created_by(st: &AppState, username: &str) {
             tracing::warn!(username, session = %session.id, "session had no branch while closing user access");
             continue;
         };
-        match archive(st, &session, &branch).await {
-            Ok(warnings) if warnings.is_empty() => {
+        match archive(st, &session, &branch, None).await {
+            Ok(outcome) if outcome.warnings.is_empty() => {
                 tracing::info!(username, session = %session.id, "closed session after authorization expired");
             }
-            Ok(warnings) => {
-                tracing::warn!(username, session = %session.id, ?warnings, "closed session with warnings after authorization expired");
+            Ok(outcome) => {
+                tracing::warn!(username, session = %session.id, ?outcome.warnings, "closed session with warnings after authorization expired");
             }
             Err(error) => {
                 tracing::warn!(%error, username, session = %session.id, "could not close session after authorization expired");
@@ -364,6 +525,17 @@ pub async fn archive_locked(
     branch: &Branch,
 ) -> Result<Vec<String>> {
     tracing::info!(session = %session.id, branch = %branch.id, "archiving session");
+    // Idempotent: a row some other archive just finished — a concurrent
+    // request, or a sweep that took this child before its own target did —
+    // must not run a second teardown or record duplicate events.
+    if session.status == "archived" {
+        tracing::info!(
+            session = %session.id,
+            branch = %branch.id,
+            "archive is a no-op: session already archived"
+        );
+        return Ok(Vec::new());
+    }
     // A person archiving a session is asking for it to go away; an abandoned
     // marker from a dead operation must not be able to refuse that forever.
     let refreshed = release_abandoned_transition(&st.db, session).await?;
@@ -1104,7 +1276,7 @@ pub async fn reconcile_interrupted_transitions(state: &AppState) {
                         continue;
                     }
                 }
-                if let Err(error) = archive(state, &session, &branch).await {
+                if let Err(error) = archive(state, &session, &branch, None).await {
                     tracing::warn!(session = %session.id, %error, "transition recovery: archive failed");
                 }
             }
