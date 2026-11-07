@@ -13,8 +13,9 @@
 // `markdown.ts`), so this renderer stays generic: it maps each token to its HTML
 // element honouring the token's own attributes, and the few things a plugin
 // emits as literal HTML (`html_inline`/`html_block`) become small sanitised
-// islands. Only fenced code is special-cased, routed to the CodeBlock /
-// MermaidBlock leaf components (which lazy-load highlight.js / mermaid).
+// islands. Fenced code and images are special-cased to leaf components —
+// CodeBlock / MermaidBlock lazy-load their heavy renderers, MarkdownImage
+// degrades a failed load into a card naming the source.
 
 import { h, cloneVNode, isVNode, type VNode } from 'vue';
 import type Token from 'markdown-it/lib/token.mjs';
@@ -22,6 +23,7 @@ import { resolveUrl, type RenderContext, type Sanitizer } from './markdown';
 import { isLocalHref } from './lib/localLinks';
 import CodeBlock from './components/CodeBlock.vue';
 import MermaidBlock from './components/MermaidBlock.vue';
+import MarkdownImage from './components/MarkdownImage.vue';
 
 /** Everything the walker needs: the image/link resolution context plus the
  *  sanitiser for raw-HTML islands. */
@@ -97,10 +99,18 @@ function walk(tokens: Token[], ctx: RenderCtx): Child[] {
       }
       case 'image': {
         const props = attrsToProps(tok.attrs);
-        if (typeof props.src === 'string') props.src = resolveUrl(ctx, props.src);
-        // The token's content is the flattened alt text.
-        props.alt = tok.content;
-        emit(h('img', props));
+        // `raw` is what the author wrote (kept for the failure card); `src`
+        // is the fetchable URL the same context resolves it to.
+        const raw = typeof props.src === 'string' ? props.src : '';
+        emit(
+          h(MarkdownImage, {
+            ...props,
+            src: raw ? resolveUrl(ctx, raw) : '',
+            raw,
+            // The token's content is the flattened alt text.
+            alt: tok.content,
+          }),
+        );
         continue;
       }
       case 'html_block':

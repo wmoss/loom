@@ -2,7 +2,8 @@ import type { Page } from '@playwright/test';
 import { test, expect } from '../fixtures/weaver';
 import type { Session, WeaverFixture } from '../fixtures/weaver';
 import { join } from 'path';
-import { unlinkSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { readFileSync, unlinkSync, writeFileSync } from 'fs';
 
 // The Conversation surface for an ACP session (`protocol='acp'`): a live,
 // journal-backed transcript rendered as typeset dialogue — serif prose for the
@@ -1417,6 +1418,42 @@ test.describe('acp conversation', () => {
       await page.screenshot({
         path: test.info().outputPath(`acp-conversation-${theme}.png`),
       });
+    }
+  });
+
+  // Agents embed host paths in their prose (`![mockup](/tmp/shot.png)`), which
+  // a browser cannot fetch — the conversation view maps them to the session's
+  // image endpoint, and a source loom genuinely cannot serve degrades to a
+  // card naming the path instead of the browser's broken-image icon.
+  test('agent prose renders host-path images inline', async ({ page, weaver }) => {
+    const shot = join(tmpdir(), `loom-e2e-host-shot-${process.pid}-${Date.now()}.png`);
+    writeFileSync(shot, readFileSync(join(__dirname, '../../crates/loom/frontend/src/favicon-32.png')));
+    const missing = join(tmpdir(), `loom-e2e-gone-${process.pid}-${Date.now()}.png`);
+    try {
+      const s = await openAcp(page, weaver, {
+        goal: `say:Here are the renders ![option A](${shot}) and ![a gone one](${missing})`,
+        name: 'inline-host-images',
+      });
+      const conv = page.getByTestId('acp-conversation');
+
+      // The host path resolves to the session's image endpoint…
+      const img = conv.locator('img[alt="option A"]').first();
+      await expect(img).toHaveAttribute(
+        'src',
+        `/api/sessions/image?session=${s.id}&path=${encodeURIComponent(shot)}`,
+      );
+      // …and the served bytes decode: the image really displays.
+      await expect
+        .poll(() => img.evaluate((el) => (el as HTMLImageElement).naturalWidth))
+        .toBeGreaterThan(0);
+
+      // A path with nothing behind it names itself instead of showing the
+      // broken-image icon.
+      const fallback = conv.getByTestId('markdown-image-fallback').first();
+      await expect(fallback).toContainText(missing);
+      await expect(fallback).toContainText('a gone one unavailable');
+    } finally {
+      unlinkSync(shot);
     }
   });
 });

@@ -847,6 +847,42 @@ fn rel_path(raw: &str) -> ApiResult<String> {
     Ok(raw.to_owned())
 }
 
+/// Upper bound on one served host image, so a path pointing at something huge
+/// cannot be slurped into memory whole.
+const MAX_HOST_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Validate a host-absolute path (for [`image_session_bytes`]). Only the shape
+/// is checked here; existence, size, and image-ness are checked after reading.
+fn host_image_path(raw: &str) -> ApiResult<String> {
+    if raw.is_empty() {
+        return Err(AppError::bad_request("path is required"));
+    }
+    if !raw.starts_with('/') || raw.contains('\\') || raw.contains('\0') {
+        return Err(AppError::bad_request("path must be absolute"));
+    }
+    Ok(raw.to_owned())
+}
+
+/// Sniff a supported raster image's content type from the magic bytes. The
+/// whitelist is the security boundary of `sessions.image`: the path is
+/// agent-chosen, so the endpoint may only answer with inert raster bytes —
+/// never text a browser could execute, which rules out SVG outright.
+fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        None
+    }
+}
+
 async fn worktree_file(work_dir: &str, path: &str) -> ApiResult<PathBuf> {
     let relative = rel_path(path)?;
     let root = tokio::fs::canonicalize(work_dir).await?;
@@ -2173,6 +2209,53 @@ pub(super) async fn raw_session_bytes(
         .into_response())
 }
 
+/// `sessions.image` — a host-absolute image file's bytes, for inline images in
+/// agent-authored markdown. The conversation view maps `![alt](/tmp/shot.png)`
+/// sources here: the browser cannot fetch a host path, but loom's process runs
+/// beside the agent's tools and can. Only files whose magic bytes pass
+/// [`sniff_image`] are served, keeping a freely-chosen path from becoming an
+/// arbitrary same-origin response.
+///
+/// Like [`raw_session_bytes`], the authorization already ran in
+/// [`super::encodings`]; what is left here is the bytes.
+pub(super) async fn image_session_bytes(
+    st: &AppState,
+    input: &ops::image::Input,
+) -> ApiResult<Response> {
+    require_session(&st.db, &input.session).await?;
+    let path = host_image_path(&input.path)?;
+    // Canonicalize resolves symlinks and rejects a missing path in one step;
+    // the file it lands on is what gets read, whatever the path spelled.
+    let file = tokio::fs::canonicalize(&path)
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => AppError::not_found("image"),
+            _ => error.into(),
+        })?;
+    let meta = tokio::fs::metadata(&file).await?;
+    if !meta.is_file() {
+        return Err(AppError::bad_request("path is not a regular file"));
+    }
+    if meta.len() > MAX_HOST_IMAGE_BYTES {
+        return Err(AppError::bad_request("image exceeds the size limit"));
+    }
+    let bytes = tokio::fs::read(&file).await?;
+    let mime = sniff_image(&bytes).ok_or_else(|| AppError::not_found("image"))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_DISPOSITION, "inline"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            // Same posture as `sessions.raw`: session-served bytes must not be
+            // an executable or embeddable resource on another site's page.
+            (header::HeaderName::from_static("cross-origin-resource-policy"), "same-origin"),
+            (header::CONTENT_SECURITY_POLICY, "sandbox allow-scripts; default-src 'none'; img-src data: http: https:; style-src 'unsafe-inline'; script-src 'unsafe-inline'"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 async fn op_url(context: OperationContext, input: ops::url::Input) -> ApiResult<SessionUrlView> {
     let st = &context.state;
     let (session, _) = require_session(&st.db, &input.session).await?;
@@ -2689,4 +2772,40 @@ async fn op_title_generation_set(
     crate::metadata_assist::set_title_enabled(&st.db, &session.id, input.enabled).await?;
     let (session, branch) = require_session(&st.db, &session.id).await?;
     session_view(&st.db, &session, &branch).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sniffs_only_supported_raster_magic() {
+        assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(sniff_image(b"\xFF\xD8\xFF\xE0junk"), Some("image/jpeg"));
+        assert_eq!(sniff_image(b"GIF89a1"), Some("image/gif"));
+        assert_eq!(
+            sniff_image(b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(sniff_image(b"BM\x36\x00"), Some("image/bmp"));
+        // Anything a browser could treat as active content — or nothing at
+        // all — is refused, not guessed from the extension.
+        assert_eq!(
+            sniff_image(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            None
+        );
+        assert_eq!(sniff_image(b"%PDF-1.4 not really"), None);
+        assert_eq!(sniff_image(b""), None);
+        assert_eq!(sniff_image(b"RIFF\x24\x00\x00\x00"), None); // truncated before the form tag
+    }
+
+    #[test]
+    fn host_paths_must_be_absolute_and_unambiguous() {
+        assert!(host_image_path("/tmp/shot.png").is_ok());
+        assert!(host_image_path("").is_err());
+        assert!(host_image_path("shot.png").is_err());
+        assert!(host_image_path("relative/../../shot.png").is_err());
+        assert!(host_image_path("C:\\shot.png").is_err());
+        assert!(host_image_path("/tmp\0shot.png").is_err());
+    }
 }

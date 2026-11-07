@@ -124,6 +124,15 @@ For local image resource links, Loom captures supported raster images up to
 10 MiB from the session worktree or the system temporary directory at tool
 completion. If capture fails, the tool detail explains why a preview is unavailable.
 
+Inline images in agent-authored Markdown resolve through Loom rather than the
+browser: a relative path reads the session's worktree, `artifact:<name>` reads
+the artifact store, and an absolute path on the Loom host — the form agents
+naturally write for files outside the worktree — is served by the session's
+image endpoint, which only releases bytes that sniff as a supported raster
+format. A source Loom cannot serve (a path in a mount the server cannot see, or
+a file that is already gone) degrades to a card naming the path instead of the
+browser's broken-image icon.
+
 An in-place model handoff pauses conversation input and shows the server-owned
 handoff stage until the incoming provider is ready. The same transition appears
 in the session header and fleet, so leaving the open Details popover does not

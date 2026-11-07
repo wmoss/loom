@@ -944,6 +944,37 @@ pub mod raw {
     pub type Output = ();
 }
 
+pub mod image {
+    use super::prelude::*;
+
+    /// Bytes of an image file at a host-absolute path, with the content type
+    /// sniffed from the magic bytes — for inline images in agent-authored
+    /// markdown. Agents embed host paths (`![mockup](/tmp/shot.png)`) that a
+    /// browser cannot fetch; the renderer points the `<img src>` here instead.
+    ///
+    /// `io = Download`: the browser fetches this directly and needs raw bytes
+    /// rather than a JSON envelope.
+    #[operation(id = "sessions.image", actor = SessionSelf, scope = Session, risk = Read,
+                grants = ["loom/sessions/read@v1"], io = Download)]
+    pub struct Input {
+        /// Absolute host path of the image file to read. The handler refuses
+        /// anything whose magic bytes are not a supported raster format, so a
+        /// host path — which agents choose freely — can only ever yield inert
+        /// image bytes.
+        //
+        // `serde(default)`: download operands arrive via the query string,
+        // extracted before defaults fill in. Empty path is rejected by the handler.
+        #[serde(default)]
+        #[operand(default = String::new())]
+        pub path: String,
+        #[serde(default)]
+        #[operand(context)]
+        pub session: String,
+    }
+
+    pub type Output = ();
+}
+
 pub mod recover {
     use super::prelude::*;
 
@@ -1488,6 +1519,7 @@ static OPERATIONS: &[&OperationSpec] = &[
     files::SPEC,
     mode::SPEC,
     raw::SPEC,
+    image::SPEC,
     url::SPEC,
     ide_info::SPEC,
     shells::list::SPEC,
