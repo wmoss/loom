@@ -78,6 +78,12 @@ export class ReviewDraftController<T extends RevisionedDraft> {
     return { request: ++this.refreshRequest, state: this.state };
   }
 
+  /// True when a newer refresh began after `epoch` — that load owns the
+  /// state, and this one must neither install nor retry.
+  isSuperseded(epoch: RefreshEpoch): boolean {
+    return epoch.request !== this.refreshRequest;
+  }
+
   acceptRefresh(epoch: RefreshEpoch, draft: T | null): boolean {
     if (epoch.request !== this.refreshRequest || epoch.state !== this.state || this.dirty) {
       return false;

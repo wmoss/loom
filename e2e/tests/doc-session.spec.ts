@@ -78,7 +78,9 @@ test('a doc session gets a Doc tab that shows only its doc, and opens on it once
   await expect(page.locator('[data-artifact]')).toHaveCount(0);
   await expect(page.getByTestId('artifact-delete')).toHaveCount(0);
 
-  await tabs.locator('[data-tab="review"]').click();
+  // The branch's tab model surfaces artifacts/commits/changes directly; the
+  // artifacts tab is the surface the old review tab carried.
+  await tabs.locator('[data-tab="artifacts"]').click();
   await expect(page).toHaveURL(new RegExp(`/s/${session.id}/artifacts`));
   await expect(page.locator('[data-artifact="progress"]')).toBeVisible();
 
