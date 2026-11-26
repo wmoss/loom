@@ -10,6 +10,7 @@ pub mod agent_kind;
 pub mod backend;
 pub mod changes;
 pub mod client_context;
+pub mod commits;
 pub mod ctx;
 pub mod env_policy;
 pub mod envfile;

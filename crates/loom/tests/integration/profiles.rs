@@ -91,16 +91,20 @@ async fn remote_mcp_profile_pins_revisions_and_renders_http() {
         .await
         .unwrap();
     assert_eq!(effective["mcp_policy"]["remote_servers"][0]["revision"], 1);
-    assert_eq!(effective["mcp_servers"][0]["type"], "http");
+    // The builtin server is always present — reading one's own submitted
+    // reviews is inherent to every session, whatever the profile narrows to —
+    // so the remote one follows it.
+    assert_eq!(effective["mcp_servers"][0]["type"], "stdio");
+    assert_eq!(effective["mcp_servers"][1]["type"], "http");
     assert_eq!(
-        effective["mcp_servers"][0]["url"],
+        effective["mcp_servers"][1]["url"],
         "https://marina.example.com/api/marina/mcp/"
     );
     assert_eq!(
-        effective["mcp_servers"][0]["headers"],
+        effective["mcp_servers"][1]["headers"],
         json!(["Authorization"])
     );
-    assert!(effective["mcp_servers"][0]["command"]
+    assert!(effective["mcp_servers"][1]["command"]
         .as_str()
         .unwrap()
         .is_empty());
@@ -109,6 +113,10 @@ async fn remote_mcp_profile_pins_revisions_and_renders_http() {
         .unwrap()
         .iter()
         .any(|rule| rule.as_str().unwrap().ends_with("__*")));
+    assert!(effective["runtime_permissions"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("mcp__loom__review_list")));
 
     let mut changed = server;
     changed["url"] = json!("https://marina.example.com/api/marina/mcp/v2/");
@@ -429,12 +437,17 @@ print("custom tests passed")
         .as_str()
         .unwrap()
         .starts_with("mcp__loom_custom_"));
+    // The review detail tool is the inherent floor every session keeps.
+    assert!(effective["runtime_permissions"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("mcp__loom__review_list")));
     assert!(
-        std::path::Path::new(effective["mcp_servers"][0]["command"].as_str().unwrap())
+        std::path::Path::new(effective["mcp_servers"][1]["command"].as_str().unwrap())
             .is_absolute()
     );
     assert_eq!(
-        effective["mcp_servers"][0]["args"],
+        effective["mcp_servers"][1]["args"],
         json!(["mcp", "serve-custom", "/ops/status"])
     );
     let source_v2 = source.replace("Return a value.", "Return a pinned value.");

@@ -125,6 +125,10 @@ async fn builtin_server_speaks_mcp_stdio() {
     assert_eq!(tools.len(), 48);
     assert!(tools.iter().any(|tool| tool["name"] == "channel_send"));
     assert!(tools.iter().any(|tool| tool["name"] == "session_history"));
+    assert!(tools.iter().any(|tool| tool["name"] == "review_list"));
+    assert!(tools
+        .iter()
+        .any(|tool| tool["name"] == "review_comment_reply"));
     assert!(tools
         .iter()
         .any(|tool| tool["name"] == "messaging_slack_send"));
